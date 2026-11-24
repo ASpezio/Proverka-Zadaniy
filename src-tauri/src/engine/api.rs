@@ -705,7 +705,8 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             {
                 let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
                 let o = ws.outcomes.entry(id).or_default();
-                o.override_grade = p.get("grade").as_f64().map(|g| super::core::norm_grade(g, true));
+                // оценка преподавателя — как он её поставил, до сотых (2,7; 2,9…)
+                o.override_grade = p.get("grade").as_f64().map(|g| (g.clamp(2.0, 5.0) * 100.0).round() / 100.0);
                 o.override_comment = p.get("comment").str_or("");
                 // преподаватель сам отмечает ИИ / списывание или снимает нарушение
                 if let Some(v) = p.get("violation").as_str() {

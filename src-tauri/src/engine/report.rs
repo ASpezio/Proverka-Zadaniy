@@ -131,7 +131,7 @@ pub fn rows(core: &Core, only: &str) -> (Vec<Row>, Json) {
         if let Some(g) = g {
             cnt += 1;
             sum += g;
-            dist[g.floor().clamp(0.0, 5.0) as usize] += 1;
+            dist[grade_bucket(g).clamp(0.0, 5.0) as usize] += 1;
         }
         if o.violation == "ai" {
             ai += 1;
@@ -290,7 +290,7 @@ fn cell(text: &str, width: u32, bold: bool, fill: &str, align: &str) -> String {
 }
 
 fn grade_fill(g: Option<f64>) -> &'static str {
-    let g = g.map(|x| x.floor() as i64);
+    let g = g.map(|x| grade_bucket(x) as i64);
     match g {
         Some(5) => "C6EFCE",
         Some(4) => "DDEBF7",
@@ -397,7 +397,7 @@ pub fn xlsx(core: &Core, only: &str) -> Vec<u8> {
     sheet.push_str("</row>");
     for (k, r) in rows.iter().enumerate() {
         let rn = k + 5;
-        let gstyle = match r.grade_num.map(|x| x.floor() as i64) {
+        let gstyle = match r.grade_num.map(|x| grade_bucket(x) as i64) {
             Some(5) => 4,
             Some(4) => 5,
             Some(3) => 6,
@@ -686,5 +686,15 @@ mod dt_tests {
         super::TZ_MIN.store(300, std::sync::atomic::Ordering::Relaxed);
         // 2026-11-23 09:05:00 UTC → 14:05 в Перми
         assert_eq!(super::fmt_dt(1795424700), "23.11.2026 14:05");
+    }
+}
+
+/// К какой целой оценке относится дробная (для цвета и распределения):
+/// «4,5» — к «4», как и раньше; остальные дроби (2,7; 3,8 из Moodle) — к ближайшей целой.
+pub fn grade_bucket(g: f64) -> f64 {
+    if (g - g.floor() - 0.5).abs() < 1e-9 {
+        g.floor()
+    } else {
+        g.round()
     }
 }

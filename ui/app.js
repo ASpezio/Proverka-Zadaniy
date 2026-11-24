@@ -504,11 +504,13 @@ function gradeSvg(g, key, size = "") {
   if (!g) return `<span class="grade empty ${size}"><svg viewBox="0 0 44 44"><path class="ring" d="${RING}" stroke-dasharray="3 5"/></svg></span>`;
   g = +g;
   const whole = Math.floor(g);
-  const half = g - whole >= 0.25;
+  // дробная часть как есть: «,5», «,7», «,75» (оценки из Moodle и точные оценки преподавателя)
+  const frac = g - whole >= 0.005 ? "," + (fmtG(g).split(",")[1] || "") : "";
   const write = key && !S.writtenGrades.has(key + ":" + g);
   if (key) S.writtenGrades.add(key + ":" + g);
-  const digit = half ? `<g transform="translate(-3.5 1.5) scale(.9)"><path class="digit" d="${DIGIT[whole]}"/></g><text class="half" x="24.5" y="33.5">,5</text>` : `<path class="digit" d="${DIGIT[whole]}"/>`;
-  return `<span class="grade g${whole} ${size} ${write ? "write" : ""}" title="Оценка ${fmtG(g)}"><svg viewBox="0 0 44 44"><path class="ring" d="${RING}"/>${digit}</svg></span>`;
+  const digit = frac ? `<g transform="translate(-3.5 1.5) scale(.9)"><path class="digit" d="${DIGIT[whole]}"/></g><text class="half" x="24.5" y="33.5"${frac.length > 2 ? ' style="font-size:9px"' : ""}>${frac}</text>` : `<path class="digit" d="${DIGIT[whole]}"/>`;
+  const tone = Math.abs(g - whole - 0.5) < 1e-9 ? whole : Math.min(5, Math.max(2, Math.round(g)));
+  return `<span class="grade g${tone} ${size} ${write ? "write" : ""}" title="Оценка ${fmtG(g)}"><svg viewBox="0 0 44 44"><path class="ring" d="${RING}"/>${digit}</svg></span>`;
 }
 
 function fileIco(name) {
@@ -1633,6 +1635,7 @@ async function openWork(id) {
     <h3 class="sec">Оценка преподавателя</h3>
     <div class="override" id="ovr">${gradeScale().map((g) => `<button class="g${Math.floor(g)} ${o.override_grade === g ? "on" : ""}" data-g="${g}">${fmtG(g)}</button>`).join("")}
       <button class="btn ghost sm" data-g="" title="Вернуть оценку нейросети">Сбросить</button></div>
+    <label class="field jc-any"><span>или точная оценка (например, 2,7)</span><input class="input" id="ovrAny" inputmode="decimal" placeholder="от 2 до 5" value="${o.override_grade != null && !gradeScale().includes(o.override_grade) ? fmtG(o.override_grade) : ""}"></label>
     <div class="field" style="margin-top:10px"><span>Нарушение</span>
       <div class="seg" id="ovrViol" role="radiogroup" aria-label="Нарушение">${[["", `как решила проверка${o.auto_violation ? ` (${o.auto_violation === "ai" ? "ИИ" : "списывание"})` : " (нет)"}`], ["ai", "Использование ИИ"], ["plagiarism", "Списывание"], ["none", "Нарушения нет"]].map(([k, t]) => `<button type="button" data-v="${k}" class="${(o.override_violation || "") === k ? "on" : ""}" role="radio" aria-checked="${(o.override_violation || "") === k}">${esc(t)}</button>`).join("")}</div>
       <small class="muted">Если отметить ИИ или списывание и не выбрать оценку выше, в ведомость пойдёт «2» и пометка «Да — ИИ» / «Да — списывание».</small></div>
@@ -1661,7 +1664,11 @@ async function openWork(id) {
   $("#aiOpen")?.addEventListener("click", () => { closeDrawer(); openAiDecide([id]); });
   $("#aiUndo")?.addEventListener("click", async (e) => { e.preventDefault(); try { S.state = await api("ai_decide", { id, decision: "" }); closeDrawer(); openAiDecide([id]); } catch (er) { toast(String(er), "err"); } });
   let sel = o.override_grade ?? null;
-  $$("#ovr [data-g]").forEach((b) => (b.onclick = () => { sel = b.dataset.g ? +b.dataset.g : null; $$("#ovr button").forEach((x) => x.classList.toggle("on", +x.dataset.g === sel)); }));
+  $$("#ovr [data-g]").forEach((b) => (b.onclick = () => { sel = b.dataset.g ? +b.dataset.g : null; $("#ovrAny").value = ""; $$("#ovr button").forEach((x) => x.classList.toggle("on", +x.dataset.g === sel)); }));
+  $("#ovrAny").oninput = (e) => {
+    const v = parseFloat(e.target.value.replace(",", "."));
+    if (Number.isFinite(v) && v >= 2 && v <= 5) { sel = Math.round(v * 100) / 100; $$("#ovr button").forEach((x) => x.classList.toggle("on", +x.dataset.g === sel)); }
+  };
   let viol = o.override_violation || "";
   $$("#ovrViol [data-v]").forEach((b) => (b.onclick = () => { viol = b.dataset.v; $$("#ovrViol button").forEach((x) => { x.classList.toggle("on", x === b); x.setAttribute("aria-checked", x === b); }); }));
   $("#wdFresh")?.addEventListener("click", () => { closeDrawer(); startCheck([id], false, true); });

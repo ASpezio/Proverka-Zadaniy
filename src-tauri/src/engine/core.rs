@@ -101,7 +101,9 @@ pub fn fmt_grade(g: f64) -> String {
     if (g - g.round()).abs() < 0.01 {
         format!("{}", g.round() as i64)
     } else {
-        format!("{:.1}", g).replace('.', ",")
+        // до сотых без лишних нулей: 4,5; 2,7; 2,75
+        let t = format!("{:.2}", g);
+        t.trim_end_matches('0').trim_end_matches('.').replace('.', ",")
     }
 }
 
