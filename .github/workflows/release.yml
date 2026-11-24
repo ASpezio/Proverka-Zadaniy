@@ -49,9 +49,19 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item src-tauri/target/release/ProverkaZadaniy.exe dist/ProverkaZadaniy.exe
           Copy-Item src-tauri/target/release/ProverkaZadaniy.exe "Проверка заданий.exe"
-          powershell -NoProfile -ExecutionPolicy Bypass -File tools/make_setup.ps1 -NoPause
-          $setup = Get-ChildItem dist -Filter "*.exe" | Where-Object { $_.Name -ne "ProverkaZadaniy.exe" } | Select-Object -First 1
-          if ($setup) { Move-Item $setup.FullName dist/Proverka-Setup.exe -Force }
+
+      # установщик (NSIS — есть на сборочных машинах GitHub; если нет — ставится);
+      # не собрался — релиз всё равно выходит с ProverkaZadaniy.exe
+      - name: Установщик
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $nsis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $nsis) { $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress | Out-Null; $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          & $nsis /V2 "/DVERSION=$env:VERSION" tools/setup.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis завершился с ошибкой $LASTEXITCODE" }
           Get-ChildItem dist
 
       - uses: actions/upload-artifact@v4

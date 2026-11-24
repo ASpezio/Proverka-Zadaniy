@@ -365,7 +365,7 @@ textarea.input { resize: vertical; min-height: 120px; line-height: 1.5; }
 .pen-line i::after { content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 40px; background: linear-gradient(90deg, transparent, rgba(255,255,255,.7)); animation: shimmer 1.4s infinite; }
 .progress-meta { display: flex; justify-content: space-between; font-size: 12.5px; color: var(--ink-2); margin-top: 8px; font-variant-numeric: tabular-nums; }
 
-.queue { display: grid; gap: 6px; }
+.queue { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
 .q-item { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 9px 12px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); position: relative; overflow: hidden; }
 .q-item.running { border-color: rgba(122,60,240,.5); }
 .q-item.running::before { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 20%, rgba(122,60,240,.12) 45%, rgba(25,227,177,.10) 55%, transparent 80%); animation: beamLoop 1.8s linear infinite; }
@@ -779,7 +779,7 @@ pre.code { margin: 0; padding: 14px; border-radius: 12px; background: #0e1029; c
 .q-filters .group-tabs { flex-wrap: wrap; }
 .q-f-row { display: flex; gap: 8px; flex-wrap: wrap; }
 .q-f-row .select, .q-f-row .input { width: auto; flex: 1 1 140px; padding: 6px 10px; font-size: 13px; }
-.q-group { display: grid; gap: 6px; margin-bottom: 10px; }
+.q-group { display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; margin-bottom: 10px; }
 .q-sec { display: flex; align-items: baseline; gap: 10px; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); padding: 8px 2px 6px; cursor: pointer; color: var(--ink); font: inherit; position: sticky; top: 0; z-index: 3; background: var(--paper); }
 .q-sec-t { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .q-sec-g { font-weight: 500; color: var(--uv); margin-left: 6px; }
@@ -1314,3 +1314,4 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .set-sub { display: grid; gap: 6px; }
 .upd-notes { max-height: 240px; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-s, 8px); background: var(--paper); font-size: 13.5px; }
 .cmp.dis { opacity: .45; cursor: default; }
+.lq-prog[hidden] { display: none; }
