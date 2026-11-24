@@ -1160,6 +1160,18 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let replace = p.get("replace").bool_or(false);
             let add_roster = p.get("roster").bool_or(true);
             let (mut added, mut updated, mut skipped, mut new_students, mut flagged) = (0, 0, 0, 0, 0);
+            let (mut comments, mut no_variant) = (0, 0);
+            // одинаковые ФИО в разных строках файла (например, обезличенный файл) — оценки таких строк сольются
+            let mut seen_names: std::collections::BTreeMap<String, usize> = Default::default();
+            {
+                let mut per: std::collections::BTreeSet<(String, String)> = Default::default();
+                for im in &list {
+                    if !per.insert((super::moodle::name_key(&im.student), im.code.clone())) {
+                        *seen_names.entry(super::moodle::name_key(&im.student)).or_default() += 1;
+                    }
+                }
+            }
+            let dup_rows: usize = seen_names.values().sum();
             let mut codes: Vec<String> = Vec::new();
             let mut tests: Vec<String> = Vec::new();
             let subject = p.get("subject").str_or("").trim().to_string();
@@ -1192,8 +1204,29 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     }
                     let exists = j.entries.iter().any(|e| e.group == group && e.student == name && e.code == im.code);
                     if exists && !replace {
+                        // оценку не трогаем, но отзыв из Moodle дописываем, если его ещё не было
+                        if !im.comment.trim().is_empty() {
+                            if let Some(e) = j.entries.iter_mut().find(|e| e.group == group && e.student == name && e.code == im.code && e.comment.trim().is_empty()) {
+                                e.comment = im.comment.clone();
+                                e.flag = super::journal::comment_flags(&im.comment);
+                                comments += 1;
+                                if super::journal::mentions_ai(&im.comment) {
+                                    flagged += 1;
+                                }
+                                if super::journal::mentions_no_variant(&im.comment) {
+                                    no_variant += 1;
+                                }
+                                continue;
+                            }
+                        }
                         skipped += 1;
                         continue;
+                    }
+                    if !im.comment.trim().is_empty() {
+                        comments += 1;
+                    }
+                    if super::journal::mentions_no_variant(&im.comment) {
+                        no_variant += 1;
                     }
                     j.upsert(Entry {
                         group: group.clone(),
@@ -1208,7 +1241,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         comment: im.comment.clone(),
                         style: Vec::new(),
                         // в отзыве преподаватель упомянул ИИ или нейросеть — помечаем оценку
-                        flag: if super::journal::mentions_ai(&im.comment) { "ai_text".into() } else { String::new() },
+                        flag: super::journal::comment_flags(&im.comment),
                     });
                     if super::journal::mentions_ai(&im.comment) {
                         flagged += 1;
@@ -1219,10 +1252,23 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         added += 1;
                     }
                 }
+                // студенты без единой оценки в файле — тоже в список группы (у них долги)
+                if add_roster {
+                    for (name, email) in super::moodle::students_of(&rows) {
+                        let roster = j.rosters.get(&group).cloned().unwrap_or_default();
+                        if !roster.iter().any(|n| super::moodle::same_person(n, &name)) {
+                            j.rosters.entry(group.clone()).or_default().push(name.clone());
+                            new_students += 1;
+                            if !email.trim().is_empty() {
+                                j.emails.entry(group.clone()).or_default().insert(name, email.trim().to_string());
+                            }
+                        }
+                    }
+                }
                 j.save();
             }
             let mut v = journal_view(core, &p);
-            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes).with("tests", tests).with("flagged", flagged).with("group", group.as_str()));
+            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes).with("tests", tests).with("flagged", flagged).with("comments", comments).with("no_variant", no_variant).with("dup_names", seen_names.len()).with("dup_rows", dup_rows).with("group", group.as_str()));
             Ok(v)
         }
 
@@ -1823,7 +1869,8 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 let custom = j.kind_of(&group, &code) == "custom";
                 match p.get("grade").as_f64() {
                     Some(g) => j.upsert(Entry {
-                        grade: Some(if custom { g } else { super::core::norm_grade(g, true) }),
+                        // как вписал преподаватель, до сотых (2,6 из Moodle не превращается в 2,5)
+                        grade: Some(if custom { g } else { (g.clamp(0.0, 5.0) * 100.0).round() / 100.0 }),
                         group,
                         student,
                         code,
@@ -1831,9 +1878,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         date: super::core::now_s(),
                         file: "вручную".into(),
                         variant: String::new(),
+                        flag: super::journal::comment_flags(&p.get("comment").str_or("")),
                         comment: p.get("comment").str_or(""),
                         style: Vec::new(),
-                        flag: String::new(),
                     }),
                     None => j.entries.retain(|e| !(e.group == group && e.student == student && e.code == code)),
                 }
@@ -2459,7 +2506,7 @@ pub fn journal_view(core: &Arc<Core>, p: &Json) -> Json {
                     if !e.violation.is_empty() {
                         viol += 1;
                     }
-                    if !e.flag.is_empty() {
+                    if e.flag.contains("ai_text") {
                         flags += 1;
                     }
                     cells.set(

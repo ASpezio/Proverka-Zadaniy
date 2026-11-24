@@ -1382,3 +1382,11 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 /* длинные названия тем (тесты Moodle) — в 2–3 строки, полностью — в подсказке */
 .jt th.th-topic .th-code { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; white-space: normal; max-width: 170px; margin: 0 auto; }
 .jt th.th-topic .th-code.long { width: 170px; }
+/* пометки клетки журнала: «в?» — в работе не указан вариант; точка в углу — есть комментарий/отзыв */
+.jt td.cell { position: relative; }
+.jt td.cell .nv { position: absolute; top: 3px; right: 4px; font: 700 10px/1 var(--font-ui); color: var(--g3); background: color-mix(in srgb, var(--g3) 14%, var(--card)); border-radius: 4px; padding: 2px 3px; }
+.jt td.cell .cm { position: absolute; bottom: 5px; right: 6px; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); }
+.jt td.cell .nv + .cm, .jt td.cell .cm { pointer-events: none; }
+.jc-any { margin-top: 10px; max-width: 280px; }
+.j-legend .nv-l { font: 700 10px/1 var(--font-ui); color: var(--g3); background: color-mix(in srgb, var(--g3) 14%, var(--card)); border-radius: 4px; padding: 2px 3px; }
+.j-legend .cm-l { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); vertical-align: middle; }

@@ -3676,7 +3676,7 @@ function openMoodleJournal() {
       S.state = await api("state"); updateRail();
       const x = r.imported;
       const works = x.codes.filter((c) => !x.tests.includes(c));
-      $("#mjOut", m).innerHTML = `<div class="ev"><span class="w ok"></span><div>${works.length ? `Работы: ${works.map(esc).join(", ")}. ` : ""}${x.tests.length ? `Тесты: ${x.tests.map(esc).join(", ")}. ` : ""}Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.${x.flagged ? `<br><b>В отзывах упоминается ИИ: ${x.flagged}</b> — такие оценки помечены в журнале.` : ""}</div></div>`;
+      $("#mjOut", m).innerHTML = `<div class="ev"><span class="w ok"></span><div>${works.length ? `Работы: ${works.map(esc).join(", ")}. ` : ""}${x.tests.length ? `Тесты: ${x.tests.map(esc).join(", ")}. ` : ""}Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.${x.comments ? ` Отзывов перенесено в комментарии: ${x.comments}.` : ""}${x.flagged ? `<br><b>В отзывах упоминается ИИ: ${x.flagged}</b> — такие оценки помечены в журнале.` : ""}${x.no_variant ? `<br><b>Не указан вариант: ${x.no_variant}</b> (в отзыве «Вариант?») — у таких оценок значок «в?».` : ""}</div></div>${x.dup_rows ? `<div class="ev"><span class="w bad"></span><div>В файле повторяются одни и те же ФИО (${x.dup_names} чел., лишних строк: ${x.dup_rows}) — оценки этих строк слились в одну. Если ФИО в файле заменены для обезличивания, загрузите файл с настоящими ФИО.</div></div>` : ""}${!x.added && !x.updated && !x.comments ? `<div class="ev"><span class="w bad"></span><div>Ни одной оценки не загружено. ${x.skipped ? "Все оценки уже есть в журнале — включите «Заменять оценки», чтобы обновить их." : "В файле не нашлось оценок: проверьте, что это экспорт журнала оценок (Оценки → Экспорт) или таблица оценок задания."}</div></div>` : ""}`;
       SND.play("add");
     } catch (e) { $("#mjOut", m).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; if (String(e).includes("какой работе")) $("#mjCode", m).focus(); }
   };
@@ -3788,10 +3788,10 @@ function renderJournal() {
   };
   const cell = (s, t) => {
     const x = s.cells[t.code];
-    const tip = x ? [x.file, x.raw != null && x.raw !== x.grade ? `в Moodle ${fmtG(x.raw)}` : "", x.comment, x.flag ? "в отзыве упоминается ИИ" : ""].filter(Boolean).join(" — ") : t.kind === "custom" ? "пусто — щёлкните, чтобы вписать" : t.due ? "нет оценки — долг" : "нет оценки";
+    const tip = x ? [x.file, x.raw != null && x.raw !== x.grade ? `в Moodle ${fmtG(x.raw)}` : "", x.comment, hasFlag(x, "ai_text") ? "в отзыве упоминается ИИ" : "", hasFlag(x, "no_variant") ? "в работе не указан вариант" : ""].filter(Boolean).join(" — ") : t.kind === "custom" ? "пусто — щёлкните, чтобы вписать" : t.due ? "нет оценки — долг" : "нет оценки";
     if (t.kind === "custom") return `<td class="cell custom" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${x && x.grade != null ? `<span class="cv">${fmtNum(x.grade)}</span>` : `<span class="miss">·</span>`}</td>`;
     const gr = x?.grade;
-    return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${gr != null ? `<span class="gm g${Math.min(5, Math.max(2, Math.round(gr)))} ${x.violation ? "v" : ""} ${x.flag ? "f" : ""}">${fmtG(gr)}</span>` : `<span class="miss ${t.due ? "due" : ""}">—</span>`}</td>`;
+    return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${gr != null ? `<span class="gm g${Math.min(5, Math.max(2, Math.round(gr)))} ${x.violation ? "v" : ""} ${hasFlag(x, "ai_text") ? "f" : ""}">${fmtG(gr)}</span>${hasFlag(x, "no_variant") ? `<sup class="nv" title="в работе не указан вариант">в?</sup>` : ""}${x.comment ? `<i class="cm" aria-label="есть комментарий"></i>` : ""}` : `<span class="miss ${t.due ? "due" : ""}">—</span>`}</td>`;
   };
   body.innerHTML = `${filterBar}
     <div class="group-tabs">${j.groups.map((x) => `<button data-g="${esc(x.name)}" class="${x.name === S.jGroup ? "on" : ""}">${esc(x.name || "без группы")}${x.program ? ` <span class="tab-prog">${esc(x.program)}</span>` : ""} <span class="muted small">${x.students.length}</span></button>`).join("")}
@@ -3817,7 +3817,7 @@ function renderJournal() {
         <td>${s.violations ? `<span class="chip solid-bad">${s.violations}</span>` : `<span class="muted">0</span>`}</td>
         <td>${s.missing ? `<span class="chip warn">${s.missing}</span>` : `<span class="muted">0</span>`}</td>
       </tr>`).join("")}</tbody></table></div>
-      <p class="small muted j-legend"><span class="gm g2 v mini">2</span> «2» за ИИ или списывание · <span class="gm g4 f mini">4</span> в отзыве (например, из Moodle) упоминается ИИ · «2» без заливки — работа оценена на «2» или не сдана · <span class="miss due">—</span> долг: работа уже оценивалась у других или срок прошёл${j.opts?.tests_min2 ? " · тесты на 0–1,9 показаны как «2»" : ""}. Щёлкните по заголовку темы, чтобы задать даты, вид, удалить её или поставить «2» несдавшим.</p>`
+      <p class="small muted j-legend"><span class="gm g2 v mini">2</span> «2» за ИИ или списывание · <span class="gm g4 f mini">4</span> в отзыве (например, из Moodle) упоминается ИИ · «2» без заливки — работа оценена на «2» или не сдана · <span class="nv-l">в?</span> по отзыву не указан вариант · <i class="cm-l"></i> есть комментарий (наведите на оценку) · <span class="miss due">—</span> долг: работа уже оценивалась у других или срок прошёл${j.opts?.tests_min2 ? " · тесты на 0–1,9 показаны как «2»" : ""}. Щёлкните по заголовку темы, чтобы задать даты, вид, удалить её или поставить «2» несдавшим.</p>`
       : emptyArt("В группе пока никого", "Добавьте список группы, запишите проверку или загрузите оценки из Moodle.")}`;
   const refilter = async () => {
     S.jFilter = { semester: $("#jfSem").value, subject: $("#jfSub").value };
@@ -4080,7 +4080,7 @@ function openJournalAnalytics() {
       vals.forEach((v) => { const k = Math.min(5, Math.max(2, Math.round(v))); d[k]++; });
       const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
       const viol = g.students.filter((s) => s.cells[t.code]?.violation).length;
-      const flags = g.students.filter((s) => s.cells[t.code]?.flag).length;
+      const flags = g.students.filter((s) => hasFlag(s.cells[t.code], "ai_text")).length;
       return { t, vals, d, avg, viol, flags };
     });
     const all = rows.flatMap((r) => r.vals);
@@ -4110,6 +4110,9 @@ function openJournalAnalytics() {
 
 /** Варианты для n студентов (или пар) по порядку списка: cycle — с from по to и снова,
  *  order — from, from+1… без повторов, random — случайно, но поровну, clear — пусто. */
+/** Пометка оценки журнала из отзыва: "ai_text" — упоминается ИИ, "no_variant" — не указан вариант. */
+function hasFlag(x, f) { return !!x?.flag && String(x.flag).split(",").includes(f); }
+
 function dealVariants(n, mode, from, to) {
   from = Math.max(1, Math.round(from)); to = Math.max(from, Math.round(to));
   const span = to - from + 1;
@@ -4340,14 +4343,21 @@ function editCell(group, student, code) {
   }
   openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)}${t.title ? ` — ${esc(t.title)}` : ""} • ${esc(group)}</p>
     ${x ? `<p class="small">Сейчас: «${fmtG(x.grade)}»${x.raw != null && x.raw !== x.grade ? ` (в Moodle ${fmtG(x.raw)})` : ""}${x.violation ? ` (${x.violation === "ai" ? "ИИ" : "списывание"})` : ""}, ${esc(x.file)}, ${new Date(x.date * 1000).toLocaleDateString("ru-RU")}</p>` : `<p class="small muted">Оценки нет.</p>`}
-    ${x?.flag ? `<div class="ev"><span class="w medium"></span><div>В отзыве упоминается ИИ или нейросеть. Проверьте, нужно ли считать это нарушением.</div></div>` : ""}
+    ${hasFlag(x, "ai_text") ? `<div class="ev"><span class="w medium"></span><div>В отзыве упоминается ИИ или нейросеть. Проверьте, нужно ли считать это нарушением.</div></div>` : ""}
+    ${hasFlag(x, "no_variant") ? `<div class="ev"><span class="w medium"></span><div>По отзыву — в работе не указан вариант.</div></div>` : ""}
     <div class="override" id="jc">${gradeScale().map((gr) => `<button class="g${Math.floor(gr)} ${x?.grade === gr ? "on" : ""}" data-g="${gr}">${fmtG(gr)}</button>`).join("")}</div>
+    <label class="field jc-any"><span>или точная оценка (например, 2,6 за тест)</span><input class="input" id="jcAny" inputmode="decimal" placeholder="от 0 до 5" value="${x?.grade != null && !gradeScale().includes(x.grade) ? fmtG(x.grade) : ""}"></label>
     <label class="field" style="margin-top:12px"><span>Комментарий / отзыв</span><textarea class="input" id="jcCom" rows="3" placeholder="например: защитил устно">${esc(x?.comment || "")}</textarea></label>
     <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="jcSave">Сохранить</button>${x ? `<button class="btn ghost danger" id="jcDel">Убрать оценку</button>` : ""}</div>`);
   let sel = x?.grade ?? null;
-  $$("#jc [data-g]").forEach((b) => (b.onclick = () => { sel = +b.dataset.g; $$("#jc button").forEach((y) => y.classList.toggle("on", +y.dataset.g === sel)); }));
+  $$("#jc [data-g]").forEach((b) => (b.onclick = () => { sel = +b.dataset.g; $("#jcAny").value = ""; $$("#jc button").forEach((y) => y.classList.toggle("on", +y.dataset.g === sel)); }));
+  $("#jcAny").oninput = (e) => {
+    const v = parseFloat(e.target.value.replace(",", "."));
+    if (Number.isFinite(v) && v >= 0 && v <= 5) { sel = Math.round(v * 100) / 100; $$("#jc button").forEach((y) => y.classList.toggle("on", +y.dataset.g === sel)); }
+  };
+  $("#jcAny").onkeydown = (e) => { if (e.key === "Enter") $("#jcSave").click(); };
   $("#jcSave").onclick = async () => {
-    if (!sel) { toast("Выберите оценку", "err"); return; }
+    if (sel == null) { toast("Выберите оценку", "err"); return; }
     await loadJournal("journal_set", { group, student, code, grade: sel, comment: $("#jcCom").value });
     closeDrawer(); renderJournal();
   };

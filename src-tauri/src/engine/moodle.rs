@@ -519,6 +519,28 @@ pub fn import_grades(rows: &[Vec<String>], code: &str) -> Result<Vec<Imported>, 
 
 /// `prefer`: какой столбец брать, если Moodle выгрузил оценку в нескольких видах —
 /// auto (проценты → значение → буква), value, percent, letter.
+/// Все студенты файла Moodle (ФИО, почта) — и те, у кого ещё нет ни одной оценки.
+pub fn students_of(rows: &[Vec<String>]) -> Vec<(String, String)> {
+    let Some(head) = rows.first() else { return Vec::new() };
+    let c_email = col(head, &["адрес электронной почты", "email address", "электронная почта", "email"]);
+    let c_full = col(head, &["полное имя", "full name", "фамилия и имя"]);
+    let c_first = col(head, &["имя", "first name"]);
+    let c_last = col(head, &["фамилия", "last name", "surname"]);
+    if c_full.is_none() && c_first.is_none() && c_last.is_none() {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for r in rows.iter().skip(1) {
+        let get = |c: Option<usize>| c.and_then(|i| r.get(i)).map(|x| x.trim().to_string()).unwrap_or_default();
+        let full = get(c_full);
+        let name = if full.is_empty() { format!("{} {}", get(c_last), get(c_first)).trim().to_string() } else { full };
+        if !name.is_empty() && !out.iter().any(|(n, _)| same_person(n, &name)) {
+            out.push((name, get(c_email)));
+        }
+    }
+    out
+}
+
 pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Result<Vec<Imported>, String> {
     let head = rows.first().ok_or("Файл пустой")?;
     let c_email = col(head, &["адрес электронной почты", "email address", "электронная почта", "email"]);
@@ -707,6 +729,10 @@ mod tests {
         assert!((g("Тестирование по Разделу 1").unwrap() - 2.6).abs() < 1e-9);
         assert_eq!(got.iter().find(|x| x.code == "Итог курса").map(|x| x.kind.as_str()), Some("custom"));
         assert!(got.iter().any(|x| x.comment.contains("ИИ")));
+        assert!(super::super::journal::mentions_no_variant("Вариант?"));
+        assert!(super::super::journal::mentions_no_variant("какой  вариант? Файл не открывается"));
+        assert!(!super::super::journal::mentions_no_variant("Вариант 3, всё верно"));
+        assert_eq!(super::super::journal::comment_flags("ИИ. Вариант?"), "ai_text,no_variant");
     }
 
     #[test]

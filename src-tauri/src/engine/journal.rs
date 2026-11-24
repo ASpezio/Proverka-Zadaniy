@@ -79,6 +79,27 @@ pub fn mentions_ai(text: &str) -> bool {
     words.iter().any(|w| low.contains(w))
 }
 
+/// Отзыв говорит, что в работе не указан вариант: «Вариант?», «Какой вариант?», «вариант не указан».
+pub fn mentions_no_variant(text: &str) -> bool {
+    let low = text.to_lowercase().replace('ё', "е");
+    let compact: String = low.split_whitespace().collect::<Vec<_>>().join(" ");
+    ["вариант?", "вариант ?", "какой вариант", "вариант не указан", "не указан вариант", "не указали вариант", "не указал вариант", "не указала вариант", "нет варианта", "без варианта", "номер варианта?", "укажите вариант", "вариант не подписан"]
+        .iter()
+        .any(|w| compact.contains(w))
+}
+
+/// Пометки оценки по отзыву: «ai_text» (упоминается ИИ), «no_variant» (не указан вариант), через запятую.
+pub fn comment_flags(text: &str) -> String {
+    let mut f: Vec<&str> = Vec::new();
+    if mentions_ai(text) {
+        f.push("ai_text");
+    }
+    if mentions_no_variant(text) {
+        f.push("no_variant");
+    }
+    f.join(",")
+}
+
 /// «2026-09-20T23:59» / «2026-09-20» → секунды (как будто UTC, без часового пояса).
 pub fn parse_local(s: &str) -> Option<i64> {
     let s = s.trim();
