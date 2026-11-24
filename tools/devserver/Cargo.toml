@@ -1,0 +1,10 @@
+[package]
+name = "devserver"
+version = "1.0.0"
+edition = "2021"
+description = "Тестовый стенд ядра без Tauri: HTTP-сервер для интерфейса в браузере, MCP по stdio, самопроверка"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2

@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri
+            tools/devserver
+
+      - name: Тесты ядра
+        working-directory: tools/devserver
+        run: cargo test --release
+        continue-on-error: true
+
+      - name: Версия сборки
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $d = Get-Date -Format "dd.MM.yyyy"
+          [IO.File]::WriteAllText("src-tauri/build_info.txt", "v$v · $d", (New-Object System.Text.UTF8Encoding $false))
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Сборка
+        working-directory: src-tauri
+        run: cargo build --release
+
+      - name: Файлы релиза
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item src-tauri/target/release/ProverkaZadaniy.exe dist/ProverkaZadaniy.exe
+          Copy-Item src-tauri/target/release/ProverkaZadaniy.exe "Проверка заданий.exe"
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools/make_setup.ps1 -NoPause
+          $setup = Get-ChildItem dist -Filter "*.exe" | Where-Object { $_.Name -ne "ProverkaZadaniy.exe" } | Select-Object -First 1
+          if ($setup) { Move-Item $setup.FullName dist/Proverka-Setup.exe -Force }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: proverka-${{ env.VERSION }}
+          path: dist/*.exe
+
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: Проверка заданий ${{ env.VERSION }}
+          files: |
+            dist/ProverkaZadaniy.exe
+            dist/Proverka-Setup.exe
+          generate_release_notes: true
+          fail_on_unmatched_files: false

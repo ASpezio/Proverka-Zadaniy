@@ -1,0 +1,26 @@
+# сборка
+/src-tauri/target/
+/src-tauri/gen/
+/tools/devserver/target/
+/dist/
+*.exe
+*.pdb
+*.log
+*.part
+
+# номер и дата сборки пишутся при сборке
+/src-tauri/build_info.txt
+/tools/build_number.txt
+
+# данные преподавателя: работы, журналы, ведомости — только у себя
+/data/
+*.proverka
+_check.bat
+_check.log
+
+# системное
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

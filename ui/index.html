@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="ru" data-theme="paper">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Проверка заданий</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <!-- Обложка журнала: шаги работы -->
+  <aside class="rail">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 48 48" aria-hidden="true">
+        <rect x="6" y="5" width="28" height="36" rx="5" class="bm-page"/>
+        <path d="M12 14h16M12 20h12M12 26h16" class="bm-lines"/>
+        <circle cx="33" cy="33" r="10" class="bm-dot"/>
+        <path d="M28.5 33.2l3.1 3.1 5.8-6.6" class="bm-check"/>
+      </svg>
+      <div>
+        <div class="brand-name">Проверка заданий</div>
+        <div class="brand-sub" id="brandSub">проверка студенческих работ</div>
+        <div class="brand-ver" id="appVer"></div>
+      </div>
+    </div>
+
+    <nav class="steps" id="steps" aria-label="Шаги">
+      <div class="ribbon" id="ribbon" aria-hidden="true"></div>
+      <button class="step" data-view="tasks"><span class="step-n">1</span><span class="step-t">Задания</span><span class="step-badge" id="bTasks"></span></button>
+      <button class="step" data-view="works"><span class="step-n">2</span><span class="step-t">Работы студентов</span><span class="step-badge" id="bWorks"></span></button>
+      <button class="step" data-view="model"><span class="step-n">3</span><span class="step-t">Нейросеть и MCP</span><span class="step-badge" id="bModel"></span></button>
+      <button class="step" data-view="check"><span class="step-n">4</span><span class="step-t">Проверка</span><span class="step-badge" id="bCheck"></span></button>
+      <button class="step" data-view="report"><span class="step-n">5</span><span class="step-t">Ведомость</span><span class="step-badge" id="bReport"></span></button>
+      <button class="step" data-view="journal"><span class="step-n">6</span><span class="step-t">Журнал группы</span><span class="step-badge" id="bJournal"></span></button>
+      <button class="step" data-view="mcplog"><span class="step-n">7</span><span class="step-t">Журнал MCP</span><span class="step-badge" id="bMcp"></span></button>
+    </nav>
+
+    <div class="rail-foot">
+      <div class="model-pill" id="modelPill" title="Выбранная нейросеть">
+        <span class="dot"></span><span class="mp-text">Модель не выбрана</span>
+      </div>
+      <button class="set-btn" id="lookBtn" title="Темы, цвета и шрифты приложения">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18c1.1 0 1.7-.8 1.7-1.7 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-.9.8-1.7 1.7-1.7H16a5 5 0 0 0 5-5c0-4-4-7.2-9-7.2z"/><circle cx="7.5" cy="11" r="1.2"/><circle cx="10.5" cy="7.2" r="1.2"/><circle cx="15" cy="7.5" r="1.2"/></svg>
+        <span>Оформление</span>
+        <span class="set-state" id="lookState"></span>
+      </button>
+      <button class="set-btn" id="setBtn" title="Настройки: тема, звук, трей, автозапуск">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
+        <span>Настройки</span>
+        <span class="set-state" id="setState"></span>
+      </button>
+      <div class="credit-box">
+        <button class="credit" id="creditBtn" title="Написать автору в Telegram">Автор — Spezio. Вопросы и идеи: Telegram @ASpezio</button>
+        <div class="ai-note">Оценки предлагает нейросеть, она может ошибаться. Спорные работы проверяйте сами.</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Лист тетради -->
+  <main class="sheet-wrap">
+    <div class="sheet" id="sheet">
+      <div class="margin-line" aria-hidden="true"></div>
+      <div class="view" id="view"></div>
+    </div>
+  </main>
+</div>
+
+<!-- Выдвижная панель подробностей -->
+<div class="drawer-backdrop" id="drawerBackdrop"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <button class="drawer-close" id="drawerClose" aria-label="Закрыть">✕</button>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<!-- Перетаскивание файлов -->
+<div class="drop-veil" id="dropVeil"><div class="drop-card"><div class="drop-papers"><i></i><i></i><i></i></div><div class="drop-text" id="dropText">Отпустите, чтобы добавить</div></div></div>
+
+<div class="stamp" id="stamp" aria-hidden="true"><span>ПРОВЕРЕНО</span><small id="stampDate"></small></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

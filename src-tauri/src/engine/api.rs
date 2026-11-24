@@ -1,0 +1,2220 @@
+//! Команды интерфейса: `dispatch(method, payload_json) -> json`.
+
+use super::core::{natural_key, Core, Outcome};
+use super::extras;
+use super::journal::Entry;
+use super::report::Block;
+use super::grader;
+use super::json::{self, Json};
+use super::llm::{self, Provider};
+use super::mcp::{self, McpClient};
+use super::report;
+use super::settings;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
+pub fn dispatch(core: &Arc<Core>, method: &str, payload: &str) -> Result<String, String> {
+    let p = if payload.trim().is_empty() { Json::obj() } else { json::parse(payload)? };
+    // часовой пояс компьютера (для дат в ведомости) — интерфейс присылает с каждым вызовом
+    if let Some(tz) = p.get("tz").as_f64() {
+        report::TZ_MIN.store(tz as i64, Ordering::Relaxed);
+    }
+    // паника внутри метода не должна ронять приложение и блокировать данные
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle(core, method, &p))).map_err(|e| {
+        let msg = e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+        core.log(&format!("Внутренняя ошибка в «{}»: {}", method, msg));
+        format!("Внутренняя ошибка ({}). Подробности — в журнале MCP на шаге «Проверка».", msg)
+    })??;
+    Ok(r.to_string())
+}
+
+/// Команды, которые меняют то, что сейчас проверяется. Во время проверки они запрещены.
+const LOCKED_WHILE_RUNNING: &[&str] = &[
+    "add_paths",
+    "remove",
+    "clear",
+    "set_doc_kind",
+    "set_work_assignment",
+    "set_work_group",
+    "set_task_scope",
+    "set_pdf_text",
+    "set_pages",
+    "set_source_text",
+    "set_page_image",
+    "merge_works",
+    "reset_settings",
+    "group_save",
+    "moodle_import",
+    "llama_start",
+    "ai_decide",
+    "group_delete",
+    "journal_roster",
+    "lmstudio_reload",
+    "add_photo_work",
+    "journal_student",
+    "undo",
+    "backup_restore",
+    "local_stop",
+    "import_all",
+    "update_apply",
+];
+
+pub const LOCK_MESSAGE: &str = "Нейросеть сейчас проверяет работы — изменения недоступны. Дождитесь окончания или нажмите «Остановить».";
+
+fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
+    if core.running.load(Ordering::SeqCst) {
+        let settings_lock = method == "set_settings" && {
+            // во время проверки можно менять только то, что не влияет на неё: оформление, звук, трей
+            let s = p.get("settings");
+            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "privacy_note"))
+        };
+        if LOCKED_WHILE_RUNNING.contains(&method) || settings_lock {
+            return Err(LOCK_MESSAGE.into());
+        }
+    }
+    // перед удалением запоминаем состояние — его вернёт «Отменить»
+    let undoable = match method {
+        "remove" => Some("удаление"),
+        "clear" => Some(if p.get("kind").str_or("") == "tasks" { "очистка заданий" } else { "очистка работ" }),
+        "merge_works" => Some("объединение работ"),
+        "group_delete" => Some("удаление группы"),
+        "journal_clear" => Some("очистка оценок группы"),
+        "journal_student" => Some(if p.get("action").str_or("") == "delete" { "удаление студента" } else { "переименование студента" }),
+        "journal_roster" if p.get("names").as_arr().is_empty() => Some("удаление списка группы"),
+        _ => None,
+    };
+    if let Some(what) = undoable {
+        core.snapshot(what);
+    }
+    let res = handle_inner(core, method, &p);
+    // удалили работы — распакованные из архивов Moodle файлы больше не нужны
+    if res.is_ok() && matches!(method, "remove" | "clear" | "merge_works" | "undo" | "backup_restore") {
+        core.cleanup_moodle();
+    }
+    res
+}
+
+fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
+    match method {
+        "state" => Ok(core.state_json()),
+
+        "undo" => {
+            let what = core.undo()?;
+            Ok(core.state_json().with("undone", what))
+        }
+
+        "backups" => Ok(Json::obj().with("list", core.backups()).with("dir", core.data_dir.join("backups").to_string_lossy().to_string())),
+
+        "backup_restore" => {
+            core.restore_backup(&p.get("name").str_or(""))?;
+            Ok(core.state_json())
+        }
+
+        "backup_now" => {
+            let _ = std::fs::remove_dir_all(core.data_dir.join("backups").join(super::core::ymd(super::core::now_s() as i64 + super::report::TZ_MIN.load(Ordering::Relaxed) * 60)));
+            core.save_session();
+            core.journal.lock().unwrap_or_else(|e| e.into_inner()).save();
+            core.backup_daily();
+            Ok(Json::obj().with("list", core.backups()))
+        }
+
+        "add_paths" => {
+            let kind = p.get("kind").str_or("works");
+            let paths = p.get("paths").str_list();
+            let errors = if kind == "tasks" { core.add_tasks(&paths, None, &p.get("scope").str_or("")) } else { core.add_works(&paths, None, &p.get("group").str_or("")) };
+            core.compute_plagiarism();
+            Ok(core.state_json().with("errors", errors))
+        }
+
+        "remove" => {
+            let id = p.get("id").str_or("");
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if p.get("kind").str_or("") == "tasks" {
+                    ws.tasks.retain(|t| t.id != id);
+                    let mut w2 = std::mem::take(&mut *ws);
+                    core.rebuild_sets(&mut w2);
+                    *ws = w2;
+                } else {
+                    ws.works.retain(|w| w.id != id);
+                    ws.outcomes.remove(&id);
+                }
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "clear" => {
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                match p.get("kind").str_or("").as_str() {
+                    "tasks" => {
+                        ws.tasks.clear();
+                        ws.sets.clear();
+                    }
+                    "results" => {
+                        for o in ws.outcomes.values_mut() {
+                            *o = Outcome { status: "pending".into(), ..Default::default() };
+                        }
+                    }
+                    _ => {
+                        ws.works.clear();
+                        ws.outcomes.clear();
+                        ws.plag.clear();
+                    }
+                }
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "set_doc_kind" => {
+            let id = p.get("id").str_or("");
+            let kind = super::assign::DocKind::from_str(&p.get("kind").str_or("task"));
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(t) = ws.tasks.iter_mut().find(|t| t.id == id) {
+                    t.kind = kind;
+                }
+                if let Some(code) = p.get("code").as_str() {
+                    if let Some(t) = ws.tasks.iter_mut().find(|t| t.id == id) {
+                        t.code = code.to_string();
+                    }
+                }
+                let mut w2 = std::mem::take(&mut *ws);
+                core.rebuild_sets(&mut w2);
+                *ws = w2;
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "set_work_assignment" => {
+            let id = p.get("id").str_or("");
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = ws.works.iter_mut().find(|w| w.id == id || id == "*") {
+                    w.assignment = p.get("code").as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+                }
+                if id == "*" {
+                    let code = p.get("code").as_str().map(|s| s.to_string()).filter(|s| !s.is_empty());
+                    for w in ws.works.iter_mut() {
+                        w.assignment = code.clone();
+                    }
+                }
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "set_work_group" => {
+            let ids = p.get("ids").str_list();
+            let group = p.get("group").str_or("").trim().to_string();
+            if group.is_empty() {
+                return Err("Укажите группу".into());
+            }
+            let mut moved: Vec<(String, String)> = Vec::new();
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                for w in ws.works.iter_mut() {
+                    if ids.contains(&w.id) && w.group != group {
+                        moved.push((w.group.clone(), w.name.clone()));
+                        w.group = group.clone();
+                    }
+                }
+            }
+            // оценки этих работ, уже записанные в журнал, переезжают вместе с ними
+            if !moved.is_empty() {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let mut changed = false;
+                for e in j.entries.iter_mut() {
+                    if moved.iter().any(|(g, f)| &e.group == g && &e.file == f) {
+                        e.group = group.clone();
+                        changed = true;
+                    }
+                }
+                if changed {
+                    j.save();
+                }
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "set_task_scope" => {
+            // для кого задания: по id набора (все его файлы) или по id файлов
+            let scope = p.get("scope").str_or("").trim().to_string();
+            let set_id = p.get("set").str_or("");
+            let ids = p.get("ids").str_list();
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let set_files: Vec<(String, String)> = ws.sets.iter().filter(|s| s.id == set_id).map(|s| (s.code.clone(), s.scope.clone())).collect();
+                for t in ws.tasks.iter_mut() {
+                    let in_set = set_files.iter().any(|(c, sc)| &t.code == c && &t.scope == sc);
+                    if ids.contains(&t.id) || in_set {
+                        t.scope = scope.clone();
+                    }
+                }
+                let mut w2 = std::mem::take(&mut *ws);
+                core.rebuild_sets(&mut w2);
+                *ws = w2;
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "group_save" => {
+            let name = p.get("name").str_or("").trim().to_string();
+            let old = p.get("old_name").str_or("").trim().to_string();
+            if name.is_empty() {
+                return Err("Укажите название группы".into());
+            }
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                if !old.is_empty() && old != name {
+                    if j.groups.iter().any(|g| g.name == name) {
+                        return Err(format!("Группа «{}» уже есть", name));
+                    }
+                    j.rename_group(&old, &name);
+                }
+                let program = p.get("program").str_or("").trim().to_string();
+                let note = p.get("note").str_or("");
+                match j.groups.iter_mut().find(|g| g.name == name) {
+                    Some(g) => {
+                        g.program = program;
+                        g.note = note;
+                    }
+                    None => j.groups.push(super::journal::GroupInfo { name: name.clone(), program, note }),
+                }
+                if !p.get("roster").is_null() {
+                    let names: Vec<String> = p
+                        .get("roster")
+                        .str_list()
+                        .into_iter()
+                        .map(|n| n.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == ' ' || c == '\t').trim().to_string())
+                        .filter(|n| !n.is_empty())
+                        .collect();
+                    if names.is_empty() {
+                        j.rosters.remove(&name);
+                        j.assigned.remove(&name);
+                        j.teams.remove(&name);
+                    } else {
+                        if let Some(m) = j.assigned.get_mut(&name) {
+                            m.retain(|k, _| names.contains(k));
+                        }
+                        if let Some(m) = j.teams.get_mut(&name) {
+                            m.retain(|k, _| names.contains(k));
+                        }
+                        j.rosters.insert(name.clone(), names);
+                    }
+                }
+                j.save();
+            }
+            if !old.is_empty() && old != name {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                for w in ws.works.iter_mut() {
+                    if w.group == old {
+                        w.group = name.clone();
+                    }
+                }
+                for t in ws.tasks.iter_mut() {
+                    if t.scope == old {
+                        t.scope = name.clone();
+                    }
+                }
+                let mut w2 = std::mem::take(&mut *ws);
+                core.rebuild_sets(&mut w2);
+                *ws = w2;
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "group_delete" => {
+            let name = p.get("name").str_or("");
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                j.groups.retain(|g| g.name != name);
+                j.rosters.remove(&name);
+                j.assigned.remove(&name);
+                j.teams.remove(&name);
+                j.save();
+            }
+            Ok(core.state_json())
+        }
+
+        "programs_save" => {
+            let list = p.get("programs").str_list();
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                st.set("programs", list);
+            }
+            core.save_settings();
+            Ok(core.state_json())
+        }
+
+        "set_pdf_text" => {
+            let id = p.get("id").str_or("");
+            let text = p.get("text").str_or("");
+            // pdf.js не смог открыть файл (повреждён, защищён паролем) — не блокируем проверку
+            let failed = p.get("failed").str_or("");
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(w) = ws.works.iter_mut().find(|w| w.id == id) {
+                    w.notes.retain(|n| !n.contains("PDF"));
+                    if !failed.is_empty() {
+                        w.needs_pdf = false;
+                        w.notes.push(format!("Не удалось прочитать PDF: {} — пересохраните файл или попросите студента прислать .docx", failed));
+                    } else {
+                        let src = std::mem::take(&mut w.sources);
+                        let main = w.path.clone();
+                        w.pages.retain(|pg| pg.src == main);
+                        w.transcript.clear();
+                        w.transcribed = false;
+                        w.visible = super::text::tidy(&text);
+                        w.marked = w.visible.clone();
+                        w.needs_pdf = w.visible.trim().is_empty() && w.pages.is_empty();
+                        w.notes.push("Текст извлечён из PDF; скрытый текст в PDF не определяется".into());
+                        core.attach_sources(w, &src);
+                    }
+                }
+                if let Some(t) = ws.tasks.iter_mut().find(|t| t.id == id) {
+                    if !failed.is_empty() {
+                        t.needs_pdf = false;
+                        t.notes.push(format!("Не удалось прочитать PDF: {}", failed));
+                    } else {
+                        t.marked = super::text::tidy(&text);
+                        t.notes.push("Текст извлечён из PDF; скрытые ловушки в PDF не определяются — загрузите .docx".into());
+                    }
+                }
+                let mut w2 = std::mem::take(&mut *ws);
+                core.rebuild_sets(&mut w2);
+                *ws = w2;
+            }
+            core.compute_plagiarism();
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // страницы скана PDF, отрисованные интерфейсом в JPEG
+        "set_pages" => {
+            let id = p.get("id").str_or("");
+            let images: Vec<Vec<u8>> = p.get("images").str_list().iter().map(|x| b64_decode(x)).filter(|b| !b.is_empty()).collect();
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let w = ws.works.iter_mut().find(|w| w.id == id).ok_or("работа не найдена")?;
+                if images.is_empty() {
+                    w.needs_pdf = false;
+                    w.notes.push("В PDF нет ни текста, ни страниц, которые удалось отрисовать".into());
+                } else {
+                    core.set_pdf_pages(w, &images);
+                }
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // текст (и страницы скана) PDF, присоединённого к работе вторым файлом
+        "set_source_text" => {
+            let id = p.get("id").str_or("");
+            let idx = p.get("i").i64_or(0).max(0) as usize;
+            let images: Vec<Vec<u8>> = p.get("images").str_list().iter().map(|x| b64_decode(x)).filter(|b| !b.is_empty()).collect();
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let w = ws.works.iter_mut().find(|w| w.id == id).ok_or("работа не найдена")?;
+                core.set_source_pdf(w, idx, &p.get("text").str_or(""), &images, &p.get("failed").str_or(""));
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // уменьшенное интерфейсом большое фото (или failed — отправим как есть)
+        "set_page_image" => {
+            let id = p.get("id").str_or("");
+            let idx = p.get("i").i64_or(0).max(0) as usize;
+            let data = b64_decode(&p.get("b64").str_or(""));
+            let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let w = ws.works.iter_mut().find(|w| w.id == id).ok_or("работа не найдена")?;
+            core.set_page_image(w, idx, if data.is_empty() { None } else { Some(&data) });
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // несколько файлов (страницы-фото, второй документ) — одна работа
+        "merge_works" => {
+            let ids = p.get("ids").str_list();
+            if ids.len() < 2 {
+                return Err("Выберите хотя бы две работы, которые нужно объединить".into());
+            }
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let mut extra: Vec<String> = Vec::new();
+                for id in &ids[1..] {
+                    if let Some(w) = ws.works.iter().find(|w| &w.id == id) {
+                        extra.push(w.path.clone());
+                        extra.extend(w.sources.iter().cloned());
+                    }
+                }
+                ws.works.retain(|w| !ids[1..].contains(&w.id));
+                for id in &ids[1..] {
+                    ws.outcomes.remove(id);
+                }
+                let main = ws.works.iter_mut().find(|w| w.id == ids[0]).ok_or("работа не найдена")?;
+                core.attach_sources(main, &extra);
+                if let Some(o) = ws.outcomes.get_mut(&ids[0]) {
+                    *o = super::core::Outcome { status: "pending".into(), ..Default::default() };
+                }
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "read_file_b64" => {
+            let id = p.get("id").str_or("");
+            let page = p.get("page").as_f64().map(|x| x as i64);
+            if let Some(si) = p.get("source").as_f64() {
+                let path = {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    ws.works.iter().find(|w| w.id == id).and_then(|w| w.pending_pdf.get(si.max(0.0) as usize).cloned())
+                }
+                .ok_or("файл не найден")?;
+                let data = std::fs::read(&path).map_err(|e| e.to_string())?;
+                return Ok(Json::obj().with("b64", b64(&data)).with("name", super::core::file_name(&path).as_str()));
+            }
+            let path = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                match page {
+                    Some(i) => ws.works.iter().find(|w| w.id == id).and_then(|w| w.pages.get(i.max(0) as usize)).map(|pg| pg.file.clone()),
+                    None => ws.works.iter().find(|w| w.id == id).map(|w| w.path.clone()).or_else(|| ws.tasks.iter().find(|t| t.id == id).map(|t| t.path.clone())),
+                }
+            }
+            .ok_or("файл не найден")?;
+            let b = std::fs::read(&path).map_err(|e| e.to_string())?;
+            Ok(Json::obj().with("b64", b64(&b)))
+        }
+
+        "work" => {
+            let id = p.get("id").str_or("");
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let w = ws.works.iter().find(|w| w.id == id).ok_or("работа не найдена")?;
+            Ok(core.work_json(&ws, w, true))
+        }
+
+        "assignment" => {
+            let code = p.get("code").str_or("");
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let s = ws.sets.iter().find(|s| s.id == code).or_else(|| ws.sets.iter().find(|s| s.code == code)).ok_or("набор не найден")?;
+            Ok(s.to_json(true))
+        }
+
+        "set_settings" => {
+            let new = p.get("settings").clone();
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                *st = settings::merge(&st.clone(), &new);
+                // списки заменяем целиком (merge их не сливает поэлементно)
+                for k in ["providers", "caps", "custom_markers"] {
+                    if !new.get(k).is_null() {
+                        st.set(k, new.get(k).clone());
+                    }
+                }
+            }
+            core.save_settings();
+            // оболочка обновляет меню трея (звук, вид прогресса)
+            (core.emit)("settings_saved", "{}".to_string());
+            // маркеры влияют на наборы заданий
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let mut w2 = std::mem::take(&mut *ws);
+                core.rebuild_sets(&mut w2);
+                *ws = w2;
+            }
+            // порог совпадения и «сколько одинаковых можно зачесть» — пересчитываем итоги
+            if !new.get("penalties").is_null() {
+                core.compute_plagiarism();
+            }
+            // ограничения оценки применяются и к уже проверенным работам
+            if !new.get("penalties").is_null() || !new.get("rules").is_null() || !new.get("caps").is_null() || !new.get("half_grades").is_null() {
+                core.refinalize_all();
+                core.save_session();
+            }
+            Ok(core.settings())
+        }
+
+        "reset_settings" => {
+            *core.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings::defaults();
+            core.save_settings();
+            Ok(core.settings())
+        }
+
+        "list_models" => {
+            let prov = Provider::from_json(p.get("provider"));
+            let models = llm::list_models(core.http.as_ref(), &prov)?;
+            Ok(Json::obj().with("models", models))
+        }
+
+        "provider_info" => {
+            // контекст: загруженный и максимальный (для LM Studio — по всем моделям)
+            let prov = Provider::from_json(p.get("provider"));
+            let info = if prov.kind == "lmstudio" { ctx_info_json(core, &prov) } else { Json::arr() };
+            let current = grader::detect_context(core, &prov);
+            Ok(Json::obj().with("models", info).with("current_ctx", current).with("kind", prov.kind.as_str()))
+        }
+
+        "lmstudio_reload" => {
+            let prov = Provider::from_json(p.get("provider"));
+            let ctx = p.get("ctx").i64_or(16384).clamp(1024, 1_048_576);
+            if prov.model.is_empty() {
+                return Err("Сначала выберите модель".into());
+            }
+            let out = grader::lmstudio_reload(&prov.model, ctx)?;
+            let now = grader::detect_context(core, &prov);
+            Ok(Json::obj().with("output", out.chars().rev().take(400).collect::<String>().chars().rev().collect::<String>()).with("current_ctx", now))
+        }
+
+        "test_provider" => {
+            let prov = Provider::from_json(p.get("provider"));
+            Ok(grader::test_provider(core, &prov))
+        }
+
+        "detect_local" => {
+            let mut out = Json::arr();
+            for (kind, url) in [("lmstudio", "http://localhost:1234/v1"), ("ollama", "http://localhost:11434"), ("llamacpp", "http://localhost:8080/v1")] {
+                let prov = Provider::from_json(&Json::obj().with("kind", kind).with("base_url", url));
+                let r = llm::list_models(core.http.as_ref(), &prov);
+                let info = if kind == "lmstudio" && r.is_ok() { ctx_info_json(core, &prov) } else { Json::arr() };
+                out.push(
+                    Json::obj()
+                        .with("kind", kind)
+                        .with("url", url)
+                        .with("online", r.is_ok())
+                        .with("models", r.clone().unwrap_or_default())
+                        .with("ctx", info)
+                        .with("error", r.err()),
+                );
+            }
+            Ok(out)
+        }
+
+        "start_check" => {
+            if core.running.load(Ordering::SeqCst) {
+                return Err("Проверка уже идёт".into());
+            }
+            let mut ids = p.get("ids").str_list();
+            let only_new = p.get("only_unchecked").bool_or(false);
+            {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if ws.works.is_empty() {
+                    return Err("Сначала загрузите работы студентов".into());
+                }
+                if ids.is_empty() {
+                    ids = ws
+                        .works
+                        .iter()
+                        .filter(|w| !only_new || ws.outcomes.get(&w.id).map(|o| o.status != "done").unwrap_or(true))
+                        .map(|w| w.id.clone())
+                        .collect();
+                }
+                // PDF, которые интерфейс ещё не успел прочитать, — проверяются без них
+                let pdf_wait: Vec<String> = ws.works.iter().filter(|w| ids.contains(&w.id) && w.needs_pdf && w.visible.is_empty() && w.pages.is_empty()).map(|w| w.id.clone()).collect();
+                if !pdf_wait.is_empty() && pdf_wait.len() == ids.len() {
+                    return Err("PDF-файлы ещё читаются — подождите пару секунд и запустите проверку снова".into());
+                }
+                ids.retain(|i| !pdf_wait.contains(i));
+            }
+            if ids.is_empty() {
+                return Err("Нет работ для проверки".into());
+            }
+            if grader::active_provider(core).map(|p| p.model.is_empty()).unwrap_or(true) {
+                return Err("Не выбрана модель — откройте раздел «Модель» и выберите её".into());
+            }
+            // «проверить заново»: не брать результаты прошлых проверок
+            core.no_cache.store(p.get("fresh").bool_or(false), Ordering::SeqCst);
+            let c = core.clone();
+            let n = ids.len();
+            std::thread::spawn(move || grader::run(c, ids));
+            Ok(Json::obj().with("started", true).with("count", n))
+        }
+
+        // снять работы с идущей проверки: из очереди — сразу, проверяемую — прервать
+        "dequeue" => {
+            let ids = p.get("ids").str_list();
+            let mut removed = 0;
+            for id in &ids {
+                let was_queued = {
+                    let mut q = core.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let before = q.len();
+                    q.retain(|x| x != id);
+                    before != q.len()
+                };
+                let st = {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    ws.outcomes.get(id).map(|o| (o.status.clone(), o.grade.is_some())).unwrap_or_default()
+                };
+                if was_queued {
+                    super::grader::emit_progress(core, id, if st.1 { "done" } else { "pending" }, "removed", "Снята с проверки");
+                    removed += 1;
+                } else if st.0 == "running" {
+                    core.dropped.lock().unwrap_or_else(|e| e.into_inner()).insert(id.clone());
+                    removed += 1;
+                } else {
+                    continue;
+                }
+                let t = core.run_total.load(Ordering::SeqCst);
+                core.run_total.store(t.saturating_sub(1), Ordering::SeqCst);
+            }
+            Ok(Json::obj().with("removed", removed).with("total", core.run_total.load(Ordering::SeqCst)))
+        }
+
+        // добавить работы в идущую проверку
+        "enqueue" => {
+            if !core.running.load(Ordering::SeqCst) {
+                return Err("Проверка не идёт".into());
+            }
+            let ids = p.get("ids").str_list();
+            let mut added = 0;
+            for id in ids {
+                let busy = {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    let exists = ws.works.iter().any(|w| w.id == id);
+                    !exists || ws.outcomes.get(&id).map(|o| o.status == "queued" || o.status == "running").unwrap_or(false)
+                };
+                if busy {
+                    continue;
+                }
+                core.dropped.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+                core.queue.lock().unwrap_or_else(|e| e.into_inner()).push(id.clone());
+                super::grader::emit_progress(core, &id, "queued", "queue", "");
+                core.run_total.fetch_add(1, Ordering::SeqCst);
+                added += 1;
+            }
+            Ok(Json::obj().with("added", added).with("total", core.run_total.load(Ordering::SeqCst)))
+        }
+
+        "cancel_check" => {
+            core.cancel.store(true, Ordering::SeqCst);
+            Ok(Json::obj().with("ok", true))
+        }
+
+        "set_override" => {
+            let id = p.get("id").str_or("");
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let o = ws.outcomes.entry(id).or_default();
+                o.override_grade = p.get("grade").as_f64().map(|g| super::core::norm_grade(g, true));
+                o.override_comment = p.get("comment").str_or("");
+                // преподаватель сам отмечает ИИ / списывание или снимает нарушение
+                if let Some(v) = p.get("violation").as_str() {
+                    if !["", "ai", "plagiarism", "none"].contains(&v) {
+                        return Err("неизвестное нарушение".into());
+                    }
+                    o.override_violation = v.to_string();
+                    o.apply_violation_override();
+                    if o.status != "done" && o.override_violation != "" && o.override_violation != "none" && o.checked_at == 0 {
+                        o.checked_at = super::core::now_s();
+                    }
+                }
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "ai_decide" => {
+            // решение преподавателя по подозрению на ИИ: keep — по содержанию, two — «2», "" — отменить
+            let decision = p.get("decision").str_or("");
+            if !["", "keep", "two"].contains(&decision.as_str()) {
+                return Err("неизвестное решение".into());
+            }
+            let mut ids = p.get("ids").str_list();
+            if let Some(id) = p.get("id").as_str() {
+                ids.push(id.to_string());
+            }
+            for id in &ids {
+                {
+                    let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(o) = ws.outcomes.get_mut(id) {
+                        o.ai_decision = decision.clone();
+                    }
+                }
+                core.refinalize(id)?;
+            }
+            core.save_session();
+            if core.settings().get("journal_auto").bool_or(true) {
+                core.journal_add_current();
+            }
+            Ok(core.state_json())
+        }
+
+        "report_preview" => {
+            if let Some(tz) = p.get("tz").as_f64() {
+                report::TZ_MIN.store(tz as i64, Ordering::Relaxed);
+            }
+            let (rows, stats) = report::rows(core, &p.get("group").str_or(""));
+            let list: Vec<Json> = rows
+                .iter()
+                .map(|r| {
+                    Json::obj()
+                        .with("n", r.n)
+                        .with("id", r.id.as_str())
+                        .with("file", r.file.as_str())
+                        .with("group", r.group.as_str())
+                        .with("variant", r.variant.as_str())
+                        .with("violation", r.violation.as_str())
+                        .with("grade", r.grade_num)
+                        .with("comment", r.comment.as_str())
+                })
+                .collect();
+            Ok(Json::obj().with("rows", list).with("stats", stats))
+        }
+
+        "export" => {
+            if let Some(tz) = p.get("tz").as_f64() {
+                report::TZ_MIN.store(tz as i64, Ordering::Relaxed);
+            }
+            let fmt = p.get("format").str_or("docx");
+            let path = p.get("path").str_or("");
+            if path.is_empty() {
+                return Err("не указан путь".into());
+            }
+            let bytes = match fmt.as_str() {
+                "xlsx" => report::xlsx(core, &p.get("group").str_or("")),
+                "csv" => report::csv(core, &p.get("group").str_or("")),
+                _ => report::docx(core, &p.get("group").str_or("")),
+            };
+            std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path))
+        }
+
+        "mcp_info" => {
+            let client = McpClient::new(core.clone(), "инспектор");
+            let init = client.initialize()?;
+            let tools = client.list_tools()?;
+            let exe = std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|_| "ProverkaZadaniy.exe".into());
+            Ok(Json::obj()
+                .with("server", init.get("serverInfo").clone())
+                .with("protocol", init.get("protocolVersion").clone())
+                .with("tools", Json::Arr(tools))
+                .with("exe", exe.as_str())
+                .with("config", mcp::client_config(&exe)))
+        }
+
+        "mcp_call" => {
+            let client = McpClient::new(core.clone(), "инспектор");
+            client.raw(&p.get("method").str_or("tools/list"), p.get("params").clone())
+        }
+
+        "prompt_preview" => {
+            let id = p.get("id").str_or("");
+            let client = McpClient::new(core.clone(), "предпросмотр");
+            let max = grader::active_provider(core).map(|p| grader::budget(&p).0).unwrap_or(40000);
+            let mode = core.settings().get("compress").str_or("dense");
+            let prompt = grader::build_direct_prompt_with(&client, &id, max.saturating_sub(grader::SYSTEM_DIRECT.chars().count()), if mode == "summary" { "dense" } else { &mode }, None)?;
+            Ok(Json::obj().with("system", grader::SYSTEM_DIRECT).with("user", prompt))
+        }
+
+        // ---------------------------------------------------------- защита и отзывы
+        "oral" => {
+            let id = p.get("id").str_or("");
+            if !p.get("regenerate").bool_or(false) {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(o) = ws.outcomes.get(&id) {
+                    if !o.oral.get("questions").as_arr().is_empty() {
+                        return Ok(o.oral.clone());
+                    }
+                }
+            }
+            extras::oral_questions(core, &id)
+        }
+
+        "feedback" => {
+            let id = p.get("id").str_or("");
+            let mode = p.get("mode").str_or("get");
+            let text = match mode.as_str() {
+                "ai" => extras::feedback_ai(core, &id)?,
+                "template" => core.feedback_template(&id).ok_or("работа не найдена")?,
+                "save" => {
+                    let t = p.get("text").str_or("");
+                    let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(o) = ws.outcomes.get_mut(&id) {
+                        o.feedback = t.clone();
+                    }
+                    drop(ws);
+                    core.save_session();
+                    t
+                }
+                _ => {
+                    let saved = core.ws.lock().unwrap_or_else(|e| e.into_inner()).outcomes.get(&id).map(|o| o.feedback.clone()).unwrap_or_default();
+                    if saved.trim().is_empty() {
+                        core.feedback_template(&id).ok_or("работа не найдена")?
+                    } else {
+                        saved
+                    }
+                }
+            };
+            Ok(Json::obj().with("text", text))
+        }
+
+        "autostart" => {
+            // запуск вместе с Windows: запись в HKCU\...\Run (без прав администратора)
+            if !cfg!(windows) {
+                return Ok(Json::obj().with("supported", false).with("enabled", false).with("minimized", false));
+            }
+            const KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+            const NAME: &str = "ProverkaZadaniy";
+            let reg = |args: &[&str]| -> Result<String, String> {
+                let mut c = std::process::Command::new("reg");
+                c.args(args);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    c.creation_flags(0x08000000);
+                }
+                let o = c.output().map_err(|e| e.to_string())?;
+                let t = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                if o.status.success() { Ok(t) } else { Err(t) }
+            };
+            if p.get("action").str_or("get") == "set" {
+                if p.get("enabled").bool_or(false) {
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    let mut val = format!("\"{}\"", exe.display());
+                    if p.get("minimized").bool_or(true) {
+                        val.push_str(" --tray");
+                    }
+                    reg(&["add", KEY, "/v", NAME, "/t", "REG_SZ", "/d", &val, "/f"]).map_err(|e| format!("не удалось включить автозапуск: {}", e.trim()))?;
+                } else {
+                    let _ = reg(&["delete", KEY, "/v", NAME, "/f"]);
+                }
+            }
+            let cur = reg(&["query", KEY, "/v", NAME]).unwrap_or_default();
+            let on = cur.contains(NAME);
+            Ok(Json::obj().with("supported", true).with("enabled", on).with("minimized", on && cur.contains("--tray")))
+        }
+
+        "app_info" => Ok(Json::obj()
+            .with("version", env!("CARGO_PKG_VERSION"))
+            // номер и дата сборки — их записывает tools/build.ps1 в src-tauri/build_info.txt
+            .with("build", option_env!("PROVERKA_BUILD").unwrap_or(""))
+            .with("data_dir", core.data_dir.to_string_lossy().to_string())
+            .with("exe", std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default())),
+
+        "llama_status" => {
+            let mut s = super::llamacpp::status(core);
+            if p.get("devices").bool_or(false) {
+                s.set("devices", super::llamacpp::devices(core));
+            }
+            Ok(s)
+        }
+
+        "llama_install" => {
+            let v = p.get("variant").str_or("cuda");
+            let bin = super::llamacpp::install(core, &v)?;
+            let mut s = super::llamacpp::status(core);
+            s.set("installed", bin);
+            s.set("devices", super::llamacpp::devices(core));
+            Ok(s)
+        }
+
+        "llama_set_bin" => {
+            let dir = p.get("dir").str_or("");
+            let exe = std::path::Path::new(&dir).join(super::llamacpp::EXE);
+            if !exe.is_file() {
+                return Err(format!("В папке нет {} — выберите папку, где он лежит", super::llamacpp::EXE));
+            }
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut l = st.get("llama").clone();
+                if l.is_null() {
+                    l = Json::obj();
+                }
+                l.set("bin_dir", dir.as_str());
+                st.set("llama", l);
+            }
+            core.save_settings();
+            let mut s = super::llamacpp::status(core);
+            s.set("devices", super::llamacpp::devices(core));
+            Ok(s)
+        }
+
+        "llama_scan" => {
+            let dir = p.get("dir").str_or("");
+            if !std::path::Path::new(&dir).is_dir() {
+                return Err("Папка не найдена".into());
+            }
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut l = st.get("llama").clone();
+                if l.is_null() {
+                    l = Json::obj();
+                }
+                l.set("models_dir", dir.as_str());
+                st.set("llama", l);
+            }
+            core.save_settings();
+            Ok(Json::obj().with("models", Json::Arr(super::llamacpp::scan_models(&dir))))
+        }
+
+        "llama_start" => {
+            let models = p.get("models").str_list();
+            let opts = super::llamacpp::StartOpts {
+                ctx: p.get("ctx").i64_or(16384).clamp(2048, 1_048_576),
+                gpu: p.get("gpu").str_or("gpu"),
+                kv_q8: p.get("kv_q8").bool_or(true),
+                extra: p.get("extra").str_or(""),
+            };
+            // запоминаем выбор
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut l = st.get("llama").clone();
+                if l.is_null() {
+                    l = Json::obj();
+                }
+                l.set("selected", models.clone());
+                l.set("ctx", opts.ctx);
+                l.set("gpu", opts.gpu.as_str());
+                l.set("kv_q8", opts.kv_q8);
+                l.set("extra", opts.extra.as_str());
+                st.set("llama", l);
+            }
+            core.save_settings();
+            core.cancel.store(false, Ordering::SeqCst);
+            let started = super::llamacpp::start(core, &models, &opts)?;
+            super::llamacpp::register(core, &started, opts.ctx);
+            core.log(&format!("llama.cpp: запущено моделей — {}", started.len()));
+            let mut st = core.state_json();
+            st.set("llama", super::llamacpp::status(core));
+            Ok(st)
+        }
+
+        // LM Studio и Ollama в один клик
+        "local_status" => Ok(super::localsrv::status(core)),
+        "local_install" => {
+            let kind = p.get("kind").str_or("");
+            let msg = super::localsrv::install(core, &kind)?;
+            Ok(super::localsrv::status(core).with("message", msg))
+        }
+        "local_start" => {
+            let kind = p.get("kind").str_or("");
+            let msg = super::localsrv::start(core, &kind)?;
+            super::localsrv::ensure_provider(core, &kind, None, false);
+            Ok(super::localsrv::status(core).with("message", msg))
+        }
+        "local_stop" => {
+            let kind = p.get("kind").str_or("");
+            let msg = super::localsrv::stop(core, &kind)?;
+            Ok(super::localsrv::status(core).with("message", msg))
+        }
+        "local_pull" => {
+            let kind = p.get("kind").str_or("");
+            let model = p.get("model").str_or("");
+            let msg = super::localsrv::pull(core, &kind, &model)?;
+            Ok(super::localsrv::status(core).with("message", msg))
+        }
+        "local_cancel" => Ok(Json::obj().with("cancelled", super::localsrv::cancel())),
+        "local_use" => {
+            // выбрать модель сервера основной нейросетью
+            let kind = p.get("kind").str_or("");
+            let model = p.get("model").str_or("");
+            let id = super::localsrv::ensure_provider(core, &kind, if model.is_empty() { None } else { Some(model.as_str()) }, p.get("activate").bool_or(true));
+            Ok(Json::obj().with("id", id).with("settings", core.settings().clone()))
+        }
+
+        "llama_stop" => {
+            core.cancel.store(true, Ordering::SeqCst);
+            let n = super::llamacpp::stop_all();
+            core.cancel.store(false, Ordering::SeqCst);
+            Ok(Json::obj().with("stopped", n))
+        }
+
+        "moodle_import" => {
+            // архив «Скачать все ответы» (.zip) или уже распакованная папка
+            let path = p.get("path").str_or("");
+            if path.is_empty() {
+                return Err("Выберите архив Moodle или папку".into());
+            }
+            let src = std::path::PathBuf::from(&path);
+            let stem = src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "moodle".into());
+            let root = if path.to_lowercase().ends_with(".zip") {
+                let safe: String = stem.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == ' ' || c == '_' { c } else { '_' }).take(60).collect();
+                let dest = core.data_dir.join("moodle").join(format!("{}-{}", safe.trim(), super::core::now_s()));
+                let n = super::moodle::unzip(&path, &dest)?;
+                core.log(&format!("Moodle: распаковано файлов: {} → {}", n, dest.display()));
+                dest
+            } else if src.is_dir() {
+                src.clone()
+            } else {
+                return Err("Нужен .zip-архив из Moodle или папка с распакованными ответами".into());
+            };
+            let (subs, skipped) = super::moodle::collect(&root, super::core::SUPPORTED);
+            if subs.is_empty() {
+                return Err("В архиве не найдено ответов Moodle: имена файлов должны быть вида «Фамилия Имя_123456_assignsubmission_file_…». Скачайте ответы кнопкой «Скачать все ответы» в задании Moodle.".into());
+            }
+            let group = {
+                let g = p.get("group").str_or("");
+                if g.trim().is_empty() { "Moodle".to_string() } else { g.trim().to_string() }
+            };
+            // тот же архив, загруженный повторно: ответы, которые уже есть, не дублируем
+            // (но файлы, которых у такой работы ещё нет, — например Excel, — присоединяем к ней)
+            let mut updated = 0usize;
+            let subs: Vec<super::moodle::Submission> = {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let mut fresh = Vec::new();
+                for s in subs {
+                    let h = std::fs::read(&s.main).map(|b| super::core::fnv(&b)).unwrap_or(0);
+                    let name = super::core::file_name(&s.main);
+                    match ws.works.iter_mut().find(|w| w.student == s.student && w.hash == h && super::core::file_name(&w.path) == name) {
+                        Some(w) => {
+                            let have: Vec<String> = w.sources.iter().map(|x| super::core::file_name(x)).collect();
+                            let missing: Vec<String> = s.extra.iter().filter(|x| !have.contains(&super::core::file_name(x))).cloned().collect();
+                            if !missing.is_empty() {
+                                core.attach_sources(w, &missing);
+                                updated += 1;
+                                let id = w.id.clone();
+                                // работу с новыми файлами нужно проверить заново
+                                if let Some(o) = ws.outcomes.get_mut(&id) {
+                                    if o.status == "done" {
+                                        o.review.insert(0, "Добавлены файлы студента из Moodle — проверьте работу заново".into());
+                                    }
+                                }
+                            }
+                        }
+                        None => fresh.push(s),
+                    }
+                }
+                fresh
+            };
+            if subs.is_empty() {
+                core.compute_plagiarism();
+                core.save_session();
+                if updated == 0 {
+                    return Err("Все ответы из этого архива уже загружены".into());
+                }
+                let mut st = core.state_json();
+                st.set("moodle", Json::obj().with("students", 0).with("updated", updated).with("group", p.get("group").str_or("").as_str()).with("extra", 0).with("skipped", Json::Arr(vec![])).with("skipped_count", 0));
+                return Ok(st);
+            }
+            let paths: Vec<String> = subs.iter().map(|s| s.main.clone()).collect();
+            let errors = core.add_works_ex(&paths, None, &group, false);
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                for s in &subs {
+                    if let Some(w) = ws.works.iter_mut().find(|w| w.path == s.main) {
+                        w.student = s.student.clone();
+                        // срок сдачи, указанный при импорте: время сдачи берётся из архива
+                        let dl = p.get("deadline").f64_or(0.0);
+                        if dl > 0.0 {
+                            w.deadline = dl as u64;
+                        }
+                        // все остальные файлы студента — в ту же работу: Excel и PowerPoint
+                        // (часть заданий), второй документ, PDF, фото страниц и скриншоты
+                        if !s.extra.is_empty() {
+                            core.attach_sources(w, &s.extra);
+                        }
+                    }
+                }
+            }
+            // студентов — в список группы (журнал), если их там ещё нет
+            if p.get("roster").bool_or(true) {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let list = j.rosters.entry(group.clone()).or_default();
+                let mut added = 0;
+                for s in &subs {
+                    if !list.iter().any(|n| super::moodle::same_person(n, &s.student)) {
+                        list.push(s.student.clone());
+                        added += 1;
+                    }
+                }
+                if added > 0 {
+                    j.save();
+                }
+            }
+            core.save_session();
+            let mut st = core.state_json();
+            st.set("errors", errors);
+            st.set(
+                "moodle",
+                Json::obj()
+                    .with("students", subs.len())
+                    .with("updated", updated)
+                    .with("group", group.as_str())
+                    .with("extra", subs.iter().map(|s| s.extra.len()).sum::<usize>())
+                    .with("skipped", skipped.iter().take(20).cloned().collect::<Vec<_>>())
+                    .with("skipped_count", skipped.len()),
+            );
+            Ok(st)
+        }
+
+        "moodle_import_grades" => {
+            // оценки из Moodle → журнал группы
+            let path = p.get("path").str_or("");
+            let group = p.get("group").str_or("").trim().to_string();
+            if group.is_empty() {
+                return Err("Выберите группу".into());
+            }
+            let bytes = std::fs::read(&path).map_err(|e| format!("не удалось открыть файл: {}", e))?;
+            let rows = super::moodle::table_rows(&path, &bytes);
+            let list = super::moodle::import_grades(&rows, &p.get("code").str_or(""))?;
+            let replace = p.get("replace").bool_or(false);
+            let add_roster = p.get("roster").bool_or(true);
+            let half = core.settings().get("half_grades").bool_or(true);
+            let (mut added, mut updated, mut skipped, mut new_students) = (0, 0, 0, 0);
+            let mut codes: Vec<String> = Vec::new();
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                for im in &list {
+                    // ФИО из Moodle — к записи в списке группы («Лесовиков Иван» = «Иван Лесовиков»)
+                    let roster = j.rosters.get(&group).cloned().unwrap_or_default();
+                    let name = match roster.iter().find(|n| super::moodle::same_person(n, &im.student)) {
+                        Some(n) => n.clone(),
+                        None => {
+                            if add_roster {
+                                j.rosters.entry(group.clone()).or_default().push(im.student.clone());
+                                new_students += 1;
+                            }
+                            im.student.clone()
+                        }
+                    };
+                    if !im.email.trim().is_empty() {
+                        j.emails.entry(group.clone()).or_default().insert(name.clone(), im.email.trim().to_string());
+                    }
+                    if !codes.contains(&im.code) {
+                        codes.push(im.code.clone());
+                    }
+                    let exists = j.entries.iter().any(|e| e.group == group && e.student == name && e.code == im.code);
+                    if exists && !replace {
+                        skipped += 1;
+                        continue;
+                    }
+                    j.upsert(Entry {
+                        group: group.clone(),
+                        student: name,
+                        code: im.code.clone(),
+                        grade: Some(super::core::norm_grade(im.grade, half)),
+                        violation: String::new(),
+                        date: super::core::now_s(),
+                        file: "из Moodle".into(),
+                        variant: String::new(),
+                        comment: im.comment.clone(),
+                        style: Vec::new(),
+                    });
+                    if exists {
+                        updated += 1;
+                    } else {
+                        added += 1;
+                    }
+                }
+                j.save();
+            }
+            let mut v = journal_view(core);
+            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes));
+            Ok(v)
+        }
+
+        "moodle_export_gradebook" => {
+            // журнал группы → CSV для «Оценки → Импорт» в Moodle
+            let path = p.get("path").str_or("");
+            let group = p.get("group").str_or("");
+            let j = core.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut codes: Vec<String> = p.get("codes").str_list();
+            if codes.is_empty() {
+                codes = j.entries.iter().filter(|e| e.group == group).map(|e| e.code.clone()).collect();
+                codes.sort_by_key(|c| natural_key(c));
+                codes.dedup();
+            }
+            if codes.is_empty() {
+                return Err("В журнале этой группы нет оценок".into());
+            }
+            let mut students: Vec<String> = j.rosters.get(&group).cloned().unwrap_or_default();
+            for e in j.entries.iter().filter(|e| e.group == group) {
+                if !students.contains(&e.student) {
+                    students.push(e.student.clone());
+                }
+            }
+            let emails = j.emails.get(&group).cloned().unwrap_or_default();
+            let list: Vec<(String, String)> = students.iter().map(|s| (s.clone(), emails.get(s).cloned().unwrap_or_default())).collect();
+            let no_mail = list.iter().filter(|(s, m)| m.is_empty() && j.entries.iter().any(|e| e.group == group && &e.student == s)).count();
+            let csv = super::moodle::export_gradebook(&list, &codes, &|s, c| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).and_then(|e| e.grade));
+            std::fs::write(&path, csv).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path).with("codes", codes).with("no_email", no_mail))
+        }
+
+        "moodle_grades" => {
+            // заполнить таблицу оценок Moodle: «Оценка» и «Отзыв в виде комментария»
+            let path = p.get("path").str_or("");
+            let text = std::fs::read(&path).map(|b| super::text::decode_bytes(&b)).map_err(|e| format!("не удалось открыть таблицу: {}", e))?;
+            let (mut rows, sep) = super::moodle::parse_csv(&text);
+            if rows.len() < 2 {
+                return Err("Таблица пустая: скачайте её в Moodle — «Просмотр всех ответов» → «Действия с оценками» → «Скачать таблицу оценок»".into());
+            }
+            let head = rows[0].clone();
+            let c_name = super::moodle::col(&head, &["полное имя", "full name", "фамилия и имя"]).ok_or("В таблице нет столбца «Полное имя»")?;
+            let c_grade = super::moodle::col(&head, &["оценка", "grade"]).ok_or("В таблице нет столбца «Оценка»")?;
+            let c_max = super::moodle::col(&head, &["максимальная оценка", "maximum grade"]);
+            let c_fb = super::moodle::col(&head, &["отзыв в виде комментария", "feedback comments"]);
+            let with_fb = p.get("feedback").bool_or(true);
+            let only = p.get("group").str_or("");
+            // оценки по студентам: из текущей проверки или из журнала группы (по коду работы)
+            let mut graded: Vec<(String, f64, String)> = Vec::new();
+            if p.get("source").str_or("") == "journal" {
+                let code = p.get("code").str_or("");
+                let j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                for e in j.entries.iter().filter(|e| (only.is_empty() || e.group == only) && e.code == code) {
+                    if let Some(g) = e.grade {
+                        graded.push((e.student.clone(), g, e.comment.clone()));
+                    }
+                }
+            } else {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                for w in &ws.works {
+                    if !only.is_empty() && w.group != only && core.program_of(&w.group) != only {
+                        continue;
+                    }
+                    let Some(o) = ws.outcomes.get(&w.id) else { continue };
+                    let Some(g) = o.final_grade() else { continue };
+                    // работа в паре — оценка каждому напарнику
+                    for student in core.authors(&ws, w).0 {
+                        graded.push((student, g, o.feedback.clone()));
+                    }
+                }
+            }
+            let (mut hit, mut miss) = (0usize, Vec::new());
+            let mut used = vec![false; graded.len()];
+            for r in rows.iter_mut().skip(1) {
+                while r.len() < head.len() {
+                    r.push(String::new());
+                }
+                let name = r[c_name].clone();
+                let Some(k) = graded.iter().enumerate().position(|(i, (s, _, _))| !used[i] && super::moodle::same_person(s, &name)) else { continue };
+                used[k] = true;
+                let (_, g, fb) = &graded[k];
+                let max = c_max.and_then(|c| r[c].replace(',', ".").trim().parse::<f64>().ok()).filter(|m| *m > 0.0).unwrap_or(5.0);
+                // шкала Moodle может быть не пятибалльной: переводим пропорционально
+                let v = if (max - 5.0).abs() < 0.01 { *g } else { (*g / 5.0 * max * 100.0).round() / 100.0 };
+                r[c_grade] = if (v - v.round()).abs() < 0.001 { format!("{}", v.round() as i64) } else { format!("{}", v) };
+                if let (Some(c), true) = (c_fb, with_fb) {
+                    if !fb.trim().is_empty() {
+                        r[c] = fb.trim().to_string();
+                    }
+                }
+                hit += 1;
+            }
+            for (i, (s, _, _)) in graded.iter().enumerate() {
+                if !used[i] {
+                    miss.push(s.clone());
+                }
+            }
+            let src = std::path::Path::new(&path);
+            let out = src.with_file_name(format!("{}_оценки.csv", src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Оценки".into())));
+            std::fs::write(&out, super::moodle::write_csv(&rows, sep)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", out.to_string_lossy().to_string()).with("filled", hit).with("not_found", miss))
+        }
+
+        "export_feedback" => {
+            let path = p.get("path").str_or("");
+            let only = p.get("ids").str_list();
+            let ids: Vec<String> = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                ws.works
+                    .iter()
+                    .filter(|w| only.is_empty() || only.contains(&w.id))
+                    .filter(|w| ws.outcomes.get(&w.id).and_then(|o| o.final_grade()).is_some())
+                    .map(|w| w.id.clone())
+                    .collect()
+            };
+            if ids.is_empty() {
+                return Err("Нет проверенных работ для отзывов".into());
+            }
+            let mut blocks = Vec::new();
+            for (i, id) in ids.iter().enumerate() {
+                let (title, text) = {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    let w = ws.works.iter().find(|w| &w.id == id).unwrap();
+                    let (student, _) = core.student_of(&ws, w);
+                    let saved = ws.outcomes.get(id).map(|o| o.feedback.clone()).unwrap_or_default();
+                    (format!("{} — {}{}", student, w.name, if w.group.is_empty() { String::new() } else { format!(", {}", w.group) }), saved)
+                };
+                let text = if text.trim().is_empty() { core.feedback_template(id).unwrap_or_default() } else { text };
+                if i > 0 {
+                    blocks.push(Block::PageBreak);
+                }
+                blocks.push(Block::Heading(title));
+                blocks.push(Block::Para(text));
+            }
+            std::fs::write(&path, super::report::docx_blocks("Отзывы студентам", &blocks, false)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path).with("count", ids.len()))
+        }
+
+        "export_oral" => {
+            let id = p.get("id").str_or("");
+            let path = p.get("path").str_or("");
+            let (title, oral) = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let w = ws.works.iter().find(|w| w.id == id).ok_or("работа не найдена")?;
+                let (student, _) = core.student_of(&ws, w);
+                (format!("{} — {}", student, w.name), ws.outcomes.get(&id).map(|o| o.oral.clone()).unwrap_or_default())
+            };
+            let qs = oral.get("questions").as_arr().to_vec();
+            if qs.is_empty() {
+                return Err("Сначала составьте вопросы".into());
+            }
+            let mut blocks = vec![Block::Title("Вопросы для устной защиты".into()), Block::Sub(title)];
+            for (i, q) in qs.iter().enumerate() {
+                blocks.push(Block::Bold(format!("{}. {}", i + 1, q.get("q").str_or(""))));
+                blocks.push(Block::Para(format!("Ожидаемый ответ: {}", q.get("expect").str_or(""))));
+                if !q.get("why").str_or("").is_empty() {
+                    blocks.push(Block::Para(format!("Что проверяет: {}", q.get("why").str_or(""))));
+                }
+            }
+            blocks.push(Block::Para(format!("\nИтог защиты: ______________________      Дата: {}", super::report::today_str())));
+            std::fs::write(&path, super::report::docx_blocks("Вопросы для защиты", &blocks, false)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path))
+        }
+
+        // ---------------------------------------------------------- журнал группы
+        "journal" => Ok(journal_view(core)),
+
+        "journal_add" => {
+            let n = core.journal_add_current();
+            Ok(journal_view(core).with("added", n))
+        }
+
+        "journal_roster" => {
+            let group = p.get("group").str_or("").trim().to_string();
+            if group.is_empty() {
+                return Err("Укажите группу".into());
+            }
+            let names: Vec<String> = p
+                .get("names")
+                .str_list()
+                .into_iter()
+                .map(|n| {
+                    // «1. Лесовиков Иван» → «Лесовиков Иван»
+                    n.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')' || c == ' ' || c == '\t').trim().to_string()
+                })
+                .filter(|n| !n.is_empty())
+                .collect();
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                if names.is_empty() {
+                    j.rosters.remove(&group);
+                    j.assigned.remove(&group);
+                    j.teams.remove(&group);
+                } else {
+                    j.rosters.insert(group.clone(), names);
+                }
+                if let Some(v) = p.get("variant_is_number").as_bool() {
+                    j.variant_is_number = v;
+                }
+                // варианты и пары студентов: {ФИО: вариант}, {ФИО: номер пары}
+                let names = j.rosters.get(&group).cloned().unwrap_or_default();
+                for key in ["variants", "teams"] {
+                    if p.get(key).is_null() {
+                        continue;
+                    }
+                    let map: std::collections::BTreeMap<String, String> = p
+                        .get(key)
+                        .as_obj()
+                        .iter()
+                        .map(|(k, v)| (k.trim().to_string(), v.as_str().map(|x| x.to_string()).or_else(|| v.as_f64().map(|n| format!("{}", n as i64))).unwrap_or_default().trim().to_string()))
+                        .filter(|(k, v)| !v.is_empty() && names.contains(k))
+                        .collect();
+                    let target = if key == "variants" { &mut j.assigned } else { &mut j.teams };
+                    if map.is_empty() {
+                        target.remove(&group);
+                    } else {
+                        target.insert(group.clone(), map);
+                    }
+                }
+                j.save();
+            }
+            core.refinalize_all();
+            Ok(journal_view(core))
+        }
+
+        "analytics" => {
+            // сводка по заданию: какие пункты решают неверно, варианты, частые ошибки, ИИ
+            use std::collections::BTreeMap;
+            let group = p.get("group").str_or("");
+            let only = p.get("assignment").str_or("");
+            #[derive(Default)]
+            struct Acc {
+                code: String,
+                title: String,
+                n: i64,
+                sum: f64,
+                dist: [i64; 4],
+                ai: i64,
+                plag: i64,
+                tasks: BTreeMap<String, [i64; 4]>,
+                variants: BTreeMap<String, (i64, f64)>,
+                groups: BTreeMap<String, (i64, f64, i64)>,
+                errors: BTreeMap<String, (i64, String)>,
+                signs: BTreeMap<String, i64>,
+                pending: i64,
+            }
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let mut acc: BTreeMap<String, Acc> = BTreeMap::new();
+            for w in &ws.works {
+                if !group.is_empty() && w.group != group {
+                    continue;
+                }
+                let Some(set) = core.set_for_work(&ws, w) else { continue };
+                if !only.is_empty() && set.id != only {
+                    continue;
+                }
+                let a = acc.entry(set.id.clone()).or_default();
+                a.code = set.code.clone();
+                a.title = set.title.clone();
+                let Some(o) = ws.outcomes.get(&w.id).filter(|o| o.status == "done" && !o.llm.is_null()) else {
+                    a.pending += 1;
+                    continue;
+                };
+                let Some(g) = o.final_grade() else { continue };
+                a.n += 1;
+                a.sum += g;
+                a.dist[(g.floor().clamp(2.0, 5.0) as usize) - 2] += 1;
+                if o.violation == "ai" {
+                    a.ai += 1;
+                }
+                if o.violation == "plagiarism" {
+                    a.plag += 1;
+                }
+                let gr = a.groups.entry(if w.group.is_empty() { "без группы".into() } else { w.group.clone() }).or_default();
+                gr.0 += 1;
+                gr.1 += g;
+                if o.violation == "ai" {
+                    gr.2 += 1;
+                }
+                let scan = core.scan(&ws, w);
+                if let Some(v) = scan.variant_shown() {
+                    let e = a.variants.entry(v).or_default();
+                    e.0 += 1;
+                    e.1 += g;
+                }
+                for t in o.llm.get("tasks").as_arr() {
+                    let n = t.get("n").as_str().map(|x| x.to_string()).or_else(|| t.get("n").as_f64().map(|x| format!("{}", x))).unwrap_or_default();
+                    if n.trim().is_empty() {
+                        continue;
+                    }
+                    let k = match t.get("status").str_or("").to_lowercase().as_str() {
+                        "верно" => 0,
+                        "частично" => 2,
+                        "не выполнено" => 3,
+                        _ => 1,
+                    };
+                    a.tasks.entry(n.trim().to_string()).or_default()[k] += 1;
+                }
+                for e in o.llm.get("errors").str_list() {
+                    // одна и та же ошибка у разных студентов: без цитат, по первым словам
+                    let mut clean = String::new();
+                    let mut depth = 0;
+                    for c in e.chars() {
+                        match c {
+                            '«' => depth += 1,
+                            '»' => depth = (depth - 1).max(0),
+                            _ if depth == 0 => clean.push(c),
+                            _ => {}
+                        }
+                    }
+                    let key: String = clean.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|x| x.len() > 1).take(6).collect::<Vec<_>>().join(" ");
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let x = a.errors.entry(key).or_insert((0, clean.trim().trim_end_matches(|c: char| c == ' ' || c == ',' || c == ':' || c == '—').to_string()));
+                    x.0 += 1;
+                }
+                for e in scan.evidence.iter().filter(|e| e.weight != "weak") {
+                    let what: String = e.what.split(':').next().unwrap_or("").chars().take(90).collect();
+                    *a.signs.entry(what).or_default() += 1;
+                }
+            }
+            let mut out = Json::arr();
+            for (id, a) in acc {
+                let mut tasks: Vec<(String, [i64; 4])> = a.tasks.into_iter().collect();
+                tasks.sort_by_key(|(n, _)| natural_key(n));
+                let mut errors: Vec<(String, (i64, String))> = a.errors.into_iter().collect();
+                errors.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
+                let mut signs: Vec<(String, i64)> = a.signs.into_iter().collect();
+                signs.sort_by(|x, y| y.1.cmp(&x.1));
+                let mut vars: Vec<(String, (i64, f64))> = a.variants.into_iter().collect();
+                vars.sort_by_key(|(v, _)| natural_key(v));
+                out.push(
+                    Json::obj()
+                        .with("id", id.as_str())
+                        .with("code", a.code.as_str())
+                        .with("title", a.title.as_str())
+                        .with("n", a.n)
+                        .with("pending", a.pending)
+                        .with("avg", if a.n > 0 { Json::Num((a.sum / a.n as f64 * 100.0).round() / 100.0) } else { Json::Null })
+                        .with("dist", Json::Arr(a.dist.iter().map(|x| Json::from(*x)).collect()))
+                        .with("ai", a.ai)
+                        .with("plag", a.plag)
+                        .with("tasks", Json::Arr(tasks.into_iter().map(|(n, c)| Json::obj().with("n", n).with("ok", c[0]).with("errors", c[1]).with("partial", c[2]).with("missing", c[3])).collect()))
+                        .with("variants", Json::Arr(vars.into_iter().map(|(v, (n, s))| Json::obj().with("variant", v).with("n", n).with("avg", (s / n as f64 * 100.0).round() / 100.0)).collect()))
+                        .with("groups", Json::Arr(a.groups.into_iter().map(|(g, (n, s, ai))| Json::obj().with("group", g).with("n", n).with("avg", (s / n as f64 * 100.0).round() / 100.0).with("ai", ai)).collect()))
+                        .with("errors", Json::Arr(errors.into_iter().take(10).map(|(_, (n, t))| Json::obj().with("text", t).with("n", n)).collect()))
+                        .with("signs", Json::Arr(signs.into_iter().take(8).map(|(t, n)| Json::obj().with("text", t).with("n", n)).collect())),
+                );
+            }
+            Ok(Json::obj().with("sets", out))
+        }
+
+        "set_deadline" => {
+            // срок сдачи для выбранных работ (0 — убрать); правило «позже срока» пересчитывается
+            let ids = p.get("ids").str_list();
+            let at = p.get("deadline").f64_or(0.0).max(0.0) as u64;
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                for w in ws.works.iter_mut().filter(|w| ids.contains(&w.id)) {
+                    w.deadline = at;
+                }
+            }
+            for id in &ids {
+                let _ = core.refinalize(id);
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        // ---- задания с фото, эталоны нейросетью, вопросы перед генерацией
+        "read_path_b64" => {
+            let path = p.get("path").str_or("");
+            if !super::docx::is_image(&path) {
+                return Err("Это не изображение".into());
+            }
+            let b = std::fs::read(&path).map_err(|e| e.to_string())?;
+            Ok(Json::obj().with("b64", b64(&b)).with("mime", super::docx::image_mime(&path)).with("name", super::core::file_name(&path).as_str()))
+        }
+        "photo_text" => {
+            let images: Vec<(String, String)> = p.get("images").as_arr().iter().map(|i| (i.get("mime").str_or("image/jpeg"), i.get("b64").str_or(""))).filter(|(_, b)| !b.is_empty()).collect();
+            let (task, key) = super::taskphoto::photo_text(core, &images, &p.get("purpose").str_or("task"), &p.get("subject").str_or(""))?;
+            Ok(Json::obj().with("task", task).with("key", key))
+        }
+        "solve_task" => {
+            let t = super::taskphoto::solve(core, &p.get("task").str_or(""), &p.get("subject").str_or(""), &p.get("level").str_or(""))?;
+            Ok(Json::obj().with("key", t))
+        }
+        "save_task_text" => {
+            let (tp, kp) = super::taskphoto::save(core, &p.get("code").str_or(""), &p.get("title").str_or(""), &p.get("scope").str_or(""), &p.get("task").str_or(""), &p.get("key").str_or(""))?;
+            Ok(core.state_json().with("task_path", tp).with("key_path", kp))
+        }
+        "set_text" => {
+            // условие и ответы набора одним текстом (для «Нет ответов» и генератора)
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let set = ws.sets.iter().find(|s| s.id == p.get("set").str_or("")).ok_or("задание не найдено")?;
+            let many = set.variants.len() > 1;
+            let mut task = String::new();
+            let mut key = String::new();
+            for (id, v) in &set.variants {
+                if many && id != "*" {
+                    task.push_str(&format!("Вариант {}\n", id));
+                }
+                task.push_str(v.task_visible.trim());
+                task.push_str("\n\n");
+                if !v.key.trim().is_empty() {
+                    if many && id != "*" {
+                        key.push_str(&format!("Вариант {}\n", id));
+                    }
+                    key.push_str(v.key.trim());
+                    key.push_str("\n\n");
+                }
+            }
+            Ok(Json::obj().with("task", task.trim()).with("key", key.trim()).with("code", set.code.as_str()).with("title", set.title.as_str()).with("scope", set.scope.as_str()))
+        }
+        "gen_plan" => {
+            let (sample, key) = if !p.get("sample").str_or("").trim().is_empty() {
+                (p.get("sample").str_or(""), p.get("key").str_or(""))
+            } else {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let set = ws.sets.iter().find(|s| s.id == p.get("set").str_or("")).ok_or("Выберите задание-образец")?;
+                let v = set.variant(&p.get("variant").str_or("")).or_else(|| set.variants.values().next()).ok_or("В задании нет вариантов")?;
+                (v.task_visible.clone(), v.key.clone())
+            };
+            super::taskphoto::plan(core, &sample, &key)
+        }
+
+        "gen_variants" => {
+            // новые варианты задания нейросетью: файл заданий со скрытыми ловушками + файл ответов
+            let own = !p.get("sample").str_or("").trim().is_empty();
+            let (sample, key, title, code, next) = if own {
+                // образец с фото или вписанный вручную
+                let code = p.get("code").str_or("").trim().to_string();
+                (p.get("sample").str_or(""), p.get("key").str_or(""), p.get("title").str_or(&code), if code.is_empty() { "Задание".to_string() } else { code }, 1usize)
+            } else {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let set = ws.sets.iter().find(|s| s.id == p.get("set").str_or("")).ok_or("Выберите задание-образец")?;
+                let base = p.get("variant").str_or("");
+                let v = set.variant(&base).or_else(|| set.variants.values().next()).ok_or("В задании нет вариантов")?;
+                let next = set.variants.keys().filter_map(|k| k.parse::<usize>().ok()).max().unwrap_or(0) + 1;
+                (v.task_visible.clone(), v.key.clone(), if set.title.is_empty() { set.code.clone() } else { set.title.clone() }, set.code.clone(), next)
+            };
+            let _ = own;
+            let count = p.get("count").i64_or(5).clamp(1, 40) as usize;
+            let start = p.get("start").i64_or(next as i64).max(1) as usize;
+            let dir = p.get("dir").str_or("");
+            if dir.is_empty() || !std::path::Path::new(&dir).is_dir() {
+                return Err("Выберите папку, куда сохранить варианты".into());
+            }
+            let vars = super::variants::generate(core, &sample, &key, start, count, p.get("traps").bool_or(true), &p.get("wishes").str_or(""))?;
+            let range = if count == 1 { format!("{}", start) } else { format!("{}-{}", start, start + count - 1) };
+            let safe = |s: &str| s.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect::<String>();
+            let tp = std::path::Path::new(&dir).join(format!("{}_варианты_{}.docx", safe(&code), range));
+            let kp = std::path::Path::new(&dir).join(format!("{}_ответы_{}.docx", safe(&code), range));
+            std::fs::write(&tp, super::variants::tasks_docx(&title, &vars)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            std::fs::write(&kp, super::variants::answers_docx(&title, &vars)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj()
+                .with("tasks", tp.to_string_lossy().to_string())
+                .with("answers", kp.to_string_lossy().to_string())
+                .with("count", vars.len())
+                .with("traps", vars.iter().map(|v| v.traps.len()).sum::<usize>())
+                .with("preview", Json::Arr(vars.iter().take(2).map(|v| Json::obj().with("n", v.n).with("tasks", Json::Arr(v.tasks.iter().map(|(n, t)| Json::Str(format!("{}. {}", n, t))).collect())).with("traps", Json::Arr(v.traps.iter().map(|(a, h)| Json::Str(format!("после задания {}: {}", a, h))).collect()))).collect())))
+        }
+
+        "compare_works" => {
+            // две работы рядом: совпадающие куски подсвечены, текст условия — отдельно
+            let (a, b) = (p.get("a").str_or(""), p.get("b").str_or(""));
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let wa = ws.works.iter().find(|w| w.id == a).ok_or("работа не найдена")?;
+            let wb = ws.works.iter().find(|w| w.id == b).ok_or("работа не найдена")?;
+            let task: String = [core.set_for_work(&ws, wa), core.set_for_work(&ws, wb)]
+                .iter()
+                .flatten()
+                .flat_map(|s| s.variants.values().map(|v| v.task_visible.clone()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let (sa, sb, share_a) = super::detect::compare_marks(&wa.visible, &wb.visible, &task);
+            let (_, _, share_b) = super::detect::compare_marks(&wb.visible, &wa.visible, &task);
+            let seg = |v: Vec<(String, u8)>| Json::Arr(v.into_iter().map(|(t, k)| Json::Arr(vec![Json::Str(t), Json::from(k as i64)])).collect());
+            let side = |w: &super::core::Work, segs: Json, share: f64| {
+                let (student, _) = core.student_of(&ws, w);
+                Json::obj().with("id", w.id.as_str()).with("name", w.name.as_str()).with("group", w.group.as_str()).with("student", student).with("segments", segs).with("share", (share * 100.0).round())
+            };
+            let score = ws.plag.iter().find(|(x, y, _)| (x == &a && y == &b) || (x == &b && y == &a)).map(|x| (x.2 * 100.0).round());
+            Ok(Json::obj().with("a", side(wa, seg(sa), share_a)).with("b", side(wb, seg(sb), share_b)).with("score", score))
+        }
+
+        "roster_import" => {
+            // список студентов из файла (Excel, Word, текст) или с фото / из буфера обмена
+            let (text, from) = if let Some(img) = p.get("image").as_str().filter(|x| !x.is_empty()) {
+                let mime = p.get("mime").str_or("image/png");
+                (grader::vision_text(core, super::roster::SYSTEM_VISION_ROSTER, "Перепиши список студентов с этого изображения.", &[(mime, img.to_string())])?, "фото".to_string())
+            } else {
+                let path = p.get("path").str_or("");
+                if path.is_empty() {
+                    return Err("Выберите файл со списком".into());
+                }
+                let bytes = std::fs::read(&path).map_err(|e| format!("Не удалось открыть файл: {}", e))?;
+                if super::docx::is_image(&path) {
+                    let mime = super::docx::image_mime(&path).to_string();
+                    (grader::vision_text(core, super::roster::SYSTEM_VISION_ROSTER, "Перепиши список студентов с этого изображения.", &[(mime, b64(&bytes))])?, "фото".to_string())
+                } else {
+                    let ex = super::docx::extract(&path, &bytes);
+                    if ex.needs_pdf {
+                        return Err("Список в PDF не читается напрямую — сохраните его как Word или Excel, либо сделайте снимок экрана и загрузите как фото".into());
+                    }
+                    let t = ex.visible();
+                    if t.trim().is_empty() {
+                        return Err(ex.notes.first().cloned().unwrap_or_else(|| "В файле не найден текст".into()));
+                    }
+                    (t, super::core::file_name(&path))
+                }
+            };
+            let rows = super::roster::parse(&text);
+            if rows.is_empty() {
+                return Err(format!("В {} не найдено ни одного ФИО. Проверьте, что в списке есть фамилии и имена (по одному студенту в строке или в ячейке).", if from == "фото" { "распознанном тексте" } else { "файле" }));
+            }
+            Ok(Json::obj()
+                .with("rows", Json::Arr(rows.iter().map(|r| Json::obj().with("name", r.name.as_str()).with("variant", r.variant.clone().unwrap_or_default())).collect()))
+                .with("from", from)
+                .with("text", super::text::clip(&text, 4000)))
+        }
+
+        "roster_parse" => {
+            let rows = super::roster::parse(&p.get("text").str_or(""));
+            if rows.is_empty() {
+                return Err("Не найдено ни одного ФИО — пишите по одному студенту в строке: «Фамилия Имя» (можно с вариантом: «Лесовиков Иван — 3»)".into());
+            }
+            Ok(Json::obj().with("rows", Json::Arr(rows.iter().map(|r| Json::obj().with("name", r.name.as_str()).with("variant", r.variant.clone().unwrap_or_default())).collect())))
+        }
+
+        "add_photo_work" => {
+            // одна работа из нескольких фото (страницы тетради), студент выбран вручную
+            let paths = p.get("paths").str_list();
+            let group = p.get("group").str_or("").trim().to_string();
+            let student = p.get("student").str_or("").trim().to_string();
+            if paths.is_empty() {
+                return Err("Выберите фото страниц работы".into());
+            }
+            let errors = core.add_works_ex(&paths[..1], None, &group, false);
+            if let Some(e) = errors.first() {
+                return Err(e.clone());
+            }
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let w = ws.works.iter_mut().find(|w| w.path == paths[0]).ok_or("Это фото уже загружено в другую работу")?;
+                if !student.is_empty() {
+                    w.student = student.clone();
+                }
+                if paths.len() > 1 {
+                    core.attach_sources(w, &paths[1..]);
+                }
+            }
+            core.compute_plagiarism();
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "journal_student" => {
+            // убрать студента из группы (список, варианты, пары, оценки) или переименовать / объединить
+            let group = p.get("group").str_or("");
+            let student = p.get("student").str_or("");
+            if student.is_empty() {
+                return Err("Не указан студент".into());
+            }
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                match p.get("action").str_or("").as_str() {
+                    "delete" => {
+                        j.delete_student(&group, &student);
+                    }
+                    "rename" => {
+                        let to = p.get("to").str_or("").trim().to_string();
+                        if to.is_empty() {
+                            return Err("Укажите новое ФИО".into());
+                        }
+                        j.rename_student(&group, &student, &to);
+                    }
+                    _ => return Err("Неизвестное действие".into()),
+                }
+                j.save();
+            }
+            core.compute_plagiarism();
+            Ok(journal_view(core))
+        }
+
+        "journal_set" => {
+            // ручная правка ячейки: grade = null — удалить
+            let (group, student, code) = (p.get("group").str_or(""), p.get("student").str_or(""), p.get("code").str_or(""));
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                match p.get("grade").as_f64() {
+                    Some(g) => j.upsert(Entry {
+                        group,
+                        student,
+                        code,
+                        grade: Some(super::core::norm_grade(g, true)),
+                        violation: String::new(),
+                        date: super::core::now_s(),
+                        file: "вручную".into(),
+                        variant: String::new(),
+                        comment: p.get("comment").str_or(""),
+                        style: Vec::new(),
+                    }),
+                    None => j.entries.retain(|e| !(e.group == group && e.student == student && e.code == code)),
+                }
+                j.save();
+            }
+            Ok(journal_view(core))
+        }
+
+        "journal_clear" => {
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                match p.get("group").as_str() {
+                    Some(g) => j.entries.retain(|e| e.group != g),
+                    None => j.entries.clear(),
+                }
+                j.save();
+            }
+            Ok(journal_view(core))
+        }
+
+        "journal_export" => {
+            let path = p.get("path").str_or("");
+            let fmt = p.get("format").str_or("xlsx");
+            let only = p.get("group").as_str().map(|s| s.to_string());
+            let v = journal_view(core);
+            let codes = v.get("codes").str_list();
+            let mut heads: Vec<String> = vec!["Студент".into(), "Группа".into()];
+            heads.extend(codes.iter().cloned());
+            heads.extend(["Средний".to_string(), "Нарушения".into(), "Долги".into()]);
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for g in v.get("groups").as_arr() {
+                let gname = g.get("name").str_or("");
+                if only.as_ref().map(|o| o != &gname).unwrap_or(false) {
+                    continue;
+                }
+                for s in g.get("students").as_arr() {
+                    let mut r = vec![s.get("name").str_or(""), gname.clone()];
+                    for c in &codes {
+                        let cell = s.get("cells").get(c);
+                        r.push(match cell.get("grade").as_f64() {
+                            Some(x) => format!("{}{}", super::core::fmt_grade(x), if cell.get("violation").str_or("").is_empty() { "" } else { "*" }),
+                            None => String::new(),
+                        });
+                    }
+                    r.push(s.get("avg").as_f64().map(|a| format!("{:.2}", a).replace('.', ",")).unwrap_or_default());
+                    r.push(s.get("violations").i64_or(0).to_string());
+                    r.push(s.get("missing").i64_or(0).to_string());
+                    rows.push(r);
+                }
+            }
+            let title = format!("Журнал группы{}  (* — нарушение: ИИ или списывание)", only.map(|g| format!(" {}", g)).unwrap_or_default());
+            let bytes = if fmt == "docx" {
+                let mut widths = vec![3600u32, 1200];
+                widths.extend(codes.iter().map(|_| 900u32));
+                widths.extend([1100, 1200, 900]);
+                let trows: Vec<Vec<(String, String)>> = rows
+                    .iter()
+                    .map(|r| {
+                        r.iter()
+                            .enumerate()
+                            .map(|(i, x)| {
+                                let fill = if i >= 2 && i < 2 + codes.len() {
+                                    match x.trim_end_matches('*') {
+                                        "5" => "C6EFCE",
+                                        "4" => "DDEBF7",
+                                        "3" => "FFEB9C",
+                                        "2" => "F8CBAD",
+                                        _ => "",
+                                    }
+                                } else {
+                                    ""
+                                };
+                                (x.clone(), fill.to_string())
+                            })
+                            .collect()
+                    })
+                    .collect();
+                super::report::docx_blocks(&title, &[Block::Title(title.clone()), Block::Sub(format!("Сформировано {}", super::report::today_str())), Block::Table { heads: heads.clone(), widths, rows: trows }], true)
+            } else {
+                let mut widths = vec![34u32, 10];
+                widths.extend(codes.iter().map(|_| 9u32));
+                widths.extend([10, 11, 8]);
+                super::report::xlsx_table("Журнал", &title, &heads, &rows, &widths)
+            };
+            std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path))
+        }
+
+        // ссылка из работы студента — в браузере по умолчанию (без cmd: в адресе бывают & и ^)
+        "open_url" => {
+            let url = p.get("url").str_or("");
+            let l = url.to_lowercase();
+            if !(l.starts_with("http://") || l.starts_with("https://")) || url.chars().any(|c| c.is_control() || c == '"' || c == ' ') {
+                return Err("Это не ссылка на сайт".into());
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", &url]).spawn();
+            }
+            #[cfg(not(target_os = "windows"))]
+            open_in_os(&url, false);
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // как будет выглядеть текст после обезличивания
+        "anon_preview" => {
+            let names: Vec<String> = p.get("names").str_list();
+            let a = if names.is_empty() {
+                // берём те же ФИО, что и при проверке (без учёта настройки)
+                let mut all: Vec<String> = Vec::new();
+                {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    for w in &ws.works {
+                        all.extend(core.authors(&ws, w).0);
+                    }
+                }
+                all.extend(core.journal.lock().unwrap_or_else(|e| e.into_inner()).rosters.values().flatten().cloned());
+                all.retain(|n| !n.trim().is_empty() && !n.starts_with('(') && n != "не определён");
+                super::anon::Anon::new(&all)
+            } else {
+                super::anon::Anon::new(&names)
+            };
+            Ok(Json::obj().with("text", a.apply(&p.get("text").str_or(""))).with("people", a.len()))
+        }
+
+        "notify_test" => {
+            super::notify::send(core, "test", "Проверка заданий", "Так будут выглядеть уведомления: например, «Проверка завершена — проверено работ: 24».");
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // ---- обновления с GitHub
+        "update_check" => {
+            if p.get("auto").bool_or(false) && !super::updater::due(&core.settings()) {
+                return Ok(Json::obj().with("skipped", true));
+            }
+            let r = super::updater::check(core)?;
+            let skip = core.settings().get("updates").get("skip").str_or("");
+            if p.get("auto").bool_or(false) && r.get("available").bool_or(false) && r.get("version").str_or("") != skip {
+                super::notify::send(core, "update", "Вышла новая версия", &format!("Проверка заданий {} — откройте приложение, чтобы обновиться.", r.get("version").str_or("")));
+            }
+            Ok(r)
+        }
+        "update_download" => {
+            let script = super::updater::download(core, &p.get("url").str_or(""), &p.get("version").str_or(""))?;
+            Ok(Json::obj().with("script", script))
+        }
+        "update_apply" => {
+            super::updater::apply_and_exit(core, &p.get("script").str_or(""))?;
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // ---- перенос всего приложения одним файлом
+        "export_all" => super::transfer::export(core, &p.get("path").str_or(""), super::transfer::Parts::from_json(p.get("parts"))),
+        "import_inspect" => super::transfer::inspect(&p.get("path").str_or("")),
+        "import_all" => {
+            let r = super::transfer::import(core, &p.get("path").str_or(""), super::transfer::Parts::from_json(p.get("parts")))?;
+            Ok(core.state_json().with("imported", r.get("imported").clone()))
+        }
+
+        // ---- свои темы и шрифты
+        "read_text" => {
+            let path = p.get("path").str_or("");
+            let ext = super::core::ext_of(&path);
+            if !["json", "txt", "proverka-theme"].contains(&ext.as_str()) {
+                return Err("Нужен файл .json".into());
+            }
+            let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+            if meta.len() > 30_000_000 {
+                return Err("Файл слишком большой".into());
+            }
+            Ok(Json::obj().with("text", std::fs::read_to_string(&path).map_err(|e| format!("не удалось прочитать: {}", e))?))
+        }
+        "font_import" => {
+            // .ttf/.otf/.woff/.woff2 — копия в папку данных/fonts
+            let path = p.get("path").str_or("");
+            let ext = super::core::ext_of(&path);
+            if !["ttf", "otf", "woff", "woff2"].contains(&ext.as_str()) {
+                return Err("Нужен файл шрифта: .ttf, .otf, .woff или .woff2".into());
+            }
+            let b = std::fs::read(&path).map_err(|e| e.to_string())?;
+            let file = save_font(core, &super::core::file_name(&path), &b)?;
+            Ok(Json::obj().with("file", file))
+        }
+        "font_save" => {
+            let b = b64_decode(&p.get("b64").str_or(""));
+            if b.is_empty() {
+                return Err("пустой шрифт".into());
+            }
+            let file = save_font(core, &p.get("file").str_or("font.ttf"), &b)?;
+            Ok(Json::obj().with("file", file))
+        }
+        "font_b64" => {
+            let file = p.get("file").str_or("");
+            if file.contains(['/', '\\']) || file.contains("..") {
+                return Err("неверное имя".into());
+            }
+            let b = std::fs::read(core.data_dir.join("fonts").join(&file)).map_err(|e| e.to_string())?;
+            Ok(Json::obj().with("b64", b64(&b)))
+        }
+        "font_delete" => {
+            let file = p.get("file").str_or("");
+            if file.contains(['/', '\\']) || file.contains("..") {
+                return Err("неверное имя".into());
+            }
+            let _ = std::fs::remove_file(core.data_dir.join("fonts").join(&file));
+            Ok(Json::obj().with("ok", true))
+        }
+        "copy_file" => {
+            // экспорт шрифта: из папки данных — куда выбрал преподаватель
+            let file = p.get("font").str_or("");
+            if file.contains(['/', '\\']) || file.contains("..") {
+                return Err("неверное имя".into());
+            }
+            std::fs::copy(core.data_dir.join("fonts").join(&file), p.get("to").str_or("")).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // сохранить текст в файл, выбранный в окне «Сохранить как»
+        "save_text" => {
+            let path = p.get("path").str_or("");
+            if path.is_empty() {
+                return Err("Не выбран файл".into());
+            }
+            let bom = if p.get("bom").bool_or(false) { "\u{feff}" } else { "" };
+            std::fs::write(&path, format!("{}{}", bom, p.get("text").str_or(""))).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path))
+        }
+
+        "open_path" => {
+            let path = p.get("path").str_or("");
+            open_in_os(&path, p.get("select").bool_or(false));
+            Ok(Json::obj().with("ok", true))
+        }
+
+        _ => Err(format!("неизвестная команда: {}", method)),
+    }
+}
+
+pub fn open_in_os(path: &str, select: bool) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if select {
+            let _ = std::process::Command::new("explorer").raw_arg(format!("/select,\"{}\"", path)).spawn();
+        } else {
+            let _ = std::process::Command::new("cmd").args(["/C", "start", "", path]).creation_flags(CREATE_NO_WINDOW).spawn();
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = select;
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = select;
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// base64 → байты (допускается префикс «data:…;base64,»).
+pub fn b64_decode(s: &str) -> Vec<u8> {
+    let s = match s.find(";base64,") {
+        Some(i) => &s[i + 8..],
+        None => s,
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => continue,
+        } as u32;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    out
+}
+
+pub fn b64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
+    for ch in data.chunks(3) {
+        let b = [ch[0], *ch.get(1).unwrap_or(&0), *ch.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if ch.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if ch.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn _unused(_: HashMap<String, String>) {}
+
+/// Сводная таблица журнала: группы → студенты → оценки по работам.
+pub fn journal_view(core: &Arc<Core>) -> Json {
+    let j = core.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut groups: Vec<String> = j.groups.iter().map(|g| g.name.clone()).collect();
+    for g in j.rosters.keys() {
+        if !groups.contains(g) {
+            groups.push(g.clone());
+        }
+    }
+    for e in &j.entries {
+        if !groups.contains(&e.group) {
+            groups.push(e.group.clone());
+        }
+    }
+    for w in core.ws.lock().unwrap_or_else(|e| e.into_inner()).works.iter() {
+        if !w.group.is_empty() && !groups.contains(&w.group) {
+            groups.push(w.group.clone());
+        }
+    }
+    groups.sort_by_key(|g| natural_key(g));
+    let mut codes: Vec<String> = j.entries.iter().map(|e| e.code.clone()).collect();
+    codes.sort_by_key(|c| natural_key(c));
+    codes.dedup();
+    let mut out = Json::arr();
+    for g in &groups {
+        let roster = j.rosters.get(g).cloned().unwrap_or_default();
+        let mut students: Vec<String> = roster.clone();
+        let mut extra: Vec<String> = j.entries.iter().filter(|e| &e.group == g && !roster.contains(&e.student)).map(|e| e.student.clone()).collect();
+        extra.sort_by_key(|s| natural_key(s));
+        extra.dedup();
+        students.extend(extra);
+        let mut rows = Json::arr();
+        for st in &students {
+            let mut cells = Json::obj();
+            let (mut sum, mut n, mut viol) = (0f64, 0i64, 0i64);
+            for c in &codes {
+                if let Some(e) = j.entries.iter().find(|e| &e.group == g && &e.student == st && &e.code == c) {
+                    if let Some(gr) = e.grade {
+                        sum += gr;
+                        n += 1;
+                    }
+                    if !e.violation.is_empty() {
+                        viol += 1;
+                    }
+                    cells.set(c, Json::obj().with("grade", e.grade).with("violation", e.violation.as_str()).with("date", e.date).with("file", e.file.as_str()).with("comment", e.comment.as_str()).with("variant", e.variant.as_str()));
+                }
+            }
+            let missing = if roster.is_empty() { 0 } else { codes.len() as i64 - n };
+            rows.push(
+                Json::obj()
+                    .with("name", st.as_str())
+                    .with("in_roster", roster.contains(st))
+                    .with("cells", cells)
+                    .with("avg", if n > 0 { Json::Num(((sum as f64 / n as f64) * 100.0).round() / 100.0) } else { Json::Null })
+                    .with("violations", viol)
+                    .with("missing", missing),
+            );
+        }
+        let map_json = |src: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>| {
+            let mut o = Json::obj();
+            if let Some(m) = src.get(g) {
+                for (k, v) in m {
+                    o.set(k, v.as_str());
+                }
+            }
+            o
+        };
+        out.push(Json::obj().with("name", g.as_str()).with("program", j.program_of(g)).with("roster", roster).with("variants", map_json(&j.assigned)).with("teams", map_json(&j.teams)).with("students", rows));
+    }
+    Json::obj().with("groups", out).with("codes", codes).with("variant_is_number", j.variant_is_number).with("entries", j.entries.len())
+}
+
+fn ctx_info_json(core: &Arc<Core>, prov: &Provider) -> Json {
+    Json::Arr(
+        grader::lmstudio_models_info(core, &prov.base_url)
+            .into_iter()
+            .map(|(id, loaded, max, is_loaded)| Json::obj().with("id", id).with("loaded_ctx", loaded).with("max_ctx", max).with("loaded", is_loaded))
+            .collect(),
+    )
+}
+
+/// Сохранить шрифт в папку данных/fonts (имя без пути, без повторов).
+fn save_font(core: &Core, name: &str, data: &[u8]) -> Result<String, String> {
+    let ext = super::core::ext_of(name);
+    if !["ttf", "otf", "woff", "woff2"].contains(&ext.as_str()) || data.len() > 25_000_000 {
+        return Err("Нужен файл шрифта: .ttf, .otf, .woff или .woff2 до 25 МБ".into());
+    }
+    let dir = core.data_dir.join("fonts");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let clean: String = name.chars().map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c }).collect();
+    let mut file = clean.clone();
+    let mut k = 2;
+    while dir.join(&file).exists() && std::fs::read(dir.join(&file)).map(|b| b != data).unwrap_or(true) {
+        file = format!("{}_{}.{}", std::path::Path::new(&clean).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default(), k, ext);
+        k += 1;
+    }
+    std::fs::write(dir.join(&file), data).map_err(|e| e.to_string())?;
+    Ok(file)
+}

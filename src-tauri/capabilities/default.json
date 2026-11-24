@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "description": "Разрешения главного окна",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "notification:default"
+  ]
+}
