@@ -141,7 +141,7 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 ### Репозиторий и релизы
 * GitHub: `ASpezio/Proverka-Zadaniy`. В репозиторий уходит только код: без данных преподавателя, работ, журналов, сборок (`.gitignore`).
 * В тестах, примерах и документации — **только вымышленные ФИО** (Лесовиков, Громобоева, Пряничков…).
-* Релиз: поднять версию в `src-tauri/Cargo.toml` и `tauri.conf.json`, `git tag vX.Y.Z`, `git push --tags` → GitHub Actions соберёт `ProverkaZadaniy.exe` и `Proverka-Setup.exe`.
+* Релиз: поднять версию в `src-tauri/Cargo.toml` и `tauri.conf.json` и отправить в `main` → GitHub Actions соберёт `ProverkaZadaniy.exe` и `Proverka-Setup.exe` и, если такой версии ещё нет, создаст релиз `vX.Y.Z`.
 
 ## Правила оценки (`Core::finalize`)
 1. Базовая оценка — `grade` от модели (2–5); при двойной проверке — по `double_check.policy` (`primary`/`min`/`avg`), расхождение больше `max_diff` → флаг `review`.
