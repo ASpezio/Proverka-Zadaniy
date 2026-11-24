@@ -283,6 +283,7 @@ fn main() {
             });
             let core = Core::new(data_dir.clone(), Arc::new(UreqClient), emitter);
             app.manage(core);
+            register_toast_id(&data_dir, &app.config().identifier);
             build_tray(app)?;
             // окно создаётся скрытым: при автозапуске «свёрнутым в трей» оно так и остаётся
             if let Some(w) = app.get_webview_window("main") {
@@ -348,6 +349,38 @@ fn show_notification<R: tauri::Runtime>(app: &tauri::AppHandle<R>, payload: &str
     }
     let _ = app.notification().builder().title(j.get("title").str_or("Проверка заданий")).body(j.get("body").str_or("")).show();
 }
+
+/// Windows показывает всплывающие уведомления только от «известного» приложения:
+/// его код (AppUserModelID, у нас — identifier из tauri.conf.json) должен быть
+/// записан в реестре, иначе уведомления молча пропадают. Поэтому при запуске приложение
+/// само регистрирует себя в HKCU (права администратора не нужны): имя и значок
+/// для уведомлений.
+#[cfg(windows)]
+fn register_toast_id(data_dir: &std::path::Path, id: &str) {
+    use std::os::windows::process::CommandExt;
+    const NO_WINDOW: u32 = 0x0800_0000;
+    let id = id.to_string();
+    let icon = data_dir.join("app-icon.png");
+    std::thread::spawn(move || {
+        let _ = std::fs::create_dir_all(icon.parent().unwrap_or(std::path::Path::new(".")));
+        if !icon.exists() {
+            let _ = std::fs::write(&icon, include_bytes!("../icons/128x128.png"));
+        }
+        let key = format!("HKCU\\Software\\Classes\\AppUserModelId\\{id}");
+        let set = |name: &str, value: &str| {
+            let _ = std::process::Command::new("reg")
+                .args(["add", &key, "/v", name, "/t", "REG_SZ", "/d", value, "/f"])
+                .creation_flags(NO_WINDOW)
+                .status();
+        };
+        set("DisplayName", "Проверка заданий");
+        set("IconUri", &icon.to_string_lossy());
+        set("IconBackgroundColor", "FF1B2140");
+    });
+}
+
+#[cfg(not(windows))]
+fn register_toast_id(_data_dir: &std::path::Path, _id: &str) {}
 
 /// Пользователь выбрал «Выход» в меню трея — окно закрывается по-настоящему.
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

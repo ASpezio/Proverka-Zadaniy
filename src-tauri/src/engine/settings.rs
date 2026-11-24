@@ -93,7 +93,16 @@ pub fn defaults() -> Json {
             "double_check",
             Json::obj().with("enabled", false).with("provider", "").with("model", "").with("checkers", Json::arr()).with("policy", "primary").with("max_diff", 2),
         )
-        .with("journal_auto", true)
+        .with("journal_auto", false)
+        .with("journal_manual", true)
+        // журнал: тесты 0–1,9 → «2», какие столбцы выгружать
+        .with("journal_opts", Json::obj().with("tests_min2", false))
+        // предметы (дисциплины) и предмет каждого набора заданий
+        .with("subjects", Json::arr())
+        .with("set_subjects", Json::obj())
+        // CSV: кодировка (utf8bom — понимают и Moodle, и Excel; utf8; cp1251) и разделитель
+        .with("csv_encoding", "utf8bom")
+        .with("csv_sep", ";")
         .with("half_grades", true)
         .with("tray", Json::obj().with("close_to_tray", false).with("minimize_to_tray", false))
         .with("llama", Json::obj().with("bin_dir", "").with("models_dir", "").with("selected", Json::arr()).with("ctx", 16384).with("gpu", "gpu").with("kv_q8", true).with("extra", ""))

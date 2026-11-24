@@ -17,6 +17,24 @@ pub fn decode_single_byte(b: u8, codepage: u32) -> char {
     }
 }
 
+/// Строка → CP1251 (символы, которых нет в кодировке, — «?»).
+pub fn encode_cp1251(s: &str) -> Vec<u8> {
+    s.chars()
+        .map(|c| {
+            let u = c as u32;
+            if u < 0x80 {
+                return u as u8;
+            }
+            match c {
+                // частые символы, которых нет в CP1251
+                '\u{2212}' => b'-',
+                '\u{2009}' | '\u{202F}' => b' ',
+                _ => CP1251.iter().position(|&x| x as u32 == u).map(|i| 0x80 + i as u8).unwrap_or(b'?'),
+            }
+        })
+        .collect()
+}
+
 /// Байты → строка: UTF-8 (с BOM или без), UTF-16 с BOM, иначе CP1251.
 pub fn decode_bytes(b: &[u8]) -> String {
     if b.starts_with(&[0xEF, 0xBB, 0xBF]) {

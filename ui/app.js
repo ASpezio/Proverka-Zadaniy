@@ -214,6 +214,7 @@ function countUp(el, to, dur = 900, dec = 0) {
 }
 
 const ICON = {
+  cal: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="5" width="16" height="15" rx="2"/><path d="M4 10h16M9 3v4M15 3v4"/></svg>',
   file: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
   folder: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>',
   pen: '<svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l4-1 11-11-3-3L5 16z"/><path d="M14 6l3 3"/></svg>',
@@ -802,10 +803,10 @@ function openGroups() {
     <h3 class="sec">Группы <span class="count">${gs.length}</span></h3>
     <div class="group-list">${gs.map((g) => `
       <div class="group-row" data-g="${esc(g.name)}">
-        <div><b>${esc(g.name)}</b><div class="small muted">${g.works} работ • в списке ${g.roster} чел.${g.registered ? "" : " • из папки"}</div></div>
+        <div><b>${esc(g.name)}</b><div class="small muted">${g.works} работ • в списке ${g.roster} чел.${g.grades ? ` • оценок в журнале ${g.grades}` : ""}${g.registered ? "" : g.works ? " • из папки" : " • из журнала"}</div></div>
         <select class="select input" data-prog>${[`<option value="">направление…</option>`, ...programs().map((p) => `<option ${g.program === p ? "selected" : ""}>${esc(p)}</option>`)].join("")}</select>
         <button class="btn sm" data-edit>Изменить</button>
-        <button class="btn ghost sm danger" data-del title="Удалить группу (оценки в журнале останутся)">${ICON.trash}</button>
+        <button class="btn ghost sm danger" data-del title="Удалить группу">${ICON.trash}</button>
       </div>`).join("") || `<p class="muted">Групп пока нет.</p>`}</div>
     <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="gNew">${ICON.plus}Новая группа</button></div>
     <h3 class="sec">Направления</h3>
@@ -816,8 +817,16 @@ function openGroups() {
     $("[data-prog]", row).onchange = async (e) => { S.state = await api("group_save", { name, program: e.target.value }); updateRail(); toast(`Группа ${name}: ${e.target.value || "без направления"}`); };
     $("[data-edit]", row).onclick = () => editGroup(name);
     $("[data-del]", row).onclick = async () => {
-      if (!(await askConfirm(`Удалить группу «${name}» из списка? Работы и оценки в журнале останутся.`))) return;
-      S.state = await api("group_delete", { name }); SND.play("delete"); openGroups(); rerender();
+      const g = gs.find((x) => x.name === name);
+      const how = await askChoice(`Удалить группу «${name}»?`, [
+        ["all", `Целиком: список студентов${g?.grades ? `, оценки журнала (${g.grades})` : ""}, темы и календарь`],
+        ["reg", "Только из списка групп — оценки журнала останутся (группа будет видна, пока в журнале есть её оценки)"],
+      ]);
+      if (!how) return;
+      const r = await api("group_delete", { name, entries: how === "all" });
+      S.state = r; S.journal = r.journal; S.repGroups = null;
+      SND.play("delete"); openGroups(); rerender();
+      toast(`Группа «${name}» удалена${g?.works ? `. Её работы (${g.works}) остались на шаге «Работы студентов»` : ""}`, "ok", { label: "Отменить", run: undoLast });
     };
   });
   $("#gNew").onclick = () => editGroup("");
@@ -908,7 +917,23 @@ VIEWS.tasks = (v, opts = {}) => {
   $$("[data-del-task]", v).forEach((b) => (b.onclick = () => act(async () => { S.state = await api("remove", { kind: "tasks", id: b.dataset.delTask }); SND.play("delete"); })));
   $$("[data-set]", v).forEach((b) => (b.onclick = () => openSet(b.dataset.set)));
   $$("[data-gen]", v).forEach((b) => (b.onclick = () => openGenerator(b.dataset.gen)));
+  $$("[data-set-subj]", v).forEach((sel) => (sel.onchange = async () => {
+    let subject = sel.value;
+    if (subject === "__new") {
+      subject = (await askText("Новый предмет", "", "например, Компьютерные сети"))?.trim() || "";
+      if (!subject) { sel.value = (settings().set_subjects || {})[sel.dataset.setSubj] || ""; return; }
+    }
+    S.state = await api("set_subject", { set: sel.dataset.setSubj, subject });
+    toast(subject ? `Предмет: ${subject}. В журнал оценки этого задания попадут с ним` : "Предмет убран");
+    rerender();
+  }));
 };
+
+/** Список предметов для выбора (+ «новый предмет…»). */
+function subjectOptions(cur) {
+  const list = [...new Set([...(settings().subjects || []), ...(cur ? [cur] : [])])];
+  return `<option value="">не указан</option>${list.map((x) => `<option ${x === cur ? "selected" : ""}>${esc(x)}</option>`).join("")}<option value="__new">новый предмет…</option>`;
+}
 
 function setCard(s) {
   const n = works().filter((w) => w.assignment_id === s.id).length;
@@ -916,6 +941,7 @@ function setCard(s) {
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px"><div class="set-code">${esc(s.code)}</div>${scopeTag(s.scope)}</div>
     <div class="set-title">${esc(s.title)}</div>
     <div class="set-scope"><span class="muted">Для кого:</span><select class="select input" data-set-scope="${esc(s.id)}">${scopeOptions(s.scope)}</select></div>
+    <div class="set-scope"><span class="muted">Предмет:</span><select class="select input" data-set-subj="${esc(s.id)}">${subjectOptions((settings().set_subjects || {})[s.id] || "")}</select></div>
     <div class="set-stats">
       <div><b>${s.variant_count}</b><span>вариантов</span></div>
       <div><b>${s.hidden_total}</b><span>скрытых ловушек</span></div>
@@ -980,7 +1006,7 @@ VIEWS.works = (v, opts = {}) => {
       <h1 class="page-title">Работы студентов</h1>
       <p class="page-lead">Добавьте файлы по одному или целой папкой. Подпапки становятся группами, а группу можно выбрать и вручную. Задание для каждой работы подбирается по её группе и направлению.</p>
     </div><div class="head-actions"><button class="btn" id="photoBtn" title="Фото страниц тетради одного студента — одна работа">Работа по фото…</button><button class="btn" id="moodleBtn">${ICON.down}Импорт из Moodle</button><button class="btn" id="grpBtn">Группы и направления</button>${st.works.length ? `<button class="btn ghost danger" id="clearWorks">${ICON.trash}Очистить</button>` : ""}</div></div>
-    ${dropzone("works", "Перетащите сюда работы или папку с работами", "Word, PDF, Excel, PowerPoint, фото и скриншоты. Фото страниц одного студента («Лесовиков_1.jpg», «Лесовиков_2.jpg» или его папка) станут одной работой. Группой по умолчанию становится папка (D:\\чек\\1гр → «1гр»).")}
+    ${dropzone("works", "Перетащите сюда работы или папку с работами", "Word, PDF, Excel, PowerPoint, фото и скриншоты. Фото страниц одного студента («Лесовиков_1.jpg», «Лесовиков_2.jpg» или его папка) станут одной работой. Группой по умолчанию становится папка, в которой лежат работы: «…\\Работы\\ИС-21\\Лесовиков.docx» → группа «ИС-21».")}
     ${!st.works.length ? `<div style="margin-top:30px">${emptyArt("Работ пока нет", "Добавьте файл или папку с работами студентов")}</div>` : `
     <div class="toolbar" style="margin-top:18px">
       <input class="input search" id="wq" placeholder="Поиск: фамилия, файл, группа" value="${esc(F.wQuery)}">
@@ -1024,7 +1050,7 @@ VIEWS.works = (v, opts = {}) => {
 /** Одна работа из фото страниц: студент выбирается из списка группы или вписывается. */
 async function openPhotoWork() {
   let journal = S.journal;
-  try { journal = await api("journal"); S.journal = journal; } catch (e) { /* без списков */ }
+  try { journal = await loadJournal(); } catch (e) { /* без списков */ }
   const groups = groupsList();
   let photos = [];
   const m = document.createElement("div");
@@ -1776,7 +1802,7 @@ VIEWS.model = async (v) => {
     <div id="provEdit"></div>
     ${fold("dc", "Проверка несколькими моделями", "Вторая и третья модели перепроверяют каждую работу — с любого сервера", `<div class="card pad" id="dcBox"></div>`)}
     ${fold("ctxz", "Длинные работы и приватность", "Как сжимать работы, не влезающие в контекст; обезличивание для облака", `<div class="card pad" id="ctxzBox"></div>`)}
-    ${fold("mode", "Как модель работает с MCP", "Прямой или агентный режим, сколько работ одновременно", `<div class="card pad">`)}
+    ${fold("mode", "Как модель работает с MCP", "Прямой или агентный режим, сколько работ одновременно", `<div class="card pad">
       <div class="mode-tabs" id="modeTabs"><span class="knob"></span>
         <button data-mode="direct">Прямой режим</button><button data-mode="agent">Агентный режим</button></div>
       <p class="small" id="modeHelp" style="margin:12px 0 0;max-width:80ch"></p>
@@ -1785,7 +1811,7 @@ VIEWS.model = async (v) => {
         <label class="field"><span>Максимум символов работы</span><input class="input" type="number" min="2000" step="1000" id="maxChars" value="${st.max_work_chars || 16000}"></label>
       </div>
       <p class="small muted" style="margin:8px 0 0">Локальная модель обычно обрабатывает работы по одной; для облака можно 3–4. Если работа не помещается в контекст модели, приложение само сократит запрос — как именно, выбирается в разделе «Длинные работы и приватность».</p>
-    </div></details>
+    </div>`)}
     ${fold("mcp", "MCP-сервер приложения", "Подключить инструменты проверки к LM Studio, Claude Desktop, Cursor", `<div class="card pad" id="mcpBox"><div class="spinner"></div></div>`)}`;
   setupFolds(v);
   renderProviders();
@@ -3574,31 +3600,56 @@ async function moodleGrades() {
   } catch (e) { toast(String(e), "err"); }
 }
 
-/** Оценки Moodle ⇄ журнал группы: загрузка из Moodle, выгрузка в Moodle. */
+/** Оценки Moodle ⇄ журнал группы: загрузка из Moodle, выгрузка в Moodle, настройки журнала. */
 function openMoodleJournal() {
   const j = S.journal || { groups: [], codes: [] };
+  const st = settings();
   const groups = j.groups.map((g) => g.name);
   const g0 = S.jGroup || groups[0] || "";
   const codes = [...new Set([...(j.codes || []), ...sets().map((x) => x.code)])];
+  const enc = st.csv_encoding || "utf8bom", sep = st.csv_sep || ";";
+  let pref = "auto";
+  try { pref = localStorage.getItem("mjPrefer") || "auto"; } catch (e) { /* нет хранилища */ }
   const m = document.createElement("div");
   m.className = "modal-veil";
-  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(720px,100%)">
+  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(760px,100%)">
     <div class="modal-head"><h2>Оценки: Moodle ⇄ журнал</h2></div>
     <div class="modal-body" style="display:grid;gap:14px">
       <label class="field"><span>Группа</span><select class="select input" id="mjGroup">${groups.map((g) => `<option ${g === g0 ? "selected" : ""}>${esc(g)}</option>`).join("")}<option value="__new">новая группа…</option></select></label>
-      <div class="mj-box"><h3>Из Moodle в журнал</h3>
-        <p class="small muted">Подойдёт экспорт журнала оценок курса («Оценки → Экспорт → Файл CSV» или «Excel») — все задания сразу, или «таблица оценок» одного задания («Просмотр всех ответов → Действия с оценками → Скачать таблицу оценок»). Стобалльные оценки переводятся в пятибалльные. Почта студентов запоминается — она нужна для выгрузки обратно.</p>
+      <details class="adv" open><summary>Из Moodle в журнал</summary><div class="adv-body" style="display:grid;gap:10px">
+        <p class="small muted" style="margin:0">Подойдёт экспорт журнала оценок курса («Оценки → Экспорт → Файл CSV» или «Excel») — все задания и тесты сразу, или «таблица оценок» одного задания. Тесты («Тест: …», «Тестирование по разделу…») попадают в журнал как тесты — у них отдельный средний балл. Отзывы тоже загружаются; если в отзыве упоминается ИИ или нейросеть, оценка помечается.</p>
+        <div class="grid2">
+          <label class="field"><span>Какой вид оценки брать</span><select class="select input" id="mjPrefer">
+            ${[["auto", "сам выберу: проценты, значение, буква"], ["value", "Значение"], ["percent", "Проценты"], ["letter", "Буква"]].map(([v, t]) => `<option value="${v}" ${pref === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+          <label class="field"><span>Предмет (необязательно)</span><input class="input" id="mjSubj" list="mjSubjs" placeholder="Компьютерные сети"><datalist id="mjSubjs">${(j.subjects || []).map((x) => `<option value="${esc(x)}">`).join("")}</datalist></label>
+        </div>
+        <p class="small muted" style="margin:-4px 0 0">В Moodle при экспорте можно выбрать «Значение», «Проценты» и «Буква». Если в файле несколько видов, по умолчанию берутся проценты — по ним шкала понятна точно; «Значение» переводится в пятибалльную по самой большой оценке в столбце (до 5, 10, 20 или 100), «Буква» — A = 5, B = 4, C и D = 3, F = 2 или «отлично», «хорошо»…</p>
         <label class="field"><span>Если это таблица одного задания — какая это работа</span><input class="input" id="mjCode" list="mjCodes" placeholder="например, ПР2"><datalist id="mjCodes">${codes.map((c) => `<option value="${esc(c)}">`).join("")}</datalist></label>
         <label class="switch"><input type="checkbox" id="mjReplace"><span class="track"></span><span class="lbl"><b>Заменять оценки, которые уже есть в журнале</b><small>Иначе берутся только недостающие.</small></span></label>
         <label class="switch"><input type="checkbox" id="mjRoster" checked><span class="track"></span><span class="lbl"><b>Добавлять новых студентов в список группы</b></span></label>
         <div class="section-actions"><button class="btn primary" id="mjImport">Выбрать файл Moodle…</button></div>
-        <div id="mjOut"></div></div>
-      <div class="mj-box"><h3>Из журнала в Moodle</h3>
+        <div id="mjOut"></div></div></details>
+      <details class="adv"><summary>Из журнала в Moodle</summary><div class="adv-body" style="display:grid;gap:10px">
+        <label class="switch"><input type="checkbox" id="mjFb"><span class="track"></span><span class="lbl"><b>Выгружать отзывы (комментарии)</b><small>В файл для журнала Moodle — столбцом «ПР1 (отзыв)» рядом с оценкой, в таблицу оценок задания — в «Отзыв в виде комментария».</small></span></label>
+        <div class="grid2">
+          <label class="field"><span>Кодировка файла</span><select class="select input" id="mjEnc">${[["utf8bom", "UTF-8 (с BOM) — Moodle и Excel"], ["utf8", "UTF-8 без BOM"], ["cp1251", "Windows-1251"]].map(([v, t]) => `<option value="${v}" ${enc === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+          <label class="field"><span>Разделитель</span><select class="select input" id="mjSep">${[[";", "точка с запятой ( ; )"], [",", "запятая ( , )"]].map(([v, t]) => `<option value="${v}" ${sep === v ? "selected" : ""}>${t}</option>`).join("")}</select></label>
+        </div>
         <div class="section-actions">
-          <button class="btn" id="mjBook" title="Файл для «Оценки → Импорт → Файл CSV»: почта, ФИО и по столбцу на каждую работу">Файл для импорта в журнал оценок Moodle…</button>
+          <button class="btn" id="mjBook" title="Файл для «Оценки → Импорт → Файл CSV»: почта, ФИО и по столбцу на каждую работу">Файл для журнала оценок Moodle…</button>
           <button class="btn" id="mjSheet" title="Заполнить «таблицу оценок» одного задания оценками из журнала">Заполнить таблицу оценок задания…</button>
         </div>
-        <p class="small muted">Импорт в Moodle: «Оценки → Импорт → Файл CSV», разделитель — точка с запятой, кодировка UTF-8; сопоставьте «Адрес электронной почты» с «Адрес электронной почты» пользователя и каждый столбец ПР — со своим заданием. Почта берётся из файлов, загруженных из Moodle. Таблицу оценок задания приложение заполнит и сохранит копию «_оценки» — её загрузите в задании: «Загрузить таблицу оценок».</p></div>
+        <p class="small muted" style="margin:0">Импорт в Moodle: «Оценки → Импорт → Файл CSV», выберите ту же кодировку (по умолчанию UTF-8) и разделитель; сопоставьте «Адрес электронной почты» с «Адрес электронной почты» пользователя и каждый столбец ПР — со своим заданием (столбцы «(отзыв)» — с отзывом). Свои столбцы журнала (пропуски) не выгружаются.</p></div></details>
+      <details class="adv"><summary>Настройки журнала группы</summary><div class="adv-body" style="display:grid;gap:12px">
+        <label class="switch"><input type="checkbox" id="mjMin2" ${st.journal_opts?.tests_min2 ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Тесты на 0–1,9 считать «2»</b><small>Студент написал тест — значит, «2», а не «0» или «1,5». Исходная оценка Moodle остаётся в подсказке клетки.</small></span></label>
+        <div class="rg-tools"><span class="rg-tools-t">Раздать варианты группе</span>
+          <select class="input sm" id="mjDealMode"><option value="cycle">по кругу</option><option value="order">по порядку без повторов</option><option value="random">случайно, поровну</option><option value="clear">убрать варианты</option></select>
+          <label class="rg-n">с <input class="input sm" id="mjFrom" type="number" min="1" value="1"></label>
+          <label class="rg-n">по <input class="input sm" id="mjTo" type="number" min="1" value="${Math.max(0, ...sets().map((x) => x.variant_count || 0)) || 30}"></label>
+          <label class="rg-chk"><input type="checkbox" id="mjPair" checked> один на пару</label>
+          <button class="btn sm" id="mjDeal">Раздать</button></div>
+        <p class="small muted" style="margin:0">Варианты раздаются с первого человека в списке группы: «с 1 по 30», «с 1 по 12» — после последнего снова с первого. Посмотреть и поправить руками — «Список и варианты».</p>
+      </div></details>
     </div>
     <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" id="mjClose">Закрыть</button></div></div>`;
   document.body.appendChild(m);
@@ -3610,16 +3661,22 @@ function openMoodleJournal() {
     if (g === "__new") { g = (await askText("Название группы", "", "например, 1гр"))?.trim(); if (!g) return null; }
     return g;
   };
+  const saveCsv = () => saveSettings({ csv_encoding: $("#mjEnc", m).value, csv_sep: $("#mjSep", m).value });
+  $("#mjEnc", m).onchange = saveCsv; $("#mjSep", m).onchange = saveCsv;
+  $("#mjPrefer", m).onchange = (e) => { try { localStorage.setItem("mjPrefer", e.target.value); } catch (x) { /* нет хранилища */ } };
+  $("#mjMin2", m).onchange = async (e) => { await saveSettings({ journal_opts: { ...(settings().journal_opts || {}), tests_min2: e.target.checked } }); await loadJournal(); if (S.view === "journal") renderJournal(); toast(e.target.checked ? "Тесты на 0–1,9 теперь «2»" : "Тесты показываются как в Moodle"); };
   $("#mjImport", m).onclick = async () => {
     const g = await group(); if (!g) return;
     const picked = await pickFiles({ multiple: false, title: "Оценки из Moodle", only: [{ name: "Оценки Moodle (CSV, Excel)", extensions: ["csv", "xlsx", "xls"] }] });
     if (!picked.length) return;
     if (!$("#mjCode", m).value) { const c = picked[0].match(/(?:ПР|PR|ЛР)\s*[-_№]?\s*(\d+)/i); if (c) $("#mjCode", m).value = c[0].toUpperCase().replace(/[^А-ЯA-Z0-9]/g, "").replace(/^PR/, "ПР"); }
     try {
-      const r = await api("moodle_import_grades", { path: picked[0], group: g, code: $("#mjCode", m).value.trim(), replace: $("#mjReplace", m).checked, roster: $("#mjRoster", m).checked });
-      S.journal = r; S.jGroup = g; renderJournal();
+      const r = await loadJournal("moodle_import_grades", { path: picked[0], group: g, code: $("#mjCode", m).value.trim(), replace: $("#mjReplace", m).checked, roster: $("#mjRoster", m).checked, prefer: $("#mjPrefer", m).value, subject: $("#mjSubj", m).value.trim() });
+      S.jGroup = g; if (S.view === "journal") renderJournal();
+      S.state = await api("state"); updateRail();
       const x = r.imported;
-      $("#mjOut", m).innerHTML = `<div class="ev"><span class="w ok"></span><div>Работы: ${x.codes.map(esc).join(", ")}. Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.</div></div>`;
+      const works = x.codes.filter((c) => !x.tests.includes(c));
+      $("#mjOut", m).innerHTML = `<div class="ev"><span class="w ok"></span><div>${works.length ? `Работы: ${works.map(esc).join(", ")}. ` : ""}${x.tests.length ? `Тесты: ${x.tests.map(esc).join(", ")}. ` : ""}Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.${x.flagged ? `<br><b>В отзывах упоминается ИИ: ${x.flagged}</b> — такие оценки помечены в журнале.` : ""}</div></div>`;
       SND.play("add");
     } catch (e) { $("#mjOut", m).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; if (String(e).includes("какой работе")) $("#mjCode", m).focus(); }
   };
@@ -3628,7 +3685,7 @@ function openMoodleJournal() {
     const path = await pickSave(`Оценки_${g}_для_Moodle.csv`, "csv");
     if (!path) return;
     try {
-      const r = await api("moodle_export_gradebook", { path, group: g });
+      const r = await api("moodle_export_gradebook", { path, group: g, feedback: $("#mjFb", m).checked, encoding: $("#mjEnc", m).value, sep: $("#mjSep", m).value });
       toast(`Сохранено: работы ${r.codes.join(", ")}${r.no_email ? `. У ${r.no_email} студентов нет почты из Moodle — загрузите сначала оценки или ответы из Moodle` : ""}`, r.no_email ? "err" : "ok", { label: "Открыть папку", run: () => api("open_path", { path: r.path.replace(/[\\/][^\\/]+$/, "") }) });
     } catch (e) { toast(String(e), "err"); }
   };
@@ -3639,73 +3696,431 @@ function openMoodleJournal() {
     const picked = await pickFiles({ multiple: false, title: "Таблица оценок задания Moodle (.csv)", only: [{ name: "Таблица оценок", extensions: ["csv"] }] });
     if (!picked.length) return;
     try {
-      const r = await api("moodle_grades", { path: picked[0], group: g, source: "journal", code, feedback: true });
+      const r = await api("moodle_grades", { path: picked[0], group: g, source: "journal", code, feedback: $("#mjFb", m).checked, encoding: $("#mjEnc", m).value });
       toast(`Заполнено оценок: ${r.filled}${r.not_found.length ? `. Не найдены в таблице: ${r.not_found.slice(0, 4).join(", ")}${r.not_found.length > 4 ? "…" : ""}` : ""}`, r.filled ? "ok" : "err", { label: "Открыть папку", run: () => api("open_path", { path: r.path.replace(/[\\/][^\\/]+$/, "") }) });
+    } catch (e) { toast(String(e), "err"); }
+  };
+  $("#mjDeal", m).onclick = async () => {
+    const g = await group(); if (!g) return;
+    const gr = (S.journal?.groups || []).find((x) => x.name === g);
+    if (!gr?.roster.length) { toast("Сначала загрузите список группы — «Список и варианты»", "err"); return; }
+    const teams = gr.teams || {};
+    const units = [];
+    gr.roster.forEach((name) => { const t = $("#mjPair", m).checked && teams[name]; const u = t ? units.find((x) => x.team === t) : null; if (u) u.names.push(name); else units.push({ team: t || null, names: [name] }); });
+    const vals = dealVariants(units.length, $("#mjDealMode", m).value, +$("#mjFrom", m).value || 1, +$("#mjTo", m).value || 1);
+    const variants = {};
+    units.forEach((u, i) => u.names.forEach((n) => { if (vals[i]) variants[n] = vals[i]; }));
+    try {
+      await loadJournal("journal_roster", { group: g, names: gr.roster, variants, teams });
+      if (S.view === "journal") renderJournal();
+      toast(Object.keys(variants).length ? `Варианты розданы: ${Object.keys(variants).length} чел., с ${vals[0]}` : "Варианты убраны");
     } catch (e) { toast(String(e), "err"); }
   };
 }
 
 // ---------------------------------------------------------------- 6. Журнал группы
+S.jFilter = { semester: "", subject: "" };
+try { Object.assign(S.jFilter, JSON.parse(localStorage.getItem("jFilter") || "{}")); } catch (e) { /* нет хранилища */ }
+/** Журнал с текущим фильтром (семестр, предмет). */
+async function loadJournal(method = "journal", payload = {}) {
+  S.journal = await api(method, { ...payload, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
+  return S.journal;
+}
+const KIND_NAME = { work: "работа", test: "тест", custom: "свой столбец" };
+const fmtDay = (d) => (d ? d.slice(8, 10) + "." + d.slice(5, 7) : "");
+const fmtNum = (x) => (x == null ? "—" : String(Math.round(x * 100) / 100).replace(".", ","));
+
 VIEWS.journal = async (v) => {
   v.innerHTML = `<div class="page-head"><div>
       <h1 class="page-title">Журнал группы</h1>
-      <p class="page-lead">Оценки за все работы семестра. После каждой проверки они записываются сюда сами. Добавьте список группы, чтобы вместо «Вариант 12» видеть фамилии: номер в списке считается номером варианта.</p>
+      <p class="page-lead">Оценки за семестр по работам и тестам, свои столбцы (пропуски, посещения), календарь заданий. Оценки проверки попадают сюда кнопкой «Записать текущую проверку» — сами не записываются.</p>
     </div><div class="head-actions">
-      <button class="btn" id="jGroups">Группы и направления</button>
-      <button class="btn" id="jAdd">Записать текущую проверку</button>
+      <button class="btn primary" id="jAdd">Записать текущую проверку</button>
+      <button class="btn" id="jCal">${ICON.cal || ""}Календарь</button>
       <button class="btn" id="jMoodle" title="Загрузить оценки из Moodle в журнал или выгрузить журнал в Moodle">Moodle ⇄ журнал</button>
+      <button class="btn" id="jAn" title="Средние, распределение оценок и долги — отдельно по работам и по тестам">Аналитика</button>
+      <button class="btn" id="jGroups">Группы и направления</button>
       <button class="btn" data-jexp="xlsx">${ICON.down}Excel</button>
-      <button class="btn primary" data-jexp="docx">${ICON.down}Word</button>
+      <button class="btn" data-jexp="docx">${ICON.down}Word</button>
     </div></div>
     <div id="jBody"><div class="spinner"></div></div>`;
   $("#jGroups").onclick = openGroups;
   $("#jMoodle").onclick = () => openMoodleJournal();
-  $("#jAdd").onclick = async () => { const r = await api("journal_add"); S.journal = r; toast(`Записано оценок: ${r.added}`); renderJournal(); };
+  $("#jCal").onclick = () => openCalendar();
+  $("#jAn").onclick = () => openJournalAnalytics();
+  $("#jAdd").onclick = async () => { const r = await loadJournal("journal_add"); toast(`Записано оценок: ${r.added}`); SND.play("add"); renderJournal(); };
   $$("[data-jexp]", v).forEach((b) => (b.onclick = () => exportJournal(b.dataset.jexp)));
-  S.journal = await api("journal");
+  await loadJournal();
   renderJournal();
 };
+
+/** Темы группы по порядку: работы, тесты, свои столбцы. */
+function orderedTopics(g) {
+  const rank = { work: 0, test: 1, custom: 2 };
+  return [...(g.topics || [])].sort((a, b) => rank[a.kind] - rank[b.kind]);
+}
 
 function renderJournal() {
   const j = S.journal;
   const body = $("#jBody");
   if (!body || !j) return;
+  const filt = j.filter || {};
+  const filterBar = `<div class="j-filter">
+      <label>Семестр <select class="select input sm" id="jfSem"><option value="">все</option>${(j.semesters || []).map((x) => `<option ${x === filt.semester ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+      <label>Предмет <select class="select input sm" id="jfSub"><option value="">все</option>${(j.subjects || []).map((x) => `<option ${x === filt.subject ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+      ${filt.semester || filt.subject ? `<button class="btn sm ghost" id="jfReset">Сбросить</button>` : ""}
+    </div>`;
   if (!j.groups.length) {
-    body.innerHTML = emptyArt("Журнал пуст", "Проверьте работы — оценки появятся здесь. Или добавьте список группы.") +
+    body.innerHTML = emptyArt("Журнал пуст", "Проверьте работы и запишите оценки кнопкой «Записать текущую проверку», загрузите оценки из Moodle или добавьте список группы.") +
       `<div style="text-align:center"><button class="btn primary" id="jNewGroup">Добавить группу</button></div>`;
     $("#jNewGroup").onclick = () => editRoster("");
     return;
   }
   if (!S.jGroup || !j.groups.some((g) => g.name === S.jGroup)) S.jGroup = j.groups[0].name;
   const g = j.groups.find((x) => x.name === S.jGroup);
-  const codes = j.codes;
-  body.innerHTML = `
+  const topics = orderedTopics(g);
+  const own = g.averages || [];
+  const showW = g.has_works && g.has_tests;
+  const head = (t) => {
+    const dates = [t.issued ? `выдано ${fmtDay(t.issued)}` : "", t.deadline ? `до ${fmtDay(t.deadline)}` : ""].filter(Boolean).join(" · ");
+    return `<th class="th-topic k-${t.kind} ${t.overdue ? "overdue" : ""}" data-topic="${esc(t.code)}" title="${esc([t.title || t.code, KIND_NAME[t.kind], t.subject, t.semester, t.note].filter(Boolean).join(" • "))}. Щёлкните: вид, даты, «2» несдавшим, переименовать, удалить">
+      <span class="th-code">${esc(t.code)}</span>${t.kind !== "work" ? `<span class="th-kind">${t.kind === "test" ? "тест" : esc(t.unit || "своё")}</span>` : ""}${dates ? `<span class="th-date">${esc(dates)}</span>` : ""}</th>`;
+  };
+  const cell = (s, t) => {
+    const x = s.cells[t.code];
+    const tip = x ? [x.file, x.raw != null && x.raw !== x.grade ? `в Moodle ${fmtG(x.raw)}` : "", x.comment, x.flag ? "в отзыве упоминается ИИ" : ""].filter(Boolean).join(" — ") : t.kind === "custom" ? "пусто — щёлкните, чтобы вписать" : t.due ? "нет оценки — долг" : "нет оценки";
+    if (t.kind === "custom") return `<td class="cell custom" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${x && x.grade != null ? `<span class="cv">${fmtNum(x.grade)}</span>` : `<span class="miss">·</span>`}</td>`;
+    const gr = x?.grade;
+    return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${gr != null ? `<span class="gm g${Math.min(5, Math.max(2, Math.round(gr)))} ${x.violation ? "v" : ""} ${x.flag ? "f" : ""}">${fmtG(gr)}</span>` : `<span class="miss ${t.due ? "due" : ""}">—</span>`}</td>`;
+  };
+  body.innerHTML = `${filterBar}
     <div class="group-tabs">${j.groups.map((x) => `<button data-g="${esc(x.name)}" class="${x.name === S.jGroup ? "on" : ""}">${esc(x.name || "без группы")}${x.program ? ` <span class="tab-prog">${esc(x.program)}</span>` : ""} <span class="muted small">${x.students.length}</span></button>`).join("")}
       <button data-g="__new" title="Добавить группу">${ICON.plus}</button></div>
-    <div class="section-actions">
+    <div class="section-actions j-actions">
       <button class="btn sm" id="jRoster">Список и варианты${g.roster.length ? ` (${g.roster.length})` : ""}</button>
-      <button class="btn ghost sm danger" id="jClear">${ICON.trash}Очистить оценки группы</button>
-      <span class="small muted" style="align-self:center">${codes.length ? `Работ: ${codes.length}. Щёлкните по клетке, чтобы поставить или убрать оценку вручную.` : "Оценок пока нет."}</span>
+      <button class="btn sm" id="jTopics" title="Вид тем (работа, тест, свой столбец), предмет, семестр, свои средние">Темы и средние</button>
+      <button class="btn sm" id="jNewCol" title="Столбец не для оценок: пропуски, посещения… В средний балл и долги не входит">${ICON.plus}Свой столбец</button>
+      <button class="btn sm" id="jFill" title="Поставить «2» всем, у кого нет оценки по выданным работам и тестам">«2» несдавшим</button>
+      <span class="j-sp"></span>
+      <button class="btn ghost sm danger" id="jClear">${ICON.trash}Очистить оценки</button>
+      <button class="btn ghost sm danger" id="jDelGroup">${ICON.trash}Удалить группу</button>
     </div>
     ${g.students.length ? `<div class="journal-wrap"><table class="jt">
-      <thead><tr><th class="name">Студент</th>${codes.map((c) => `<th>${esc(c)}</th>`).join("")}<th>Средний</th><th>Нарушения</th>${g.roster.length ? "<th>Долги</th>" : ""}</tr></thead>
+      <thead><tr><th class="num">№</th><th class="name">Студент</th>${topics.map(head).join("")}
+        <th class="sum">Средний</th>${showW ? `<th class="sum">По работам</th>` : ""}${g.has_tests ? `<th class="sum">По тестам</th>` : ""}${own.map((a) => `<th class="sum own" title="${esc(a.codes.join(", "))}">${esc(a.name)}</th>`).join("")}
+        <th class="sum">Нарушения</th><th class="sum">Долги</th></tr></thead>
       <tbody>${g.students.map((s, i) => `<tr style="animation:fadeIn .4s ${Math.min(i, 30) * 18}ms both">
+        <td class="num">${i + 1}</td>
         <td class="name ${s.in_roster || !g.roster.length ? "" : "notroster"}" data-stud="${esc(s.name)}" title="${s.in_roster || !g.roster.length ? "Щёлкните: история студента, переименовать, удалить" : "Нет в списке группы — щёлкните: история, переименовать, объединить или удалить"}">${esc(s.name)}${g.teams?.[s.name] ? ` <span class="j-var" title="Работает в паре">пара ${esc(g.teams[s.name])}</span>` : ""}${g.variants?.[s.name] ? ` <span class="j-var" title="Вариант по списку группы">в. ${esc(g.variants[s.name])}</span>` : ""}</td>
-        ${codes.map((c) => { const x = s.cells[c]; return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(c)}" title="${x ? esc(`${x.file}${x.comment ? " — " + x.comment : ""}`) : "нет оценки"}">${x && x.grade ? `<span class="gm g${Math.floor(x.grade)} ${x.violation ? "v" : ""}">${fmtG(x.grade)}</span>` : `<span class="miss">—</span>`}</td>`; }).join("")}
-        <td class="avg">${s.avg != null ? String(s.avg.toFixed(2)).replace(".", ",") : "—"}</td>
+        ${topics.map((t) => cell(s, t)).join("")}
+        <td class="avg">${fmtNum(s.avg)}</td>${showW ? `<td class="avg sub">${fmtNum(s.avg_works)}</td>` : ""}${g.has_tests ? `<td class="avg sub">${fmtNum(s.avg_tests)}</td>` : ""}${own.map((a) => `<td class="avg sub">${fmtNum(s.avg_own?.[a.name])}</td>`).join("")}
         <td>${s.violations ? `<span class="chip solid-bad">${s.violations}</span>` : `<span class="muted">0</span>`}</td>
-        ${g.roster.length ? `<td>${s.missing ? `<span class="chip warn">${s.missing}</span>` : `<span class="muted">0</span>`}</td>` : ""}
+        <td>${s.missing ? `<span class="chip warn">${s.missing}</span>` : `<span class="muted">0</span>`}</td>
       </tr>`).join("")}</tbody></table></div>
-      <p class="small muted">Красный кружок — работа оценена на «2» за ИИ или списывание.</p>` : emptyArt("В группе пока никого", "Добавьте список группы или проверьте её работы.")}`;
+      <p class="small muted j-legend"><span class="gm g2 v mini">2</span> «2» за ИИ или списывание · <span class="gm g4 f mini">4</span> в отзыве (например, из Moodle) упоминается ИИ · «2» без заливки — работа оценена на «2» или не сдана · <span class="miss due">—</span> долг: работа уже оценивалась у других или срок прошёл${j.opts?.tests_min2 ? " · тесты на 0–1,9 показаны как «2»" : ""}. Щёлкните по заголовку темы, чтобы задать даты, вид, удалить её или поставить «2» несдавшим.</p>`
+      : emptyArt("В группе пока никого", "Добавьте список группы, запишите проверку или загрузите оценки из Moodle.")}`;
+  const refilter = async () => {
+    S.jFilter = { semester: $("#jfSem").value, subject: $("#jfSub").value };
+    try { localStorage.setItem("jFilter", JSON.stringify(S.jFilter)); } catch (e) { /* нет хранилища */ }
+    await loadJournal(); renderJournal();
+  };
+  $("#jfSem").onchange = refilter; $("#jfSub").onchange = refilter;
+  $("#jfReset")?.addEventListener("click", () => { $("#jfSem").value = ""; $("#jfSub").value = ""; refilter(); });
   $$(".group-tabs [data-g]").forEach((b) => (b.onclick = () => { if (b.dataset.g === "__new") editRoster(""); else { S.jGroup = b.dataset.g; renderJournal(); } }));
   $("#jRoster").onclick = () => editRoster(S.jGroup);
-  $("#jClear").onclick = async () => {
-    if (!(await askConfirm(`Удалить все оценки группы «${S.jGroup}» из журнала? Списки студентов останутся.`))) return;
-    S.journal = await api("journal_clear", { group: S.jGroup });
-    renderJournal();
+  $("#jTopics").onclick = () => editTopics(S.jGroup);
+  $("#jNewCol").onclick = () => editTopic(S.jGroup, "", "custom");
+  $("#jFill").onclick = async () => {
+    const due = (g.topics || []).filter((t) => t.kind !== "custom" && t.due).map((t) => t.code);
+    if (!due.length) { toast("Нет выданных работ и тестов — нечего заполнять. Работа считается выданной, когда по ней есть оценки или прошёл срок из календаря."); return; }
+    const miss = g.students.reduce((a, s) => a + s.missing, 0);
+    if (!miss) { toast("Долгов нет — у всех есть оценки"); return; }
+    if (!(await askConfirm(`Поставить «2» за несданные работы и тесты группы «${g.name}»? Это ${miss} клеток в темах: ${due.join(", ")}. Отменить можно сразу после.`))) return;
+    const r = await loadJournal("journal_fill", { group: g.name, codes: due, grade: 2 });
+    renderJournal(); toast(`Поставлено «2»: ${r.filled}`, "ok", { label: "Отменить", run: undoLast });
   };
+  $("#jClear").onclick = async () => {
+    if (!(await askConfirm(`Удалить все оценки группы «${S.jGroup}» из журнала? Списки студентов и календарь останутся.`))) return;
+    await loadJournal("journal_clear", { group: S.jGroup });
+    renderJournal(); toast("Оценки группы удалены", "ok", { label: "Отменить", run: undoLast });
+  };
+  $("#jDelGroup").onclick = () => deleteGroup(S.jGroup);
   $$(".jt td.cell").forEach((td) => (td.onclick = () => editCell(S.jGroup, td.dataset.s, td.dataset.c)));
   $$(".jt td[data-stud]").forEach((td) => (td.onclick = () => editStudent(S.jGroup, td.dataset.stud)));
+  $$(".jt th[data-topic]").forEach((th) => (th.onclick = () => editTopic(S.jGroup, th.dataset.topic)));
+}
+
+/** Удалить группу целиком: из реестра, журнала (оценки, список, календарь). */
+async function deleteGroup(name) {
+  const n = S.journal?.groups.find((g) => g.name === name)?.students.length || 0;
+  const works = (S.state?.works || []).filter((w) => w.group === name).length;
+  if (!(await askConfirm(`Удалить группу «${name}»? Пропадут её список студентов${n ? ` (${n} чел.)` : ""}, оценки журнала, темы и календарь.${works ? ` Работы группы (${works}) на шаге «Работы студентов» останутся — их можно удалить там.` : ""} Отменить можно сразу после.`))) return;
+  try {
+    const r = await api("group_delete", { name, entries: true, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
+    S.state = r; S.journal = r.journal; S.repGroups = null;
+    if (S.jGroup === name) S.jGroup = null;
+    updateRail(); if (S.view === "journal") renderJournal();
+    SND.play("delete");
+    toast(`Группа «${name}» удалена`, "ok", { label: "Отменить", run: undoLast });
+  } catch (e) { toast(String(e), "err"); }
+}
+
+/** Тема журнала: вид, название, предмет, семестр, даты; «2» несдавшим; переименовать; удалить. */
+function editTopic(group, code, kindNew = "") {
+  const g = S.journal.groups.find((x) => x.name === group);
+  const t = (g?.topics || []).find((x) => x.code === code) || { code: "", kind: kindNew || "work", kind_set: kindNew, title: "", subject: "", semester: "", semester_set: "", issued: "", issued_set: "", deadline: "", note: "", unit: "", graded: 0 };
+  const isNew = !code;
+  const subjects = S.journal.subjects || [];
+  const missing = isNew ? 0 : g.students.filter((s) => !s.cells[code] || s.cells[code].grade == null).length;
+  openDrawer(`<h2>${isNew ? (kindNew === "custom" ? "Свой столбец" : "Новая тема") : esc(code)}</h2>
+    <p class="muted" style="margin-top:0">${esc(group)}${!isNew ? ` • оценок: ${t.graded}` : ""}</p>
+    ${kindNew === "custom" ? `<p class="small muted">Столбец не для оценок — например «Пропущено пар» или «Посещено». Числа вписываются щелчком по клетке. В средний балл и долги не входит.</p>` : ""}
+    <div class="grid2">
+      <label class="field"><span>${kindNew === "custom" ? "Название столбца" : "Шифр (заголовок столбца)"}</span><input class="input" id="tpCode" value="${esc(code)}" placeholder="${kindNew === "custom" ? "Пропущено пар" : "ПР3"}"></label>
+      <label class="field"><span>Вид</span><select class="select input" id="tpKind">
+        <option value="" ${!t.kind_set ? "selected" : ""}>по названию (сейчас: ${KIND_NAME[t.kind] || "работа"})</option>
+        <option value="work" ${t.kind_set === "work" ? "selected" : ""}>работа</option>
+        <option value="test" ${t.kind_set === "test" ? "selected" : ""}>тест — отдельный средний балл</option>
+        <option value="custom" ${t.kind_set === "custom" ? "selected" : ""}>свой столбец — не оценка</option></select></label>
+      <label class="field tp-unit" ${t.kind === "custom" || kindNew === "custom" ? "" : "hidden"}><span>Единица (необязательно)</span><input class="input" id="tpUnit" value="${esc(t.unit)}" placeholder="пар, ч, раз"></label>
+      <label class="field"><span>Полное название</span><input class="input" id="tpTitle" value="${esc(t.title)}" placeholder="Практическая работа 3. Сетевые протоколы"></label>
+      <label class="field"><span>Предмет</span><input class="input" id="tpSubj" list="tpSubjs" value="${esc(t.subject)}" placeholder="Компьютерные сети"><datalist id="tpSubjs">${subjects.map((x) => `<option value="${esc(x)}">`).join("")}</datalist></label>
+      <label class="field"><span>Выдано</span><input class="input" type="date" id="tpIssued" value="${esc(t.issued_set || "")}" placeholder="${esc(t.issued)}"></label>
+      <label class="field"><span>Срок сдачи (необязательно)</span><input class="input" type="datetime-local" id="tpDeadline" value="${esc(t.deadline || "")}"></label>
+      <label class="field"><span>Семестр</span><input class="input" id="tpSem" list="tpSems" value="${esc(t.semester_set || "")}" placeholder="${esc(t.semester || "по дате выдачи")}"><datalist id="tpSems">${(S.journal.semesters || []).map((x) => `<option value="${esc(x)}">`).join("")}</datalist></label>
+      <label class="field"><span>Заметка</span><input class="input" id="tpNote" value="${esc(t.note)}" placeholder="например: защита на паре"></label>
+    </div>
+    ${!isNew ? `<p class="small muted">${t.issued && !t.issued_set ? `Дата выдачи сейчас взята по первой оценке: ${esc(fmtDay(t.issued))}. ` : ""}Срок сдачи из календаря работает как срок Moodle: работа, сданная позже, получит ограничение по правилу «Сдано позже срока».</p>` : ""}
+    <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="tpSave">Сохранить</button>
+      ${!isNew && t.kind !== "custom" ? `<button class="btn" id="tpFill" ${missing ? "" : "disabled"}>«2» несдавшим (${missing})</button>` : ""}
+      ${!isNew ? `<button class="btn ghost danger" id="tpDel">${ICON.trash}Удалить тему</button>` : ""}</div>`);
+  $("#tpKind").onchange = () => ($(".tp-unit").hidden = $("#tpKind").value !== "custom" && !(t.kind === "custom" && !$("#tpKind").value));
+  const topic = () => ({ kind: $("#tpKind").value || (kindNew === "custom" ? "custom" : ""), title: $("#tpTitle").value.trim(), subject: $("#tpSubj").value.trim(), semester: $("#tpSem").value.trim(), issued: $("#tpIssued").value, deadline: $("#tpDeadline").value, note: $("#tpNote").value.trim(), unit: $("#tpUnit").value.trim() });
+  $("#tpSave").onclick = async () => {
+    const to = $("#tpCode").value.trim();
+    if (!to) { toast("Укажите название", "err"); return; }
+    try {
+      if (!isNew && to !== code) await api("journal_topic", { group, code, action: "rename", to });
+      await loadJournal("journal_topic", { group, code: to, action: "set", topic: topic() });
+      closeDrawer(); renderJournal(); toast(isNew ? "Добавлено" : "Сохранено");
+    } catch (e) { toast(String(e), "err"); }
+  };
+  $("#tpFill")?.addEventListener("click", async () => {
+    if (!(await askConfirm(`Поставить «2» по «${code}» всем, у кого нет оценки (${missing} чел.)?`))) return;
+    const r = await loadJournal("journal_fill", { group, codes: [code], grade: 2 });
+    closeDrawer(); renderJournal(); toast(`Поставлено «2»: ${r.filled}`, "ok", { label: "Отменить", run: undoLast });
+  });
+  $("#tpDel")?.addEventListener("click", async () => {
+    if (!(await askConfirm(`Удалить тему «${code}» в группе «${group}»${t.graded ? ` вместе с оценками (${t.graded})` : ""}? Она перестанет считаться долгом. Отменить можно сразу после.`))) return;
+    const r = await loadJournal("journal_topic", { group, code, action: "delete" });
+    closeDrawer(); renderJournal(); SND.play("delete");
+    toast(`Тема «${code}» удалена${r.removed ? `, оценок: ${r.removed}` : ""}`, "ok", { label: "Отменить", run: undoLast });
+  });
+}
+
+/** Все темы группы сразу: вид, предмет, удаление; свои средние по выбранным темам. */
+function editTopics(group) {
+  const g = S.journal.groups.find((x) => x.name === group);
+  const topics = orderedTopics(g);
+  let avgs = (g.averages || []).map((a) => ({ name: a.name, codes: [...a.codes] }));
+  openDrawer(`<h2>Темы группы ${esc(group)}</h2>
+    <p class="small muted" style="margin-top:0">Вид определяет, куда идёт оценка: «работа» — в средний по работам, «тест» — в средний по тестам, «свой столбец» — никуда (пропуски, посещения). Тесты узнаются по названию сами («Тестирование по разделу», «Итоговый тест»). Показаны темы по текущему фильтру семестра и предмета.</p>
+    <table class="tp-table"><thead><tr><th>Тема</th><th>Вид</th><th>Предмет</th><th>Выдано</th><th></th></tr></thead><tbody>
+    ${topics.map((t) => `<tr><td><b>${esc(t.code)}</b>${t.title ? `<div class="small muted">${esc(t.title)}</div>` : ""}</td>
+      <td><select class="select input sm" data-tk="${esc(t.code)}"><option value="" ${!t.kind_set ? "selected" : ""}>авто: ${KIND_NAME[t.kind]}</option><option value="work" ${t.kind_set === "work" ? "selected" : ""}>работа</option><option value="test" ${t.kind_set === "test" ? "selected" : ""}>тест</option><option value="custom" ${t.kind_set === "custom" ? "selected" : ""}>свой столбец</option></select></td>
+      <td><input class="input sm" data-ts="${esc(t.code)}" list="tpSubjs2" value="${esc(t.subject)}" placeholder="—"></td>
+      <td class="small">${esc(fmtDay(t.issued) || "—")}</td>
+      <td><button class="icon-btn" data-tedit="${esc(t.code)}" title="Даты, название, удалить">✎</button></td></tr>`).join("") || `<tr><td colspan="5" class="muted small">Тем пока нет.</td></tr>`}
+    </tbody></table><datalist id="tpSubjs2">${(S.journal.subjects || []).map((x) => `<option value="${esc(x)}">`).join("")}</datalist>
+    <div class="section-actions" style="margin-top:8px"><button class="btn sm primary" id="tpsSave">Сохранить виды и предметы</button><button class="btn sm ghost" id="tpsNew">${ICON.plus}Новая тема</button></div>
+    <h3 class="sec">Свои средние</h3>
+    <p class="small muted">Например «Средний за модуль 1» — по ПР1–ПР4. Появится отдельным столбцом журнала и в выгрузке.</p>
+    <div id="avgList"></div>
+    <div class="section-actions"><button class="btn sm" id="avgAdd">${ICON.plus}Добавить средний</button><button class="btn sm primary" id="avgSave">Сохранить средние</button></div>`);
+  const codes = topics.filter((t) => t.kind !== "custom").map((t) => t.code);
+  const drawAvg = () => {
+    $("#avgList").innerHTML = avgs.map((a, i) => `<div class="avg-def"><input class="input sm" data-an="${i}" value="${esc(a.name)}" placeholder="Название, например «Модуль 1»">
+      <div class="avg-codes">${codes.map((c) => `<label class="idea"><input type="checkbox" class="cbx" data-ac="${i}" value="${esc(c)}" ${a.codes.includes(c) ? "checked" : ""}><span>${esc(c)}</span></label>`).join("")}</div>
+      <button class="icon-btn" data-adel="${i}" title="Убрать">✕</button></div>`).join("") || `<p class="small muted">Своих средних нет.</p>`;
+    $$("[data-an]").forEach((x) => (x.oninput = () => (avgs[+x.dataset.an].name = x.value)));
+    $$("[data-ac]").forEach((x) => (x.onchange = () => { const a = avgs[+x.dataset.ac]; a.codes = x.checked ? [...new Set([...a.codes, x.value])] : a.codes.filter((c) => c !== x.value); }));
+    $$("[data-adel]").forEach((x) => (x.onclick = () => { avgs.splice(+x.dataset.adel, 1); drawAvg(); }));
+  };
+  drawAvg();
+  $("#avgAdd").onclick = () => { avgs.push({ name: `Средний ${avgs.length + 1}`, codes: [] }); drawAvg(); };
+  $("#avgSave").onclick = async () => {
+    const list = avgs.filter((a) => a.name.trim() && a.codes.length);
+    await loadJournal("journal_averages", { group, averages: list });
+    renderJournal(); toast(list.length ? "Свои средние сохранены" : "Свои средние убраны");
+  };
+  $("#tpsSave").onclick = async () => {
+    for (const t of topics) {
+      const kind = $(`[data-tk="${CSS.escape(t.code)}"]`).value, subject = $(`[data-ts="${CSS.escape(t.code)}"]`).value.trim();
+      if (kind === (t.kind_set || "") && subject === (t.subject || "")) continue;
+      await api("journal_topic", { group, code: t.code, action: "set", topic: { kind, title: t.title, subject, semester: t.semester_set, issued: t.issued_set, deadline: t.deadline, note: t.note, unit: t.unit } });
+    }
+    await loadJournal(); closeDrawer(); renderJournal(); toast("Сохранено");
+  };
+  $("#tpsNew").onclick = () => editTopic(group, "");
+  $$("[data-tedit]").forEach((b) => (b.onclick = () => editTopic(group, b.dataset.tedit)));
+}
+
+/** Календарь заданий: какой группе что выдано и до какого срока. */
+async function openCalendar(start) {
+  let items = [];
+  const load = async () => { items = (await api("journal_calendar")).items || []; };
+  await load();
+  const groups = (S.journal?.groups || []).map((g) => g.name);
+  const today = new Date();
+  let cur = start || new Date(today.getFullYear(), today.getMonth(), 1);
+  const m = document.createElement("div");
+  m.className = "modal-veil";
+  m.innerHTML = `<div class="modal cal-modal" role="dialog" aria-modal="true"><div class="modal-head"><h2>Календарь заданий</h2>
+      <div class="cal-nav"><button class="icon-btn" id="calPrev" title="Предыдущий месяц">‹</button><b id="calMonth"></b><button class="icon-btn" id="calNext" title="Следующий месяц">›</button><button class="btn sm ghost" id="calToday">Сегодня</button></div></div>
+    <div class="modal-body"><div class="cal-filter"><select class="select input sm" id="calGroup"><option value="">все группы</option>${groups.map((x) => `<option ${x === S.jGroup ? "" : ""}>${esc(x)}</option>`).join("")}</select>
+      <span class="small muted">Щёлкните по дню, чтобы выдать задание. Срок сдачи необязателен; если он есть, работы, сданные позже, получат ограничение по правилу «Сдано позже срока».</span></div>
+      <div class="cal-grid" id="calGrid"></div><div id="calList"></div></div>
+    <div class="modal-foot"><button class="btn" id="calAdd">${ICON.plus}Выдать задание</button><span style="flex:1"></span><button class="btn ghost" id="calClose">Закрыть</button></div></div>`;
+  document.body.appendChild(m);
+  requestAnimationFrame(() => m.classList.add("on"));
+  const close = async () => { m.classList.remove("on"); setTimeout(() => m.remove(), 250); if (S.view === "journal") { await loadJournal(); renderJournal(); } };
+  $("#calClose", m).onclick = close;
+  const ymd = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const draw = () => {
+    const gsel = $("#calGroup", m).value;
+    const its = items.filter((x) => !gsel || x.group === gsel);
+    $("#calMonth", m).textContent = cur.toLocaleDateString("ru-RU", { month: "long", year: "numeric" });
+    const first = new Date(cur.getFullYear(), cur.getMonth(), 1);
+    const shift = (first.getDay() + 6) % 7;
+    const days = new Date(cur.getFullYear(), cur.getMonth() + 1, 0).getDate();
+    const cells = [];
+    for (let i = 0; i < shift; i++) cells.push(`<div class="cal-d empty"></div>`);
+    for (let d = 1; d <= days; d++) {
+      const key = ymd(new Date(cur.getFullYear(), cur.getMonth(), d));
+      const iss = its.filter((x) => x.issued === key), due = its.filter((x) => (x.deadline || "").slice(0, 10) === key);
+      cells.push(`<button class="cal-d ${key === ymd(today) ? "today" : ""}" data-day="${key}"><span class="cal-n">${d}</span>
+        ${iss.map((x) => `<span class="cal-it k-${x.kind}" data-ci="${items.indexOf(x)}" title="${esc(`${x.group}: ${x.code}${x.title ? " — " + x.title : ""} (выдано)`)}">${esc(x.code)}<i>${esc(x.group)}</i></span>`).join("")}
+        ${due.map((x) => `<span class="cal-it due" data-ci="${items.indexOf(x)}" title="${esc(`${x.group}: ${x.code} — срок сдачи ${x.deadline.slice(11, 16)}`)}">⏰ ${esc(x.code)}<i>${esc(x.group)}</i></span>`).join("")}</button>`);
+    }
+    $("#calGrid", m).innerHTML = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"].map((d) => `<div class="cal-h">${d}</div>`).join("") + cells.join("");
+    const mon = ymd(first).slice(0, 7);
+    const list = its.filter((x) => (x.issued || "").startsWith(mon) || (x.deadline || "").startsWith(mon)).sort((a, b) => (a.issued || a.deadline).localeCompare(b.issued || b.deadline));
+    $("#calList", m).innerHTML = list.length ? `<h3 class="sec">В этом месяце <span class="count">${list.length}</span></h3><div class="cal-rows">${list.map((x) => `<button class="cal-row" data-ci="${items.indexOf(x)}"><b>${esc(x.code)}</b><span>${esc(x.group)}</span><span class="small muted">${esc(x.title || KIND_NAME[x.kind] || "")}${x.subject ? ` • ${esc(x.subject)}` : ""}</span><span class="small">${x.issued ? `выдано ${esc(fmtDay(x.issued))}` : ""}${x.deadline ? ` • до ${esc(fmtDay(x.deadline))} ${esc(x.deadline.slice(11, 16))}` : ""}${x.auto ? " • по первой оценке" : ""}</span></button>`).join("")}</div>` : `<p class="small muted" style="margin-top:12px">В этом месяце заданий нет.</p>`;
+    $$("[data-day]", m).forEach((b) => (b.onclick = (e) => { const it = e.target.closest("[data-ci]"); if (it) edit(items[+it.dataset.ci]); else edit(null, b.dataset.day); }));
+    $$(".cal-row", m).forEach((b) => (b.onclick = () => edit(items[+b.dataset.ci])));
+  };
+  const edit = (it, day = "") => {
+    const codes = [...new Set([...sets().map((x) => x.code), ...(S.journal?.codes || [])])];
+    const f = document.createElement("div");
+    f.className = "modal-veil";
+    f.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)"><div class="modal-head"><h2>${it ? `${esc(it.code)} — ${esc(it.group)}` : "Выдать задание"}</h2></div>
+      <div class="modal-body"><div class="grid2">
+        ${it ? "" : `<div class="field" style="grid-column:1/-1"><span>Группы</span><div class="cal-gs">${groups.map((x) => `<label class="idea"><input type="checkbox" class="cbx" value="${esc(x)}" ${x === ($("#calGroup", m).value || S.jGroup) ? "checked" : ""}><span>${esc(x)}</span></label>`).join("") || `<span class="small muted">Групп пока нет — добавьте их в журнале.</span>`}</div></div>`}
+        <label class="field"><span>Задание (шифр)</span><input class="input" id="ceCode" list="ceCodes" value="${esc(it?.code || "")}" ${it ? "readonly" : ""} placeholder="ПР3"><datalist id="ceCodes">${codes.map((c) => `<option value="${esc(c)}">`).join("")}</datalist></label>
+        <label class="field"><span>Вид</span><select class="select input" id="ceKind"><option value="">по названию</option><option value="work" ${it?.kind === "work" && !it.auto ? "selected" : ""}>работа</option><option value="test" ${it?.kind === "test" ? "selected" : ""}>тест</option></select></label>
+        <label class="field" style="grid-column:1/-1"><span>Название</span><input class="input" id="ceTitle" value="${esc(it?.title || "")}" placeholder="Практическая работа 3. Сетевые протоколы"></label>
+        <label class="field"><span>Предмет</span><input class="input" id="ceSubj" list="ceSubjs" value="${esc(it?.subject || "")}"><datalist id="ceSubjs">${(S.journal?.subjects || []).map((x) => `<option value="${esc(x)}">`).join("")}</datalist></label>
+        <label class="field"><span>Выдано</span><input class="input" type="date" id="ceIssued" value="${esc(it?.issued || day)}"></label>
+        <label class="field"><span>Срок сдачи (необязательно)</span><input class="input" type="datetime-local" id="ceDeadline" value="${esc(it?.deadline || "")}"></label>
+        <label class="field"><span>Заметка</span><input class="input" id="ceNote" value="${esc(it?.note || "")}"></label>
+      </div></div>
+      <div class="modal-foot">${it && !it.auto ? `<button class="btn ghost danger" id="ceDel">Убрать из календаря</button>` : ""}<span style="flex:1"></span><button class="btn ghost" id="ceNo">Отмена</button><button class="btn primary" id="ceOk">Сохранить</button></div></div>`;
+    document.body.appendChild(f);
+    requestAnimationFrame(() => f.classList.add("on"));
+    const done = () => { f.classList.remove("on"); setTimeout(() => f.remove(), 250); };
+    $("#ceNo", f).onclick = done;
+    $("#ceOk", f).onclick = async () => {
+      const code = $("#ceCode", f).value.trim();
+      const gs = it ? [it.group] : $$(".cal-gs input:checked", f).map((x) => x.value);
+      if (!code || !gs.length) { toast(code ? "Отметьте группу" : "Укажите задание", "err"); return; }
+      const g0 = S.journal?.groups.find((x) => x.name === gs[0]);
+      const old = (g0?.topics || []).find((t) => t.code === code) || {};
+      try {
+        await api("journal_topic", { groups: gs, code, action: "set", topic: { kind: $("#ceKind", f).value || old.kind_set || "", title: $("#ceTitle", f).value.trim(), subject: $("#ceSubj", f).value.trim(), semester: old.semester_set || "", issued: $("#ceIssued", f).value, deadline: $("#ceDeadline", f).value, note: $("#ceNote", f).value.trim(), unit: old.unit || "" } });
+        await loadJournal(); await load(); done(); draw(); toast("Сохранено");
+      } catch (e) { toast(String(e), "err"); }
+    };
+    $("#ceDel", f)?.addEventListener("click", async () => {
+      await api("journal_topic", { group: it.group, code: it.code, action: "set", topic: { kind: it.kind_set || "", title: it.title, subject: it.subject, unit: it.unit || "" } });
+      await loadJournal(); await load(); done(); draw(); toast("Даты убраны — оценки остались");
+    });
+  };
+  $("#calPrev", m).onclick = () => { cur = new Date(cur.getFullYear(), cur.getMonth() - 1, 1); draw(); };
+  $("#calNext", m).onclick = () => { cur = new Date(cur.getFullYear(), cur.getMonth() + 1, 1); draw(); };
+  $("#calToday", m).onclick = () => { cur = new Date(today.getFullYear(), today.getMonth(), 1); draw(); };
+  $("#calGroup", m).onchange = draw;
+  $("#calAdd", m).onclick = () => edit(null, ymd(today));
+  draw();
+}
+
+/** Аналитика журнала: отдельно по работам и по тестам. */
+function openJournalAnalytics() {
+  const j = S.journal;
+  if (!j?.groups.length) { toast("Журнал пуст"); return; }
+  let gname = S.jGroup || j.groups[0].name, kind = "work";
+  const m = document.createElement("div");
+  m.className = "modal-veil";
+  m.innerHTML = `<div class="modal an-modal" role="dialog" aria-modal="true"><div class="modal-head"><h2>Аналитика журнала</h2>
+      <div class="an-filters"><select class="select input sm" id="jaGroup">${j.groups.map((g) => `<option ${g.name === gname ? "selected" : ""}>${esc(g.name)}</option>`).join("")}</select>
+      <div class="seg" id="jaKind"><button data-k="work" class="on">Работы</button><button data-k="test">Тесты</button></div></div></div>
+    <div class="modal-body" id="jaBody"></div>
+    <div class="modal-foot"><span class="small muted">${j.filter?.semester || j.filter?.subject ? `Фильтр журнала: ${esc([j.filter.subject, j.filter.semester].filter(Boolean).join(", "))}` : "Все семестры и предметы"}</span><span style="flex:1"></span><button class="btn ghost" id="jaClose">Закрыть</button></div></div>`;
+  document.body.appendChild(m);
+  requestAnimationFrame(() => m.classList.add("on"));
+  $("#jaClose", m).onclick = () => { m.classList.remove("on"); setTimeout(() => m.remove(), 250); };
+  const bar = (d, total) => `<div class="an-dist">${[5, 4, 3, 2].map((k) => d[k] ? `<i class="d${k}" style="flex:${d[k]}" title="«${k}»: ${d[k]}">${d[k]}</i>` : "").join("")}${total - Object.values(d).reduce((a, b) => a + b, 0) > 0 ? `<i class="d0" style="flex:${total - Object.values(d).reduce((a, b) => a + b, 0)}" title="нет оценки">${total - Object.values(d).reduce((a, b) => a + b, 0)}</i>` : ""}</div>`;
+  const draw = () => {
+    const g = j.groups.find((x) => x.name === gname);
+    const ts = (g.topics || []).filter((t) => t.kind === kind);
+    if (!ts.length) { $("#jaBody", m).innerHTML = emptyArt(kind === "test" ? "Тестов нет" : "Работ нет", kind === "test" ? "Тесты узнаются по названию («Тестирование по разделу…») или отмечаются в «Темы и средние»." : "Запишите проверку или загрузите оценки из Moodle."); return; }
+    const n = g.students.length;
+    const rows = ts.map((t) => {
+      const vals = g.students.map((s) => s.cells[t.code]?.grade).filter((x) => x != null);
+      const d = { 5: 0, 4: 0, 3: 0, 2: 0 };
+      vals.forEach((v) => { const k = Math.min(5, Math.max(2, Math.round(v))); d[k]++; });
+      const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+      const viol = g.students.filter((s) => s.cells[t.code]?.violation).length;
+      const flags = g.students.filter((s) => s.cells[t.code]?.flag).length;
+      return { t, vals, d, avg, viol, flags };
+    });
+    const all = rows.flatMap((r) => r.vals);
+    const avgAll = all.length ? all.reduce((a, b) => a + b, 0) / all.length : null;
+    const hard = rows.filter((r) => r.avg != null).sort((a, b) => a.avg - b.avg)[0];
+    const debt = g.students.map((s) => ({ s, k: ts.filter((t) => t.due && s.cells[t.code]?.grade == null).length })).filter((x) => x.k).sort((a, b) => b.k - a.k);
+    const avgKey = kind === "test" ? "avg_tests" : (g.has_tests ? "avg_works" : "avg");
+    const best = [...g.students].filter((s) => s[avgKey] != null).sort((a, b) => b[avgKey] - a[avgKey]);
+    $("#jaBody", m).innerHTML = `<div class="hist-sum">
+        <div><b>${fmtNum(avgAll)}</b><span>средний по ${kind === "test" ? "тестам" : "работам"}</span></div>
+        <div><b>${ts.length}</b><span>${kind === "test" ? "тестов" : "работ"}</span></div>
+        <div><b>${all.length ? Math.round((all.filter((v) => v >= 2.5).length / all.length) * 100) : 0}%</b><span>оценок выше «2»</span></div>
+        <div><b class="${debt.length ? "bad" : ""}">${debt.reduce((a, x) => a + x.k, 0)}</b><span>долгов у ${debt.length} чел.</span></div>
+      </div>
+      <h3 class="sec">По ${kind === "test" ? "тестам" : "работам"}</h3>
+      <table class="hist-table an-table"><thead><tr><th>${kind === "test" ? "Тест" : "Работа"}</th><th>Средний</th><th style="width:40%">Оценки: 5 · 4 · 3 · 2 · нет</th><th>Сдали</th>${kind === "work" ? "<th>ИИ / списывание</th>" : ""}</tr></thead><tbody>
+      ${rows.map((r) => `<tr><td><b>${esc(r.t.code)}</b>${r.t.title ? `<div class="small muted">${esc(r.t.title)}</div>` : ""}</td><td><b>${fmtNum(r.avg)}</b></td><td>${bar(r.d, n)}</td><td class="nowrap">${r.vals.length} из ${n}</td>${kind === "work" ? `<td>${r.viol || r.flags ? `${r.viol ? `<span class="chip solid-bad">${r.viol}</span>` : ""}${r.flags ? ` <span class="chip" title="в отзыве упоминается ИИ">отзыв: ${r.flags}</span>` : ""}` : `<span class="muted">0</span>`}</td>` : ""}</tr>`).join("")}
+      </tbody></table>
+      ${hard ? `<p class="small">Сложнее всего далась <b>${esc(hard.t.code)}</b>: средний ${fmtNum(hard.avg)}.</p>` : ""}
+      <div class="an-cols"><div><h3 class="sec">Лучше всех</h3>${best.slice(0, 5).map((s) => `<div class="an-li"><span>${esc(s.name)}</span><b>${fmtNum(s[avgKey])}</b></div>`).join("") || `<p class="small muted">—</p>`}</div>
+        <div><h3 class="sec">Больше всего долгов</h3>${debt.slice(0, 5).map((x) => `<div class="an-li"><span>${esc(x.s.name)}</span><b class="bad">${x.k}</b></div>`).join("") || `<p class="small muted">Долгов нет</p>`}</div></div>`;
+  };
+  $("#jaGroup", m).onchange = (e) => { gname = e.target.value; draw(); };
+  $$("#jaKind button", m).forEach((b) => (b.onclick = () => { kind = b.dataset.k; $$("#jaKind button", m).forEach((x) => x.classList.toggle("on", x === b)); draw(); }));
+  draw();
+}
+
+/** Варианты для n студентов (или пар) по порядку списка: cycle — с from по to и снова,
+ *  order — from, from+1… без повторов, random — случайно, но поровну, clear — пусто. */
+function dealVariants(n, mode, from, to) {
+  from = Math.max(1, Math.round(from)); to = Math.max(from, Math.round(to));
+  const span = to - from + 1;
+  if (mode === "clear") return Array(n).fill("");
+  if (mode === "order") return Array.from({ length: n }, (_, i) => String(from + i));
+  if (mode === "random") {
+    const pool = [];
+    while (pool.length < n) { const part = Array.from({ length: span }, (_, k) => from + k); for (let k = part.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [part[k], part[j]] = [part[j], part[k]]; } pool.push(...part); }
+    return pool.slice(0, n).map(String);
+  }
+  return Array.from({ length: n }, (_, i) => String(from + (i % span)));
 }
 
 function editRoster(group) {
@@ -3731,12 +4146,13 @@ function editRoster(group) {
     <div class="rg-tools">
       <span class="rg-tools-t">Раздать варианты</span>
       <select class="input sm" id="rgMode">
-        <option value="order">по порядку: 1, 2, 3…</option>
-        <option value="cycle">по кругу: 1…N, потом снова 1</option>
-        <option value="random">случайно из 1…N</option>
+        <option value="cycle">по кругу: с… по…, потом снова с первого</option>
+        <option value="order">по порядку без повторов: с…, +1, +1…</option>
+        <option value="random">случайно, поровну из с… по…</option>
         <option value="clear">убрать все варианты</option>
       </select>
-      <label class="rg-n" title="Сколько вариантов в задании">N <input class="input sm" id="rgN" type="number" min="1" max="999" value="${nVar}"></label>
+      <label class="rg-n" title="С какого варианта начать — его получит первый в списке">с <input class="input sm" id="rgFrom" type="number" min="1" max="999" value="1"></label>
+      <label class="rg-n" title="Последний вариант (сколько вариантов в задании)">по <input class="input sm" id="rgN" type="number" min="1" max="999" value="${nVar}"></label>
       <button class="btn sm" id="rgDeal">Раздать</button>
       <label class="rg-chk" title="Напарники получают один вариант на двоих"><input type="checkbox" id="rgPairVar" checked> одинаковый у пары</label>
     </div>
@@ -3761,7 +4177,7 @@ function editRoster(group) {
   body.onclick = (e) => { const b = e.target.closest("[data-del]"); if (b) { rows.splice(+b.dataset.del, 1); render(); } };
   $("#rgAdd").onclick = () => { rows.push({ name: "", variant: "", team: "" }); render(); body.querySelector(`[data-i="${rows.length - 1}"][data-f="name"]`)?.focus(); };
   $("#rgDeal").onclick = () => {
-    const mode = $("#rgMode").value, n = Math.max(1, +$("#rgN").value || 1);
+    const mode = $("#rgMode").value;
     // единицы раздачи: пара (одинаковый номер в «Пара») или отдельный студент
     const units = [];
     rows.forEach((r) => {
@@ -3769,16 +4185,8 @@ function editRoster(group) {
       const u = t ? units.find((x) => x.team === t) : null;
       if (u) u.rows.push(r); else units.push({ team: t || null, rows: [r] });
     });
-    const set = (u, v) => u.rows.forEach((r) => (r.variant = v));
-    if (mode === "clear") units.forEach((u) => set(u, ""));
-    else if (mode === "order") units.forEach((u, i) => set(u, String(i + 1)));
-    else if (mode === "cycle") units.forEach((u, i) => set(u, String((i % n) + 1)));
-    else {
-      // случайно, но равномерно: каждый вариант достаётся примерно одинаковому числу студентов (пар)
-      const pool = [];
-      while (pool.length < units.length) { const part = Array.from({ length: n }, (_, k) => k + 1); for (let k = part.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [part[k], part[j]] = [part[j], part[k]]; } pool.push(...part); }
-      units.forEach((u, i) => set(u, String(pool[i])));
-    }
+    const vals = dealVariants(units.length, mode, +$("#rgFrom").value || 1, +$("#rgN").value || 1);
+    units.forEach((u, i) => u.rows.forEach((r) => (r.variant = vals[i])));
     render();
     toast(mode === "clear" ? "Варианты убраны" : "Варианты розданы — не забудьте сохранить");
   };
@@ -3849,7 +4257,7 @@ function editRoster(group) {
     const cnt = {};
     Object.values(teams).forEach((t) => (cnt[t] = (cnt[t] || 0) + 1));
     Object.keys(teams).forEach((k) => { if (cnt[teams[k]] < 2) delete teams[k]; });
-    S.journal = await api("journal_roster", { group: name, names: clean.map((r) => r.name), variants, teams, variant_is_number: $("#rgNum").checked });
+    await loadJournal("journal_roster", { group: name, names: clean.map((r) => r.name), variants, teams, variant_is_number: $("#rgNum").checked });
     S.jGroup = name;
     document.removeEventListener("paste", onPaste);
     closeDrawer();
@@ -3902,41 +4310,84 @@ function editStudent(group, student) {
   $("#esSave").onclick = async () => {
     const to = $("#esTo").value.trim();
     if (!to || to === student) { closeDrawer(); return; }
-    try { S.journal = await api("journal_student", { group, student, action: "rename", to }); closeDrawer(); renderJournal(); toast(g.roster.includes(to) ? `Оценки перенесены к «${to}»` : "Студент переименован"); } catch (e) { toast(String(e), "err"); }
+    try { await loadJournal("journal_student", { group, student, action: "rename", to }); closeDrawer(); renderJournal(); toast(g.roster.includes(to) ? `Оценки перенесены к «${to}»` : "Студент переименован"); } catch (e) { toast(String(e), "err"); }
   };
   $("#esDel").onclick = async () => {
     if (!(await askConfirm(`Удалить «${student}» из группы «${group}»? Он пропадёт из списка группы, а его оценки (${n}) — из журнала. Работы и ведомость не меняются.`))) return;
-    try { S.journal = await api("journal_student", { group, student, action: "delete" }); closeDrawer(); renderJournal(); SND.play("delete"); toast("Студент удалён"); } catch (e) { toast(String(e), "err"); }
+    try { await loadJournal("journal_student", { group, student, action: "delete" }); closeDrawer(); renderJournal(); SND.play("delete"); toast("Студент удалён"); } catch (e) { toast(String(e), "err"); }
   };
 }
 
 function editCell(group, student, code) {
   const g = S.journal.groups.find((x) => x.name === group);
-  const s = g?.students.find((x) => x.name === student);
-  const x = s?.cells[code];
-  openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)} • ${esc(group)}</p>
-    ${x ? `<p class="small">Сейчас: «${fmtG(x.grade)}»${x.violation ? ` (${x.violation === "ai" ? "ИИ" : "списывание"})` : ""}, файл: ${esc(x.file)}, ${new Date(x.date * 1000).toLocaleDateString("ru-RU")}</p>` : `<p class="small muted">Оценки нет.</p>`}
+  const s0 = g?.students.find((x) => x.name === student);
+  const t = (g?.topics || []).find((x) => x.code === code) || { kind: "work" };
+  const x = s0?.cells[code];
+  if (t.kind === "custom") {
+    openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)} • ${esc(group)}</p>
+      <label class="field"><span>Значение${t.unit ? `, ${esc(t.unit)}` : ""}</span><input class="input" type="number" step="any" id="jcNum" value="${x?.grade ?? ""}" placeholder="например, 4"></label>
+      <label class="field" style="margin-top:12px"><span>Комментарий</span><input class="input" id="jcCom" value="${esc(x?.comment || "")}"></label>
+      <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="jcSave">Сохранить</button>${x ? `<button class="btn ghost danger" id="jcDel">Очистить</button>` : ""}</div>`);
+    $("#jcNum").focus();
+    $("#jcSave").onclick = async () => {
+      const v = $("#jcNum").value.trim();
+      await loadJournal("journal_set", { group, student, code, grade: v === "" ? null : +v.replace(",", "."), comment: $("#jcCom").value });
+      closeDrawer(); renderJournal();
+    };
+    $("#jcNum").onkeydown = (e) => { if (e.key === "Enter") $("#jcSave").click(); };
+    $("#jcDel")?.addEventListener("click", async () => { await loadJournal("journal_set", { group, student, code, grade: null }); closeDrawer(); renderJournal(); });
+    return;
+  }
+  openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)}${t.title ? ` — ${esc(t.title)}` : ""} • ${esc(group)}</p>
+    ${x ? `<p class="small">Сейчас: «${fmtG(x.grade)}»${x.raw != null && x.raw !== x.grade ? ` (в Moodle ${fmtG(x.raw)})` : ""}${x.violation ? ` (${x.violation === "ai" ? "ИИ" : "списывание"})` : ""}, ${esc(x.file)}, ${new Date(x.date * 1000).toLocaleDateString("ru-RU")}</p>` : `<p class="small muted">Оценки нет.</p>`}
+    ${x?.flag ? `<div class="ev"><span class="w medium"></span><div>В отзыве упоминается ИИ или нейросеть. Проверьте, нужно ли считать это нарушением.</div></div>` : ""}
     <div class="override" id="jc">${gradeScale().map((gr) => `<button class="g${Math.floor(gr)} ${x?.grade === gr ? "on" : ""}" data-g="${gr}">${fmtG(gr)}</button>`).join("")}</div>
-    <label class="field" style="margin-top:12px"><span>Комментарий</span><input class="input" id="jcCom" value="${esc(x?.comment || "")}" placeholder="например: защитил устно"></label>
+    <label class="field" style="margin-top:12px"><span>Комментарий / отзыв</span><textarea class="input" id="jcCom" rows="3" placeholder="например: защитил устно">${esc(x?.comment || "")}</textarea></label>
     <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="jcSave">Сохранить</button>${x ? `<button class="btn ghost danger" id="jcDel">Убрать оценку</button>` : ""}</div>`);
   let sel = x?.grade ?? null;
   $$("#jc [data-g]").forEach((b) => (b.onclick = () => { sel = +b.dataset.g; $$("#jc button").forEach((y) => y.classList.toggle("on", +y.dataset.g === sel)); }));
   $("#jcSave").onclick = async () => {
     if (!sel) { toast("Выберите оценку", "err"); return; }
-    S.journal = await api("journal_set", { group, student, code, grade: sel, comment: $("#jcCom").value });
+    await loadJournal("journal_set", { group, student, code, grade: sel, comment: $("#jcCom").value });
     closeDrawer(); renderJournal();
   };
-  $("#jcDel")?.addEventListener("click", async () => { S.journal = await api("journal_set", { group, student, code, grade: null }); closeDrawer(); renderJournal(); });
+  $("#jcDel")?.addEventListener("click", async () => { await loadJournal("journal_set", { group, student, code, grade: null }); closeDrawer(); renderJournal(); });
 }
 
+const JEXP_COLS = [
+  ["num", "№ по порядку"], ["avg", "Средний"], ["avg_works", "Средний по работам"], ["avg_tests", "Средний по тестам"],
+  ["avg_own", "Свои средние"], ["custom", "Свои столбцы (пропуски, посещения)"], ["violations", "Нарушения"], ["missing", "Долги"],
+];
 async function exportJournal(fmt) {
-  const name = `Журнал_${(S.jGroup || "группы").replace(/[\\/:*?"<>|]/g, "")}_${new Date().toLocaleDateString("ru-RU").replace(/\./g, "-")}.${fmt}`;
-  const path = await pickSave(name, fmt);
-  if (!path) return;
-  try {
-    await api("journal_export", { path, format: fmt, group: S.jGroup || null });
-    toast("Журнал сохранён", "ok", { label: "Открыть", run: () => api("open_path", { path }) });
-  } catch (e) { toast(String(e), "err"); }
+  let cols = {};
+  try { cols = JSON.parse(localStorage.getItem("jexpCols") || "{}"); } catch (e) { /* нет хранилища */ }
+  const groups = S.journal?.groups || [];
+  const m = document.createElement("div");
+  m.className = "modal-veil";
+  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(520px,100%)"><div class="modal-head"><h2>Журнал в ${fmt === "docx" ? "Word" : "Excel"}</h2></div>
+    <div class="modal-body" style="display:grid;gap:10px">
+      <label class="field"><span>Группа</span><select class="select input" id="jeGroup">${groups.map((g) => `<option ${g.name === S.jGroup ? "selected" : ""}>${esc(g.name)}</option>`).join("")}<option value="">все группы в одной таблице</option></select></label>
+      <div class="field"><span>Столбцы</span><div class="snd-ev">${JEXP_COLS.map(([k, t]) => `<label class="idea"><input type="checkbox" class="cbx" data-jc="${k}" ${cols[k] === false ? "" : "checked"}><span>${t}</span></label>`).join("")}</div></div>
+      <p class="small muted" style="margin:0">Темы — по фильтру журнала${S.jFilter.semester || S.jFilter.subject ? ` (${esc([S.jFilter.subject, S.jFilter.semester].filter(Boolean).join(", "))})` : " (все семестры и предметы)"}. Цветом выделяются только оценки, дробные — по ближайшей целой.</p>
+    </div>
+    <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" id="jeNo">Отмена</button><button class="btn primary" id="jeOk">${ICON.down}Сохранить…</button></div></div>`;
+  document.body.appendChild(m);
+  requestAnimationFrame(() => m.classList.add("on"));
+  const close = () => { m.classList.remove("on"); setTimeout(() => m.remove(), 250); };
+  $("#jeNo", m).onclick = close;
+  $("#jeOk", m).onclick = async () => {
+    cols = Object.fromEntries($$("[data-jc]", m).map((c) => [c.dataset.jc, c.checked]));
+    try { localStorage.setItem("jexpCols", JSON.stringify(cols)); } catch (e) { /* нет хранилища */ }
+    const grp = $("#jeGroup", m).value;
+    const name = `Журнал_${(grp || "все_группы").replace(/[\\/:*?"<>|]/g, "")}_${new Date().toLocaleDateString("ru-RU").replace(/\./g, "-")}.${fmt}`;
+    const path = await pickSave(name, fmt);
+    if (!path) return;
+    try {
+      await api("journal_export", { path, format: fmt, group: grp || null, cols, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
+      close();
+      toast("Журнал сохранён", "ok", { label: "Открыть", run: () => api("open_path", { path }) });
+    } catch (e) { toast(String(e), "err"); }
+  };
 }
 
 // ---------------------------------------------------------------- оформление: темы и шрифты

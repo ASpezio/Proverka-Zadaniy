@@ -239,6 +239,22 @@ pub fn write_csv(rows: &[Vec<String>], sep: char) -> String {
     s
 }
 
+/// CSV-текст (из `write_csv`) → байты в нужной кодировке:
+/// `utf8bom` — UTF-8 с BOM (по умолчанию: Moodle его понимает, Excel открывает без «каракулей»),
+/// `utf8` — UTF-8 без BOM, `cp1251` — Windows-1251.
+pub fn encode_csv(text: &str, enc: &str) -> Vec<u8> {
+    let body = text.trim_start_matches('\u{feff}');
+    match enc {
+        "utf8" => body.as_bytes().to_vec(),
+        "cp1251" => super::text::encode_cp1251(body),
+        _ => {
+            let mut b = vec![0xEF, 0xBB, 0xBF];
+            b.extend_from_slice(body.as_bytes());
+            b
+        }
+    }
+}
+
 /// Ключ имени для сравнения: «Лесовиков  Иван Ё.» → «иван лесовиков е» (слова по алфавиту).
 pub fn name_key(s: &str) -> String {
     let mut w: Vec<String> = s
@@ -331,13 +347,95 @@ pub fn to_five(v: f64, max: f64) -> f64 {
     g.clamp(0.0, 5.0)
 }
 
+/// Столбец журнала оценок Moodle: «Тест: Тестирование по разделу 1 (Проценты)» →
+/// (код, полное название, вид work|test, тип: value|percent|letter|feedback).
+pub fn column_info(h: &str) -> Option<(String, String, &'static str, &'static str)> {
+    let low = h.to_lowercase();
+    let kinds: [(&str, &str); 12] = [
+        ("задание:", "work"),
+        ("assignment:", "work"),
+        ("тест:", "test"),
+        ("quiz:", "test"),
+        ("лекция:", "work"),
+        ("lesson:", "work"),
+        ("семинар:", "work"),
+        ("workshop:", "work"),
+        ("форум:", "work"),
+        ("forum:", "work"),
+        ("элемент курса:", "work"),
+        ("ручная оценка:", "work"),
+    ];
+    let (p, k, kind) = kinds.iter().find_map(|(k, kind)| low.find(k).map(|p| (p, k.len(), *kind)))?;
+    let item = h[p + k..].trim().to_string();
+    // тип значения — в последних скобках
+    let (name, typ) = match item.rfind(" (") {
+        Some(i) if item.ends_with(')') => {
+            let t = item[i + 2..item.len() - 1].to_lowercase();
+            let typ = if t.starts_with("процент") || t.starts_with("percent") {
+                "percent"
+            } else if t.starts_with("букв") || t.starts_with("letter") {
+                "letter"
+            } else if t.starts_with("отзыв") || t.starts_with("feedback") || t.starts_with("комментар") {
+                "feedback"
+            } else if t.starts_with("значен") || t.starts_with("real") || t.starts_with("value") || t.starts_with("балл") {
+                "value"
+            } else {
+                ""
+            };
+            if typ.is_empty() {
+                (item.clone(), "value")
+            } else {
+                (item[..i].trim().to_string(), typ)
+            }
+        }
+        _ => (item.clone(), "value"),
+    };
+    let code = super::text::find_work_code(&name).unwrap_or_else(|| name.clone());
+    let kind = if kind == "work" && super::journal::auto_kind(&name, "") == "test" { "test" } else { kind };
+    Some((code, name, kind, typ))
+}
+
 /// Код работы из заголовка столбца журнала оценок Moodle:
 /// «Задание: Практическая работа 2 (Значение)» → «ПР2».
 pub fn column_code(h: &str) -> Option<String> {
-    let low = h.to_lowercase();
-    let item = ["задание:", "assignment:", "тест:", "quiz:"].iter().find_map(|k| low.find(k).map(|p| h[p + k.len()..].to_string()))?;
-    let item = item.split(" (").next().unwrap_or(&item).trim().to_string();
-    Some(super::text::find_work_code(&item).unwrap_or(item))
+    column_info(h).map(|x| x.0)
+}
+
+/// Буква Moodle → пятибалльная оценка: A/B/C/D/E/F (с плюсами и минусами) или слова.
+pub fn letter_to_five(s: &str) -> Option<f64> {
+    let t = s.trim().to_lowercase();
+    if t.is_empty() || t == "-" {
+        return None;
+    }
+    if let Some(v) = grade_value(&t).filter(|v| (2.0..=5.0).contains(v) && t.chars().all(|c| c.is_ascii_digit() || c == ',' || c == '.')) {
+        return Some(v);
+    }
+    let words: [(&str, f64); 8] = [("неуд", 2.0), ("не зач", 2.0), ("отлич", 5.0), ("хорош", 4.0), ("удовл", 3.0), ("зачт", 5.0), ("плох", 2.0), ("excellent", 5.0)];
+    if let Some((_, v)) = words.iter().find(|(w, _)| t.starts_with(w)) {
+        return Some(*v);
+    }
+    match t.chars().next()? {
+        'a' | 'а' => Some(5.0),
+        'b' | 'в' => Some(4.0),
+        'c' | 'с' => Some(3.0),
+        'd' | 'e' => Some(3.0),
+        'f' => Some(2.0),
+        _ => None,
+    }
+}
+
+/// Шкала столбца «Значение» по самому большому числу: до 5 — пятибалльная, до 10, до 20 или 100.
+pub fn guess_scale(vals: &[f64]) -> f64 {
+    let max = vals.iter().cloned().fold(0.0, f64::max);
+    if max <= 5.5 {
+        5.0
+    } else if max <= 10.0 {
+        10.0
+    } else if max <= 20.0 {
+        20.0
+    } else {
+        100.0
+    }
 }
 
 /// Отзыв из Moodle хранится в HTML: «<p>Хорошо</p>» → «Хорошо».
@@ -367,11 +465,21 @@ pub struct Imported {
     pub code: String,
     pub grade: f64,
     pub comment: String,
+    /// work | test
+    pub kind: String,
+    /// полное название элемента курса
+    pub title: String,
 }
 
 /// Разбор таблицы Moodle: «таблица оценок» задания (одна работа, нужен `code`)
 /// или экспорт журнала оценок курса (столбцы «Задание: …»).
 pub fn import_grades(rows: &[Vec<String>], code: &str) -> Result<Vec<Imported>, String> {
+    import_grades_as(rows, code, "auto")
+}
+
+/// `prefer`: какой столбец брать, если Moodle выгрузил оценку в нескольких видах —
+/// auto (проценты → значение → буква), value, percent, letter.
+pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Result<Vec<Imported>, String> {
     let head = rows.first().ok_or("Файл пустой")?;
     let c_email = col(head, &["адрес электронной почты", "email address", "электронная почта", "email"]);
     let c_full = col(head, &["полное имя", "full name", "фамилия и имя"]);
@@ -406,31 +514,72 @@ pub fn import_grades(rows: &[Vec<String>], code: &str) -> Result<Vec<Imported>, 
                     email: c_email.and_then(|i| r.get(i)).cloned().unwrap_or_default(),
                     code: code.trim().to_string(),
                     grade: to_five(v, max),
-                    comment: c_fb.and_then(|i| r.get(i)).map(|x| strip_tags(x).chars().take(300).collect()).unwrap_or_default(),
+                    comment: c_fb.and_then(|i| r.get(i)).map(|x| strip_tags(x).chars().take(600).collect()).unwrap_or_default(),
+                    kind: super::journal::auto_kind(code, "").to_string(),
+                    title: String::new(),
                 });
             }
             return Ok(out);
         }
     }
-    // журнал оценок курса: по столбцу на каждое задание
-    let cols: Vec<(usize, String)> = head.iter().enumerate().filter_map(|(i, h)| column_code(h).map(|c| (i, c))).collect();
-    if cols.is_empty() {
+    // журнал оценок курса: по столбцу на каждый элемент и вид оценки
+    let infos: Vec<(usize, (String, String, &str, &str))> = head.iter().enumerate().filter_map(|(i, h)| column_info(h).map(|c| (i, c))).collect();
+    if infos.is_empty() {
         return Err("Не понял формат файла. Подойдут: «таблица оценок» задания (Просмотр всех ответов → Действия с оценками → Скачать таблицу оценок) или экспорт журнала оценок курса (Оценки → Экспорт → CSV или Excel)".into());
     }
     if c_full.is_none() && c_last.is_none() && c_first.is_none() {
         return Err("В файле нет столбцов с именем и фамилией".into());
     }
-    // шкала: если где-то больше 5 — считаем стобалльной
-    for (i, c) in &cols {
-        let vals: Vec<f64> = rows.iter().skip(1).filter_map(|r| r.get(*i).and_then(|x| grade_value(x))).collect();
-        let max = if vals.iter().any(|v| *v > 5.5) { 100.0 } else { 5.0 };
+    // коды по порядку появления
+    let mut codes: Vec<String> = Vec::new();
+    for (_, (c, ..)) in &infos {
+        if !codes.contains(c) {
+            codes.push(c.clone());
+        }
+    }
+    let order: Vec<&str> = match prefer {
+        "value" => vec!["value", "percent", "letter"],
+        "percent" => vec!["percent", "value", "letter"],
+        "letter" => vec!["letter", "percent", "value"],
+        _ => vec!["percent", "value", "letter"],
+    };
+    for c in &codes {
+        let cols: Vec<&(usize, (String, String, &str, &str))> = infos.iter().filter(|(_, x)| &x.0 == c).collect();
+        let (title, kind) = cols.first().map(|(_, x)| (x.1.clone(), x.2)).unwrap_or_default();
+        let fb = cols.iter().find(|(_, x)| x.3 == "feedback").map(|(i, _)| *i);
+        let mut by_type: Vec<(usize, &str)> = Vec::new();
+        for t in &order {
+            if let Some((i, _)) = cols.iter().find(|(_, x)| x.3 == *t) {
+                by_type.push((*i, t));
+            }
+        }
+        // шкала столбца «Значение»
+        let scale = |i: usize| guess_scale(&rows.iter().skip(1).filter_map(|r| r.get(i).and_then(|x| grade_value(x))).collect::<Vec<_>>());
+        let scales: Vec<f64> = by_type.iter().map(|(i, t)| if *t == "value" { scale(*i) } else { 100.0 }).collect();
         for r in rows.iter().skip(1) {
-            let Some(v) = r.get(*i).and_then(|x| grade_value(x)) else { continue };
             let name = name_of(r);
             if name.is_empty() {
                 continue;
             }
-            out.push(Imported { student: name, email: c_email.and_then(|k| r.get(k)).cloned().unwrap_or_default(), code: c.clone(), grade: to_five(v, max), comment: String::new() });
+            // первая из колонок в порядке предпочтения, где есть оценка
+            let g = by_type.iter().zip(&scales).find_map(|((i, t), sc)| {
+                let cell = r.get(*i)?;
+                match *t {
+                    "letter" => letter_to_five(cell),
+                    "percent" => grade_value(cell).map(|v| to_five(v, 100.0)),
+                    _ => grade_value(cell).map(|v| to_five(v, *sc)),
+                }
+            });
+            let Some(g) = g else { continue };
+            out.push(Imported {
+                student: name,
+                email: c_email.and_then(|k| r.get(k)).cloned().unwrap_or_default(),
+                code: c.clone(),
+                grade: g,
+                comment: fb.and_then(|k| r.get(k)).map(|x| strip_tags(x).chars().take(600).collect()).unwrap_or_default(),
+                kind: kind.to_string(),
+                title: title.clone(),
+            });
         }
     }
     Ok(out)
@@ -438,7 +587,19 @@ pub fn import_grades(rows: &[Vec<String>], code: &str) -> Result<Vec<Imported>, 
 
 /// CSV для «Оценки → Импорт → Файл CSV» в Moodle: почта, ФИО и по столбцу на работу.
 pub fn export_gradebook(students: &[(String, String)], codes: &[String], grade: &dyn Fn(&str, &str) -> Option<f64>) -> String {
-    let mut rows: Vec<Vec<String>> = vec![std::iter::once("Адрес электронной почты".to_string()).chain(std::iter::once("Полное имя".to_string())).chain(codes.iter().cloned()).collect()];
+    export_gradebook_full(students, codes, grade, None, ';')
+}
+
+/// То же, с отзывами (столбец «<работа> (отзыв)» сразу после оценки) и выбором разделителя.
+pub fn export_gradebook_full(students: &[(String, String)], codes: &[String], grade: &dyn Fn(&str, &str) -> Option<f64>, feedback: Option<&dyn Fn(&str, &str) -> String>, sep: char) -> String {
+    let mut head = vec!["Адрес электронной почты".to_string(), "Полное имя".to_string()];
+    for c in codes {
+        head.push(c.clone());
+        if feedback.is_some() {
+            head.push(format!("{} (отзыв)", c));
+        }
+    }
+    let mut rows: Vec<Vec<String>> = vec![head];
     for (name, email) in students {
         let mut r = vec![email.clone(), name.clone()];
         let mut any = false;
@@ -450,12 +611,15 @@ pub fn export_gradebook(students: &[(String, String)], codes: &[String], grade: 
                 }
                 None => r.push(String::new()),
             }
+            if let Some(f) = feedback {
+                r.push(f(name, c));
+            }
         }
         if any {
             rows.push(r);
         }
     }
-    write_csv(&rows, ';').trim_start_matches('\u{feff}').to_string()
+    write_csv(&rows, sep).trim_start_matches('\u{feff}').to_string()
 }
 
 #[cfg(test)]
@@ -501,6 +665,20 @@ mod tests {
         let codes: Vec<&str> = g.iter().map(|x| x.code.as_str()).collect();
         assert_eq!(codes, vec!["ПР1", "ПР1", "ПР2"]);
         assert_eq!(g[0].student, "Громобоева Анна");
+        // проценты, буквы, отзывы, тесты
+        let csv = "Фамилия;Имя;Адрес электронной почты;Задание: ПР1 Сети (Значение);Задание: ПР1 Сети (Проценты);Задание: ПР1 Сети (Буква);Задание: ПР1 Сети (Отзыв);Тест: Тестирование по разделу 1 (Значение)\nГромобоева;Анна;anna@example.ru;8,00;80,00 %;B-;<p>Похоже на ответ нейросети</p>;7,00\nВетерков;Пётр;petr@example.ru;10,00;100,00 %;A;;3,00";
+        let g = import_grades_as(&parse_csv(csv).0, "", "auto").unwrap();
+        let pr = g.iter().find(|x| x.code == "ПР1" && x.student == "Громобоева Анна").unwrap();
+        assert!((pr.grade - 4.0).abs() < 1e-9, "{}", pr.grade);
+        assert_eq!(pr.comment, "Похоже на ответ нейросети");
+        let t = g.iter().find(|x| x.kind == "test" && x.student == "Ветерков Пётр").unwrap();
+        assert_eq!(t.code, "Тестирование по разделу 1");
+        assert!((t.grade - 1.5).abs() < 1e-9, "{}", t.grade);
+        let l = import_grades_as(&parse_csv(csv).0, "", "letter").unwrap();
+        assert_eq!(l.iter().find(|x| x.code == "ПР1" && x.student == "Ветерков Пётр").unwrap().grade, 5.0);
+        assert_eq!(letter_to_five("неудовлетворительно"), Some(2.0));
+        assert_eq!(encode_csv("Оценка;5\r\n", "cp1251"), vec![0xCE, 0xF6, 0xE5, 0xED, 0xEA, 0xE0, b';', b'5', b'\r', b'\n']);
+        assert!(encode_csv("x", "utf8bom").starts_with(&[0xEF, 0xBB, 0xBF]));
         let out = export_gradebook(&[("Громобоева Анна".into(), "anna@example.ru".into())], &["ПР1".into()], &|_, _| Some(4.5));
         assert!(out.starts_with("Адрес электронной почты;Полное имя;ПР1") && out.contains("anna@example.ru;Громобоева Анна;4.5"));
     }

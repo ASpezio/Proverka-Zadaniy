@@ -67,7 +67,7 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         let settings_lock = method == "set_settings" && {
             // во время проверки можно менять только то, что не влияет на неё: оформление, звук, трей
             let s = p.get("settings");
-            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "privacy_note"))
+            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects"))
         };
         if LOCKED_WHILE_RUNNING.contains(&method) || settings_lock {
             return Err(LOCK_MESSAGE.into());
@@ -82,6 +82,8 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         "journal_clear" => Some("очистка оценок группы"),
         "journal_student" => Some(if p.get("action").str_or("") == "delete" { "удаление студента" } else { "переименование студента" }),
         "journal_roster" if p.get("names").as_arr().is_empty() => Some("удаление списка группы"),
+        "journal_topic" if p.get("action").str_or("") == "delete" => Some("удаление темы"),
+        "journal_fill" => Some("«2» несдавшим"),
         _ => None,
     };
     if let Some(what) = undoable {
@@ -334,16 +336,14 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
         }
 
         "group_delete" => {
+            // с entries=true — вместе с оценками журнала, темами и календарём
             let name = p.get("name").str_or("");
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
-                j.groups.retain(|g| g.name != name);
-                j.rosters.remove(&name);
-                j.assigned.remove(&name);
-                j.teams.remove(&name);
+                j.delete_group(&name, p.get("entries").bool_or(false));
                 j.save();
             }
-            Ok(core.state_json())
+            Ok(core.state_json().with("journal", journal_view(core, &p)))
         }
 
         "programs_save" => {
@@ -743,7 +743,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 core.refinalize(id)?;
             }
             core.save_session();
-            if core.settings().get("journal_auto").bool_or(true) {
+            if core.settings().get("journal_auto").bool_or(false) {
                 core.journal_add_current();
             }
             Ok(core.state_json())
@@ -1156,14 +1156,18 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             }
             let bytes = std::fs::read(&path).map_err(|e| format!("не удалось открыть файл: {}", e))?;
             let rows = super::moodle::table_rows(&path, &bytes);
-            let list = super::moodle::import_grades(&rows, &p.get("code").str_or(""))?;
+            let list = super::moodle::import_grades_as(&rows, &p.get("code").str_or(""), &p.get("prefer").str_or("auto"))?;
             let replace = p.get("replace").bool_or(false);
             let add_roster = p.get("roster").bool_or(true);
             let half = core.settings().get("half_grades").bool_or(true);
-            let (mut added, mut updated, mut skipped, mut new_students) = (0, 0, 0, 0);
+            let (mut added, mut updated, mut skipped, mut new_students, mut flagged) = (0, 0, 0, 0, 0);
             let mut codes: Vec<String> = Vec::new();
+            let mut tests: Vec<String> = Vec::new();
+            let subject = p.get("subject").str_or("").trim().to_string();
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                // группа из импорта сразу видна в «Группах и направлениях»
+                j.ensure_group(&group);
                 for im in &list {
                     // ФИО из Moodle — к записи в списке группы («Лесовиков Иван» = «Иван Лесовиков»)
                     let roster = j.rosters.get(&group).cloned().unwrap_or_default();
@@ -1182,6 +1186,10 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     }
                     if !codes.contains(&im.code) {
                         codes.push(im.code.clone());
+                        j.touch_topic(&group, &im.code, &im.kind, &im.title, &subject);
+                        if j.kind_of(&group, &im.code) == "test" {
+                            tests.push(im.code.clone());
+                        }
                     }
                     let exists = j.entries.iter().any(|e| e.group == group && e.student == name && e.code == im.code);
                     if exists && !replace {
@@ -1199,7 +1207,12 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         variant: String::new(),
                         comment: im.comment.clone(),
                         style: Vec::new(),
+                        // в отзыве преподаватель упомянул ИИ или нейросеть — помечаем оценку
+                        flag: if super::journal::mentions_ai(&im.comment) { "ai_text".into() } else { String::new() },
                     });
+                    if super::journal::mentions_ai(&im.comment) {
+                        flagged += 1;
+                    }
                     if exists {
                         updated += 1;
                     } else {
@@ -1208,8 +1221,8 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 }
                 j.save();
             }
-            let mut v = journal_view(core);
-            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes));
+            let mut v = journal_view(core, &p);
+            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes).with("tests", tests).with("flagged", flagged).with("group", group.as_str()));
             Ok(v)
         }
 
@@ -1236,8 +1249,14 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let emails = j.emails.get(&group).cloned().unwrap_or_default();
             let list: Vec<(String, String)> = students.iter().map(|s| (s.clone(), emails.get(s).cloned().unwrap_or_default())).collect();
             let no_mail = list.iter().filter(|(s, m)| m.is_empty() && j.entries.iter().any(|e| e.group == group && &e.student == s)).count();
-            let csv = super::moodle::export_gradebook(&list, &codes, &|s, c| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).and_then(|e| e.grade));
-            std::fs::write(&path, csv).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            // свои столбцы (пропуски, посещения) в Moodle не выгружаем
+            codes.retain(|c| j.kind_of(&group, c) != "custom");
+            let with_fb = p.get("feedback").bool_or(false);
+            let sep = p.get("sep").str_or(";").chars().next().unwrap_or(';');
+            let fb = |s: &str, c: &str| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).map(|e| e.comment.clone()).unwrap_or_default();
+            let csv = super::moodle::export_gradebook_full(&list, &codes, &|s, c| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).and_then(|e| e.grade), if with_fb { Some(&fb) } else { None }, sep);
+            let bytes = super::moodle::encode_csv(&csv, &p.get("encoding").str_or("utf8bom"));
+            std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
             Ok(Json::obj().with("path", path).with("codes", codes).with("no_email", no_mail))
         }
 
@@ -1308,7 +1327,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             }
             let src = std::path::Path::new(&path);
             let out = src.with_file_name(format!("{}_оценки.csv", src.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "Оценки".into())));
-            std::fs::write(&out, super::moodle::write_csv(&rows, sep)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            std::fs::write(&out, super::moodle::encode_csv(&super::moodle::write_csv(&rows, sep), &p.get("encoding").str_or("utf8bom"))).map_err(|e| format!("не удалось сохранить: {}", e))?;
             Ok(Json::obj().with("path", out.to_string_lossy().to_string()).with("filled", hit).with("not_found", miss))
         }
 
@@ -1374,11 +1393,11 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
         }
 
         // ---------------------------------------------------------- журнал группы
-        "journal" => Ok(journal_view(core)),
+        "journal" => Ok(journal_view(core, &p)),
 
         "journal_add" => {
             let n = core.journal_add_current();
-            Ok(journal_view(core).with("added", n))
+            Ok(journal_view(core, &p).with("added", n))
         }
 
         "journal_roster" => {
@@ -1404,6 +1423,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     j.teams.remove(&group);
                 } else {
                     j.rosters.insert(group.clone(), names);
+                    j.ensure_group(&group);
                 }
                 if let Some(v) = p.get("variant_is_number").as_bool() {
                     j.variant_is_number = v;
@@ -1431,7 +1451,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 j.save();
             }
             core.refinalize_all();
-            Ok(journal_view(core))
+            Ok(journal_view(core, &p))
         }
 
         "analytics" => {
@@ -1792,7 +1812,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 j.save();
             }
             core.compute_plagiarism();
-            Ok(journal_view(core))
+            Ok(journal_view(core, &p))
         }
 
         "journal_set" => {
@@ -1800,24 +1820,132 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let (group, student, code) = (p.get("group").str_or(""), p.get("student").str_or(""), p.get("code").str_or(""));
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let custom = j.kind_of(&group, &code) == "custom";
                 match p.get("grade").as_f64() {
                     Some(g) => j.upsert(Entry {
+                        grade: Some(if custom { g } else { super::core::norm_grade(g, true) }),
                         group,
                         student,
                         code,
-                        grade: Some(super::core::norm_grade(g, true)),
                         violation: String::new(),
                         date: super::core::now_s(),
                         file: "вручную".into(),
                         variant: String::new(),
                         comment: p.get("comment").str_or(""),
                         style: Vec::new(),
+                        flag: String::new(),
                     }),
                     None => j.entries.retain(|e| !(e.group == group && e.student == student && e.code == code)),
                 }
                 j.save();
             }
-            Ok(journal_view(core))
+            Ok(journal_view(core, &p))
+        }
+
+        "journal_topic" => {
+            // тема журнала: задать вид/предмет/семестр/даты, переименовать, удалить целиком
+            let group = p.get("group").str_or("");
+            let code = p.get("code").str_or("").trim().to_string();
+            if code.is_empty() {
+                return Err("Не указана тема".into());
+            }
+            let groups: Vec<String> = { let mut g = p.get("groups").str_list(); if g.is_empty() { g.push(group.clone()); } g };
+            let mut n = 0;
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                for g in &groups {
+                    match p.get("action").str_or("set").as_str() {
+                        "set" => {
+                            j.ensure_group(g);
+                            j.set_topic(g, &code, super::journal::Topic::from_json(p.get("topic")));
+                            // тема без даты и без оценок всё равно должна остаться столбцом
+                            if j.topic(g, &code).is_empty() && !j.entries.iter().any(|e| &e.group == g && e.code == code) {
+                                j.set_topic(g, &code, super::journal::Topic { kind: super::journal::auto_kind(&code, "").into(), ..Default::default() });
+                            }
+                        }
+                        "delete" => n += j.delete_topic(g, &code),
+                        "forget" => j.set_topic(g, &code, Default::default()),
+                        "rename" => j.rename_topic(g, &code, p.get("to").str_or("").trim()),
+                        _ => return Err("Неизвестное действие".into()),
+                    }
+                }
+                j.save();
+            }
+            Ok(journal_view(core, &p).with("removed", n))
+        }
+
+        "journal_fill" => {
+            // «2» всем, у кого нет оценки по теме (или по всем работам и тестам)
+            let group = p.get("group").str_or("");
+            let grade = p.get("grade").f64_or(2.0);
+            let n = {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let codes = { let c = p.get("codes").str_list(); if c.is_empty() { j.codes_of(&group) } else { c } };
+                let n = j.fill_missing(&group, &codes, grade, super::core::now_s());
+                j.save();
+                n
+            };
+            Ok(journal_view(core, &p).with("filled", n))
+        }
+
+        "journal_averages" => {
+            // свои средние группы: [{name, codes}]
+            let group = p.get("group").str_or("");
+            {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let list: Vec<(String, Vec<String>)> = p.get("averages").as_arr().iter().map(|a| (a.get("name").str_or("").trim().to_string(), a.get("codes").str_list())).filter(|(n, c)| !n.is_empty() && !c.is_empty()).collect();
+                if list.is_empty() {
+                    j.averages.remove(&group);
+                } else {
+                    j.averages.insert(group, list);
+                }
+                j.save();
+            }
+            Ok(journal_view(core, &p))
+        }
+
+        "journal_calendar" => {
+            // все темы всех групп с датами — для календаря
+            let j = core.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut items = Json::arr();
+            for (g, m) in &j.topics {
+                for (c, t) in m {
+                    items.push(t.to_json().with("group", g.as_str()).with("code", c.as_str()).with("kind", j.kind_of(g, c)).with("graded", j.entries.iter().filter(|e| &e.group == g && &e.code == c && e.grade.is_some()).count()));
+                }
+            }
+            // оценённые темы без календаря — тоже, с датой первой оценки
+            let tz = report::TZ_MIN.load(Ordering::Relaxed) * 60;
+            let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+            for e in &j.entries {
+                if j.topics.get(&e.group).map(|m| m.contains_key(&e.code)).unwrap_or(false) || !seen.insert((e.group.clone(), e.code.clone())) {
+                    continue;
+                }
+                let first = j.entries.iter().filter(|x| x.group == e.group && x.code == e.code && x.date > 0).map(|x| x.date).min().unwrap_or(0);
+                items.push(Json::obj().with("group", e.group.as_str()).with("code", e.code.as_str()).with("kind", j.kind_of(&e.group, &e.code)).with("issued", if first > 0 { super::core::ymd(first as i64 + tz) } else { String::new() }).with("deadline", "").with("title", "").with("subject", "").with("note", "").with("auto", true).with("graded", 1));
+            }
+            Ok(Json::obj().with("items", items))
+        }
+
+        "set_subject" => {
+            // предмет набора заданий
+            let set = p.get("set").str_or("");
+            let subject = p.get("subject").str_or("").trim().to_string();
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut m = st.get("set_subjects").clone();
+                if m.is_null() {
+                    m = Json::obj();
+                }
+                m.set(&set, subject.as_str());
+                st.set("set_subjects", m);
+                let mut subs = st.get("subjects").str_list();
+                if !subject.is_empty() && !subs.contains(&subject) {
+                    subs.push(subject.clone());
+                    st.set("subjects", subs);
+                }
+            }
+            core.save_settings();
+            Ok(core.state_json())
         }
 
         "journal_clear" => {
@@ -1829,72 +1957,176 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 }
                 j.save();
             }
-            Ok(journal_view(core))
+            Ok(journal_view(core, &p))
         }
 
         "journal_export" => {
+            // журнал в Excel или Word: какие столбцы — по галочкам (`cols`), темы — по фильтру семестра и предмета
             let path = p.get("path").str_or("");
             let fmt = p.get("format").str_or("xlsx");
             let only = p.get("group").as_str().map(|s| s.to_string());
-            let v = journal_view(core);
-            let codes = v.get("codes").str_list();
-            let mut heads: Vec<String> = vec!["Студент".into(), "Группа".into()];
-            heads.extend(codes.iter().cloned());
-            heads.extend(["Средний".to_string(), "Нарушения".into(), "Долги".into()]);
-            let mut rows: Vec<Vec<String>> = Vec::new();
-            for g in v.get("groups").as_arr() {
-                let gname = g.get("name").str_or("");
-                if only.as_ref().map(|o| o != &gname).unwrap_or(false) {
-                    continue;
+            let cols = p.get("cols").clone();
+            let on = |k: &str, d: bool| cols.get(k).bool_or(d);
+            let v = journal_view(core, &p);
+            let groups: Vec<Json> = v.get("groups").as_arr().iter().filter(|g| only.as_ref().map(|o| o == &g.get("name").str_or("")).unwrap_or(true)).cloned().collect();
+            // темы: из выбранной группы или объединение всех
+            let mut codes: Vec<String> = Vec::new();
+            let mut kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for g in &groups {
+                for t in g.get("topics").as_arr() {
+                    let c = t.get("code").str_or("");
+                    let k = t.get("kind").str_or("work");
+                    if k == "custom" && !on("custom", true) {
+                        continue;
+                    }
+                    if !codes.contains(&c) {
+                        codes.push(c.clone());
+                    }
+                    kinds.insert(c, k);
                 }
-                for s in g.get("students").as_arr() {
-                    let mut r = vec![s.get("name").str_or(""), gname.clone()];
+            }
+            // по порядку: работы, тесты, свои столбцы
+            let rank = |c: &String| match kinds.get(c).map(|k| k.as_str()) {
+                Some("test") => 1u8,
+                Some("custom") => 2,
+                _ => 0,
+            };
+            codes.sort_by_key(|c| (rank(c), natural_key(c)));
+            let own_names: Vec<String> = {
+                let mut n: Vec<String> = Vec::new();
+                for g in &groups {
+                    for a in g.get("averages").as_arr() {
+                        let x = a.get("name").str_or("");
+                        if !n.contains(&x) {
+                            n.push(x);
+                        }
+                    }
+                }
+                n
+            };
+            let has_tests = codes.iter().any(|c| kinds.get(c).map(|k| k == "test").unwrap_or(false));
+            let has_works = codes.iter().any(|c| kinds.get(c).map(|k| k == "work").unwrap_or(false));
+            let with_group = only.is_none();
+            let mut heads: Vec<String> = Vec::new();
+            if on("num", true) {
+                heads.push("№".into());
+            }
+            heads.push("Студент".into());
+            if with_group {
+                heads.push("Группа".into());
+            }
+            let first_grade = heads.len();
+            heads.extend(codes.iter().cloned());
+            let last_grade = heads.len();
+            let fmt2 = |x: &Json| x.as_f64().map(|a| format!("{:.2}", a).replace('.', ",")).unwrap_or_default();
+            let mut extra: Vec<(&str, String)> = Vec::new();
+            if on("avg", true) {
+                extra.push(("avg", "Средний".into()));
+            }
+            if on("avg_works", true) && has_works && has_tests {
+                extra.push(("avg_works", "Средний по работам".into()));
+            }
+            if on("avg_tests", true) && has_tests {
+                extra.push(("avg_tests", "Средний по тестам".into()));
+            }
+            if on("avg_own", true) {
+                for n in &own_names {
+                    extra.push(("own", n.clone()));
+                }
+            }
+            if on("violations", true) {
+                extra.push(("violations", "Нарушения".into()));
+            }
+            if on("missing", true) {
+                extra.push(("missing", "Долги".into()));
+            }
+            heads.extend(extra.iter().map(|(_, h)| h.clone()));
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            let mut n = 0;
+            for g in &groups {
+                let gname = g.get("name").str_or("");
+                for st in g.get("students").as_arr() {
+                    n += 1;
+                    let mut r: Vec<String> = Vec::new();
+                    if on("num", true) {
+                        r.push(n.to_string());
+                    }
+                    r.push(st.get("name").str_or(""));
+                    if with_group {
+                        r.push(gname.clone());
+                    }
                     for c in &codes {
-                        let cell = s.get("cells").get(c);
+                        let cell = st.get("cells").get(c);
+                        let custom = kinds.get(c).map(|k| k == "custom").unwrap_or(false);
                         r.push(match cell.get("grade").as_f64() {
-                            Some(x) => format!("{}{}", super::core::fmt_grade(x), if cell.get("violation").str_or("").is_empty() { "" } else { "*" }),
+                            Some(x) if custom => if (x - x.round()).abs() < 1e-9 { format!("{}", x.round() as i64) } else { format!("{}", x).replace('.', ",") },
+                            Some(x) => format!("{}{}{}", super::core::fmt_grade(x), if cell.get("violation").str_or("").is_empty() { "" } else { "*" }, if cell.get("flag").str_or("").is_empty() { "" } else { "•" }),
                             None => String::new(),
                         });
                     }
-                    r.push(s.get("avg").as_f64().map(|a| format!("{:.2}", a).replace('.', ",")).unwrap_or_default());
-                    r.push(s.get("violations").i64_or(0).to_string());
-                    r.push(s.get("missing").i64_or(0).to_string());
+                    for (k, name) in &extra {
+                        r.push(match *k {
+                            "avg" | "avg_works" | "avg_tests" => fmt2(st.get(k)),
+                            "own" => fmt2(st.get("avg_own").get(name)),
+                            other => st.get(other).i64_or(0).to_string(),
+                        });
+                    }
                     rows.push(r);
                 }
             }
-            let title = format!("Журнал группы{}  (* — нарушение: ИИ или списывание)", only.map(|g| format!(" {}", g)).unwrap_or_default());
+            let filt = v.get("filter");
+            let mut sub_title: Vec<String> = Vec::new();
+            for k in ["subject", "semester"] {
+                let x = filt.get(k).str_or("");
+                if !x.is_empty() {
+                    sub_title.push(x);
+                }
+            }
+            let title = format!(
+                "Журнал группы{}{}",
+                only.as_ref().map(|g| format!(" {}", g)).unwrap_or_default(),
+                if sub_title.is_empty() { String::new() } else { format!(" — {}", sub_title.join(", ")) }
+            );
+            let legend = "* — «2» за нарушение (ИИ или списывание); • — в отзыве упоминается ИИ; пустая клетка — оценки нет";
+            // цвет — только у оценок; дробные («3,5») — по ближайшей целой
+            let fill_of = |i: usize, x: &str| -> &'static str {
+                if i < first_grade || i >= last_grade || kinds.get(&heads[i]).map(|k| k == "custom").unwrap_or(false) {
+                    return "";
+                }
+                match x.trim_end_matches(['*', '•']).replace(',', ".").parse::<f64>().ok().map(|g| (g + 1e-9).round() as i64) {
+                    Some(5) => "C6EFCE",
+                    Some(4) => "DDEBF7",
+                    Some(3) => "FFEB9C",
+                    Some(0..=2) => "F8CBAD",
+                    _ => "",
+                }
+            };
             let bytes = if fmt == "docx" {
-                let mut widths = vec![3600u32, 1200];
+                let mut widths: Vec<u32> = Vec::new();
+                if on("num", true) {
+                    widths.push(500);
+                }
+                widths.push(3400);
+                if with_group {
+                    widths.push(1100);
+                }
                 widths.extend(codes.iter().map(|_| 900u32));
-                widths.extend([1100, 1200, 900]);
-                let trows: Vec<Vec<(String, String)>> = rows
-                    .iter()
-                    .map(|r| {
-                        r.iter()
-                            .enumerate()
-                            .map(|(i, x)| {
-                                let fill = if i >= 2 && i < 2 + codes.len() {
-                                    match x.trim_end_matches('*') {
-                                        "5" => "C6EFCE",
-                                        "4" => "DDEBF7",
-                                        "3" => "FFEB9C",
-                                        "2" => "F8CBAD",
-                                        _ => "",
-                                    }
-                                } else {
-                                    ""
-                                };
-                                (x.clone(), fill.to_string())
-                            })
-                            .collect()
-                    })
-                    .collect();
-                super::report::docx_blocks(&title, &[Block::Title(title.clone()), Block::Sub(format!("Сформировано {}", super::report::today_str())), Block::Table { heads: heads.clone(), widths, rows: trows }], true)
+                widths.extend(extra.iter().map(|_| 1100u32));
+                let trows: Vec<Vec<(String, String)>> = rows.iter().map(|r| r.iter().enumerate().map(|(i, x)| (x.clone(), fill_of(i, x).to_string())).collect()).collect();
+                super::report::docx_blocks(&title, &[Block::Title(title.clone()), Block::Sub(format!("Сформировано {}. {}", super::report::today_str(), legend)), Block::Table { heads: heads.clone(), widths, rows: trows }], true)
             } else {
-                let mut widths = vec![34u32, 10];
-                widths.extend(codes.iter().map(|_| 9u32));
-                widths.extend([10, 11, 8]);
-                super::report::xlsx_table("Журнал", &title, &heads, &rows, &widths)
+                let mut widths: Vec<u32> = Vec::new();
+                if on("num", true) {
+                    widths.push(5);
+                }
+                widths.push(34);
+                if with_group {
+                    widths.push(10);
+                }
+                widths.extend(codes.iter().map(|c| (c.chars().count() as u32 + 2).clamp(8, 22)));
+                widths.extend(extra.iter().map(|(_, h)| (h.chars().count() as u32 + 2).clamp(9, 22)));
+                let fills: Vec<Vec<String>> = rows.iter().map(|r| r.iter().enumerate().map(|(i, x)| fill_of(i, x).to_string()).collect()).collect();
+                super::report::xlsx_table_ex("Журнал", &format!("{}  ({})", title, legend), &heads, &rows, &widths, &fills, if on("num", true) { 2 } else { 1 })
             };
             std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
             Ok(Json::obj().with("path", path))
@@ -2120,10 +2352,19 @@ pub fn b64(data: &[u8]) -> String {
 fn _unused(_: HashMap<String, String>) {}
 
 /// Сводная таблица журнала: группы → студенты → оценки по работам.
-pub fn journal_view(core: &Arc<Core>) -> Json {
+pub fn journal_view(core: &Arc<Core>, p: &Json) -> Json {
+    use super::journal::{parse_local, semester_of_date};
     let j = core.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let st = core.settings();
+    let opts = st.get("journal_opts").clone();
+    let tests_min2 = opts.get("tests_min2").bool_or(false);
+    // фильтр журнала (f_*: «subject» в запросах занят предметом импорта и темы)
+    let f_sem = p.get("f_semester").str_or("");
+    let f_sub = p.get("f_subject").str_or("");
+    let tz = report::TZ_MIN.load(Ordering::Relaxed) * 60;
+    let now = super::core::now_s() as i64;
     let mut groups: Vec<String> = j.groups.iter().map(|g| g.name.clone()).collect();
-    for g in j.rosters.keys() {
+    for g in j.rosters.keys().chain(j.topics.keys()) {
         if !groups.contains(g) {
             groups.push(g.clone());
         }
@@ -2139,41 +2380,139 @@ pub fn journal_view(core: &Arc<Core>) -> Json {
         }
     }
     groups.sort_by_key(|g| natural_key(g));
-    let mut codes: Vec<String> = j.entries.iter().map(|e| e.code.clone()).collect();
-    codes.sort_by_key(|c| natural_key(c));
-    codes.dedup();
+    let mut semesters: Vec<String> = Vec::new();
+    let mut subjects: Vec<String> = st.get("subjects").str_list();
+    let mut all_codes: Vec<String> = Vec::new();
+    let r2 = |x: f64| (x * 100.0).round() / 100.0;
     let mut out = Json::arr();
     for g in &groups {
+        let mut codes_all = j.codes_of(g);
+        codes_all.sort_by_key(|c| natural_key(c));
+        // темы группы: вид, даты, семестр; фильтр по семестру и предмету
+        let mut codes: Vec<String> = Vec::new();
+        let mut topics = Json::arr();
+        let mut kinds: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut due: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+        for c in &codes_all {
+            let t = j.topic(g, c);
+            let kind = j.kind_of(g, c);
+            let first = j.entries.iter().filter(|e| &e.group == g && &e.code == c && e.date > 0).map(|e| e.date).min().unwrap_or(0);
+            let issued = if !t.issued.is_empty() { t.issued.clone() } else if first > 0 { super::core::ymd(first as i64 + tz) } else { String::new() };
+            let semester = if !t.semester.is_empty() { t.semester.clone() } else { semester_of_date(&issued) };
+            if !semester.is_empty() && !semesters.contains(&semester) {
+                semesters.push(semester.clone());
+            }
+            if !t.subject.is_empty() && !subjects.contains(&t.subject) {
+                subjects.push(t.subject.clone());
+            }
+            if (!f_sem.is_empty() && semester != f_sem) || (!f_sub.is_empty() && t.subject != f_sub) {
+                continue;
+            }
+            let dl = parse_local(&t.deadline).map(|x| x - tz).unwrap_or(0);
+            let graded = j.entries.iter().filter(|e| &e.group == g && &e.code == c && e.grade.is_some()).count();
+            // долг: работа уже оценивалась у кого-то или срок прошёл
+            let is_due = kind != "custom" && (graded > 0 || (dl > 0 && dl < now));
+            topics.push(
+                Json::obj()
+                    .with("code", c.as_str())
+                    .with("kind", kind.as_str())
+                    .with("kind_set", t.kind.as_str())
+                    .with("title", t.title.as_str())
+                    .with("subject", t.subject.as_str())
+                    .with("semester", semester.as_str())
+                    .with("semester_set", t.semester.as_str())
+                    .with("issued", issued.as_str())
+                    .with("issued_set", t.issued.as_str())
+                    .with("deadline", t.deadline.as_str())
+                    .with("overdue", dl > 0 && dl < now)
+                    .with("note", t.note.as_str())
+                    .with("unit", t.unit.as_str())
+                    .with("graded", graded)
+                    .with("due", is_due),
+            );
+            kinds.insert(c.clone(), kind);
+            due.insert(c.clone(), is_due);
+            codes.push(c.clone());
+            if !all_codes.contains(c) {
+                all_codes.push(c.clone());
+            }
+        }
         let roster = j.rosters.get(g).cloned().unwrap_or_default();
         let mut students: Vec<String> = roster.clone();
         let mut extra: Vec<String> = j.entries.iter().filter(|e| &e.group == g && !roster.contains(&e.student)).map(|e| e.student.clone()).collect();
         extra.sort_by_key(|s| natural_key(s));
         extra.dedup();
         students.extend(extra);
+        let avgs: Vec<(String, Vec<String>)> = j.averages.get(g).cloned().unwrap_or_default();
         let mut rows = Json::arr();
-        for st in &students {
+        for stu in &students {
             let mut cells = Json::obj();
-            let (mut sum, mut n, mut viol) = (0f64, 0i64, 0i64);
+            let (mut sa, mut na, mut sw, mut nw, mut stt, mut nt, mut viol, mut missing, mut flags) = (0f64, 0, 0f64, 0, 0f64, 0, 0i64, 0i64, 0i64);
+            let mut shown: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
             for c in &codes {
-                if let Some(e) = j.entries.iter().find(|e| &e.group == g && &e.student == st && &e.code == c) {
-                    if let Some(gr) = e.grade {
-                        sum += gr;
-                        n += 1;
-                    }
+                let kind = kinds.get(c).map(|s| s.as_str()).unwrap_or("work");
+                let e = j.entries.iter().find(|e| &e.group == g && &e.student == stu && &e.code == c);
+                let raw = e.and_then(|e| e.grade);
+                // тесты на 0–1,9 — это «2» (по настройке)
+                let val = raw.map(|x| if kind == "test" && tests_min2 && x < 2.0 { 2.0 } else { x });
+                if let Some(e) = e {
                     if !e.violation.is_empty() {
                         viol += 1;
                     }
-                    cells.set(c, Json::obj().with("grade", e.grade).with("violation", e.violation.as_str()).with("date", e.date).with("file", e.file.as_str()).with("comment", e.comment.as_str()).with("variant", e.variant.as_str()));
+                    if !e.flag.is_empty() {
+                        flags += 1;
+                    }
+                    cells.set(
+                        c,
+                        Json::obj()
+                            .with("grade", val)
+                            .with("raw", raw)
+                            .with("violation", e.violation.as_str())
+                            .with("flag", e.flag.as_str())
+                            .with("date", e.date)
+                            .with("file", e.file.as_str())
+                            .with("comment", e.comment.as_str())
+                            .with("variant", e.variant.as_str()),
+                    );
+                }
+                match (kind, val) {
+                    ("custom", _) => {}
+                    (k, Some(v)) => {
+                        sa += v;
+                        na += 1;
+                        if k == "test" {
+                            stt += v;
+                            nt += 1;
+                        } else {
+                            sw += v;
+                            nw += 1;
+                        }
+                        shown.insert(c.as_str(), v);
+                    }
+                    (_, None) => {
+                        if due.get(c).copied().unwrap_or(false) {
+                            missing += 1;
+                        }
+                    }
                 }
             }
-            let missing = if roster.is_empty() { 0 } else { codes.len() as i64 - n };
+            let mut own = Json::obj();
+            for (name, list) in &avgs {
+                let vals: Vec<f64> = list.iter().filter_map(|c| shown.get(c.as_str()).copied()).collect();
+                own.set(name, if vals.is_empty() { Json::Null } else { Json::Num(r2(vals.iter().sum::<f64>() / vals.len() as f64)) });
+            }
+            let avg = |s: f64, n: i32| if n > 0 { Json::Num(r2(s / n as f64)) } else { Json::Null };
             rows.push(
                 Json::obj()
-                    .with("name", st.as_str())
-                    .with("in_roster", roster.contains(st))
+                    .with("name", stu.as_str())
+                    .with("in_roster", roster.contains(stu))
                     .with("cells", cells)
-                    .with("avg", if n > 0 { Json::Num(((sum as f64 / n as f64) * 100.0).round() / 100.0) } else { Json::Null })
+                    .with("avg", avg(sa, na))
+                    .with("avg_works", avg(sw, nw))
+                    .with("avg_tests", avg(stt, nt))
+                    .with("avg_own", own)
                     .with("violations", viol)
+                    .with("flags", flags)
                     .with("missing", missing),
             );
         }
@@ -2186,9 +2525,36 @@ pub fn journal_view(core: &Arc<Core>) -> Json {
             }
             o
         };
-        out.push(Json::obj().with("name", g.as_str()).with("program", j.program_of(g)).with("roster", roster).with("variants", map_json(&j.assigned)).with("teams", map_json(&j.teams)).with("students", rows));
+        let has_tests = kinds.values().any(|k| k == "test");
+        let has_works = kinds.values().any(|k| k == "work");
+        out.push(
+            Json::obj()
+                .with("name", g.as_str())
+                .with("program", j.program_of(g))
+                .with("in_registry", j.groups.iter().any(|x| &x.name == g))
+                .with("roster", roster)
+                .with("variants", map_json(&j.assigned))
+                .with("teams", map_json(&j.teams))
+                .with("codes", codes)
+                .with("codes_all", codes_all)
+                .with("topics", topics)
+                .with("has_tests", has_tests)
+                .with("has_works", has_works)
+                .with("averages", Json::Arr(avgs.iter().map(|(n, c)| Json::obj().with("name", n.as_str()).with("codes", c.clone())).collect()))
+                .with("students", rows),
+        );
     }
-    Json::obj().with("groups", out).with("codes", codes).with("variant_is_number", j.variant_is_number).with("entries", j.entries.len())
+    semesters.sort();
+    all_codes.sort_by_key(|c| natural_key(c));
+    Json::obj()
+        .with("groups", out)
+        .with("codes", all_codes)
+        .with("semesters", semesters)
+        .with("subjects", subjects)
+        .with("filter", Json::obj().with("semester", f_sem.as_str()).with("subject", f_sub.as_str()))
+        .with("opts", opts)
+        .with("variant_is_number", j.variant_is_number)
+        .with("entries", j.entries.len())
 }
 
 fn ctx_info_json(core: &Arc<Core>, prov: &Provider) -> Json {

@@ -662,6 +662,11 @@ impl Core {
                 }
                 sv.set("programs_school", true);
             }
+            // оценки в журнал теперь записываются только кнопкой — один раз выключаем автозапись
+            if !sv.is_null() && !sv.get("journal_manual").bool_or(false) {
+                sv.set("journal_auto", false);
+                sv.set("journal_manual", true);
+            }
             sv
         };
         let st = settings::merge(&settings::defaults(), &saved);
@@ -783,29 +788,51 @@ impl Core {
     /// Удалить из папки `moodle` файлы, которые больше не нужны ни одной работе
     /// (и тем, что вернёт «Отменить»), а также опустевшие папки.
     pub fn cleanup_moodle(&self) {
-        let root = self.data_dir.join("moodle");
-        if !root.is_dir() {
-            return;
-        }
+        self.cleanup_files();
+    }
+
+    /// Убрать из папки данных всё, на что больше ничего не ссылается: распакованные ответы
+    /// Moodle, фото и страницы сканов (с распознанным текстом), импортированные файлы,
+    /// задания с фото — и опустевшие папки. Файлы состояния для «Отменить» сохраняются.
+    pub fn cleanup_files(&self) {
         let mut keep: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        let mut hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
         {
             let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
             for w in &ws.works {
                 keep.insert(PathBuf::from(&w.path));
+                hashes.insert(format!("{:016x}", w.hash));
                 for s in &w.sources {
                     keep.insert(PathBuf::from(s));
                 }
-            }
-        }
-        if let Some(doc) = std::fs::read_to_string(self.data_dir.join("undo").join("session.json")).ok().and_then(|t| json::parse(&t).ok()) {
-            for w in doc.get("works").as_arr() {
-                keep.insert(PathBuf::from(w.get("path").str_or("")));
-                for s in w.get("sources").str_list() {
-                    keep.insert(PathBuf::from(s));
+                for pg in &w.pages {
+                    keep.insert(PathBuf::from(&pg.file));
+                    keep.insert(PathBuf::from(&pg.src));
+                    hashes.insert(format!("{:016x}", pg.hash));
                 }
             }
+            for t in &ws.tasks {
+                keep.insert(PathBuf::from(&t.path));
+            }
         }
-        fn walk(dir: &Path, keep: &std::collections::HashSet<PathBuf>) -> bool {
+        // состояние до последнего удаления («Отменить»): его файлы и страницы не трогаем
+        if let Some(doc) = std::fs::read_to_string(self.data_dir.join("undo").join("session.json")).ok().and_then(|t| json::parse(&t).ok()) {
+            let mut files: Vec<String> = Vec::new();
+            for w in doc.get("works").as_arr() {
+                files.push(w.get("path").str_or(""));
+                files.extend(w.get("sources").str_list());
+            }
+            for t in doc.get("tasks").as_arr() {
+                files.push(t.get("path").str_or(""));
+            }
+            for f in files {
+                if let Ok(b) = std::fs::read(&f) {
+                    hashes.insert(format!("{:016x}", fnv(&b)));
+                }
+                keep.insert(PathBuf::from(f));
+            }
+        }
+        fn walk(dir: &Path, keep: &dyn Fn(&Path) -> bool) -> bool {
             // true — папка опустела
             let Ok(rd) = std::fs::read_dir(dir) else { return false };
             let mut empty = true;
@@ -817,7 +844,7 @@ impl Core {
                     } else {
                         empty = false;
                     }
-                } else if keep.contains(&p) {
+                } else if keep(&p) {
                     empty = false;
                 } else if std::fs::remove_file(&p).is_err() {
                     empty = false;
@@ -825,7 +852,21 @@ impl Core {
             }
             empty
         }
-        walk(&root, &keep);
+        let by_path = |p: &Path| keep.contains(p);
+        for sub in ["moodle", "imported", "tasks_text"] {
+            let root = self.data_dir.join(sub);
+            if root.is_dir() && walk(&root, &by_path) {
+                let _ = std::fs::remove_dir(&root);
+            }
+        }
+        // фото и страницы: имя начинается с хэша исходного файла или страницы
+        let pages = self.data_dir.join("pages");
+        if pages.is_dir() {
+            let by_hash = |p: &Path| {
+                keep.contains(p) || p.file_name().map(|n| n.to_string_lossy().chars().take(16).collect::<String>()).map(|h| hashes.contains(&h)).unwrap_or(false)
+            };
+            walk(&pages, &by_hash);
+        }
     }
 
     /// Вернуть состояние до последнего удаления. Возвращает, что было отменено.
@@ -2086,7 +2127,8 @@ impl Core {
 
     pub fn refinalize(&self, wid: &str) -> Result<(), String> {
         let mut ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
-        let w = ws.works.iter().find(|w| w.id == wid).cloned().ok_or("работа не найдена")?;
+        let mut w = ws.works.iter().find(|w| w.id == wid).cloned().ok_or("работа не найдена")?;
+        w.deadline = self.deadline_of(&ws, &w);
         let scan = self.scan(&ws, &w);
         let pinfo = self.plag_info(&ws, wid);
         let o = ws.outcomes.get_mut(wid).ok_or("работа ещё не проверена")?;
@@ -2247,8 +2289,9 @@ impl Core {
             .with("assignment_foreign", set.map(|s| w.assignment.is_none() && !self.set_fits(s, &w.group, &self.program_of(&w.group))).unwrap_or(false))
             .with("assignment_manual", w.assignment.clone())
             .with("deadline", w.deadline)
+            .with("deadline_plan", if w.deadline == 0 { self.deadline_of(ws, w) } else { 0 })
             .with("submitted_at", w.submitted_at(&self.data_dir))
-            .with("late", w.late(&self.data_dir).is_some())
+            .with("late", { let mut w2 = w.clone(); w2.deadline = self.deadline_of(ws, w); w2.late(&self.data_dir).is_some() })
             .with("variant", scan.variant_shown())
             .with("variant_checked", scan.variant_used.clone())
             .with("variant_source", scan.variant_source.as_str())
@@ -2627,10 +2670,15 @@ impl Core {
     pub fn journal_add_current(&self) -> usize {
         let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries = Vec::new();
+        let mut topics: Vec<(String, String, String, String)> = Vec::new();
         for w in &ws.works {
             let Some(o) = ws.outcomes.get(&w.id) else { continue };
             let Some(g) = o.final_grade() else { continue };
-            let code = self.set_for_work(&ws, w).map(|s| s.code.clone()).unwrap_or_else(|| "Работа".into());
+            let set = self.set_for_work(&ws, w);
+            let code = set.map(|s| s.code.clone()).unwrap_or_else(|| "Работа".into());
+            let title = set.map(|s| s.title.clone()).unwrap_or_default();
+            let subject = set.map(|s| self.settings().get("set_subjects").get(&s.id).str_or("")).unwrap_or_default();
+            topics.push((w.group.clone(), code.clone(), title, subject));
             let (students, _) = self.authors(&ws, w);
             let scan = self.scan(&ws, w);
             // работа в паре — оценка каждому из напарников
@@ -2646,6 +2694,7 @@ impl Core {
                     variant: scan.variant_shown().unwrap_or_default(),
                     comment: o.override_comment.clone(),
                     style: detect::style_features(&w.visible),
+                    flag: String::new(),
                 });
             }
         }
@@ -2655,8 +2704,22 @@ impl Core {
         for e in entries {
             j.upsert(e);
         }
+        for (g, c, t, sub) in topics {
+            j.ensure_group(&g);
+            j.touch_topic(&g, &c, "", &t, &sub);
+        }
         j.save();
         n
+    }
+
+    /// Срок сдачи работы: свой (из Moodle или «Срок сдачи…») или из календаря журнала группы.
+    pub fn deadline_of(&self, ws: &Workspace, w: &Work) -> u64 {
+        if w.deadline > 0 {
+            return w.deadline;
+        }
+        let Some(code) = self.set_for_work(ws, w).map(|s| s.code.clone()) else { return 0 };
+        let t = self.journal.lock().unwrap_or_else(|e| e.into_inner()).topic(&w.group, &code);
+        super::journal::parse_local(&t.deadline).map(|x| (x - super::report::TZ_MIN.load(Ordering::Relaxed) * 60).max(0) as u64).unwrap_or(0)
     }
 
     /// Отзыв студенту по результатам проверки (без нейросети).
@@ -2741,8 +2804,11 @@ impl Core {
                 names.push(n.to_string());
             }
         };
-        for g in j.rosters.keys() {
+        for g in j.rosters.keys().chain(j.topics.keys()) {
             add(g, &mut names);
+        }
+        for e in &j.entries {
+            add(&e.group, &mut names);
         }
         for w in &ws.works {
             add(&w.group, &mut names);
@@ -2766,6 +2832,7 @@ impl Core {
                         .with("registered", info.is_some())
                         .with("roster", j.rosters.get(n).map(|r| r.len()).unwrap_or(0))
                         .with("works", ws.works.iter().filter(|w| &w.group == n).count())
+                        .with("grades", j.entries.iter().filter(|e| &e.group == n).count())
                 })
                 .collect(),
         )

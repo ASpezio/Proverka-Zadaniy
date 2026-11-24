@@ -448,17 +448,18 @@ pub fn xlsx(core: &Core, only: &str) -> Vec<u8> {
 
 pub fn csv(core: &Core, only: &str) -> Vec<u8> {
     let (rows, _) = rows(core, only);
-    let q = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
-    let mut out = String::from("\u{feff}№;Студент / файл;Группа;Вариант;ИИ / списывание;Оценка;Обоснование\r\n");
+    let st = core.settings();
+    let sep = st.get("csv_sep").str_or(";").chars().next().unwrap_or(';');
+    let mut t: Vec<Vec<String>> = vec![["№", "Студент / файл", "Группа", "Вариант", "ИИ / списывание", "Оценка", "Обоснование"].iter().map(|s| s.to_string()).collect()];
     for r in rows {
-        out.push_str(&format!("{};{};{};{};{};{};{}\r\n", r.n, q(&r.file), q(&r.group), q(&r.variant), q(&r.violation), r.grade, q(&r.comment)));
+        t.push(vec![r.n.to_string(), r.file.clone(), r.group.clone(), r.variant.clone(), r.violation.clone(), r.grade.to_string(), r.comment.clone()]);
     }
-    out.into_bytes()
+    super::moodle::encode_csv(&super::moodle::write_csv(&t, sep), &st.get("csv_encoding").str_or("utf8bom"))
 }
 
 fn today() -> String {
-    // дата без внешних библиотек (UTC+5 — Пермь)
-    let secs = super::core::now_s() as i64 + 5 * 3600;
+    // дата без внешних библиотек, в часовом поясе компьютера (его присылает интерфейс)
+    let secs = super::core::now_s() as i64 + TZ_MIN.load(std::sync::atomic::Ordering::Relaxed) * 60;
     let days = secs.div_euclid(86400);
     let (y, m, d) = civil_from_days(days);
     format!("{:02}.{:02}.{}", d, m, y)
@@ -587,7 +588,28 @@ fn package_docx(title: &str, body: &str) -> Vec<u8> {
 
 /// Простой XLSX: заголовок + таблица; значения-числа пишутся как числа, «5»/«4»… раскрашиваются.
 pub fn xlsx_table(sheet: &str, title: &str, heads: &[String], rows: &[Vec<String>], widths: &[u32]) -> Vec<u8> {
-    let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView workbookViewId=\"0\"><pane xSplit=\"2\" ySplit=\"2\" topLeftCell=\"C3\" activePane=\"bottomRight\" state=\"frozen\"/></sheetView></sheetViews><cols>");
+    let fills: Vec<Vec<String>> = rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(c, v)| match v.trim().trim_end_matches('*').parse::<i64>().ok().filter(|g| (2..=5).contains(g) && c >= 2) {
+                    Some(5) => "C6EFCE".to_string(),
+                    Some(4) => "DDEBF7".to_string(),
+                    Some(3) => "FFEB9C".to_string(),
+                    Some(_) => "F8CBAD".to_string(),
+                    None => String::new(),
+                })
+                .collect()
+        })
+        .collect();
+    xlsx_table_ex(sheet, title, heads, rows, widths, &fills, 2)
+}
+
+/// XLSX с заливкой каждой клетки по `fills` (цвет из четырёх оценочных или ""), `frozen` — сколько столбцов закрепить.
+pub fn xlsx_table_ex(sheet: &str, title: &str, heads: &[String], rows: &[Vec<String>], widths: &[u32], fills: &[Vec<String>], frozen: usize) -> Vec<u8> {
+    let tl = format!("{}3", col(frozen));
+    let mut x = format!("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView workbookViewId=\"0\"><pane xSplit=\"{}\" ySplit=\"2\" topLeftCell=\"{}\" activePane=\"bottomRight\" state=\"frozen\"/></sheetView></sheetViews><cols>", frozen, tl);
     for (i, w) in widths.iter().enumerate() {
         x.push_str(&format!("<col min=\"{}\" max=\"{}\" width=\"{}\" customWidth=\"1\"/>", i + 1, i + 1, w));
     }
@@ -603,23 +625,17 @@ pub fn xlsx_table(sheet: &str, title: &str, heads: &[String], rows: &[Vec<String
         x.push_str(&format!("<row r=\"{}\">", rn));
         for (c, v) in r.iter().enumerate() {
             let t = v.trim();
-            let g = t.trim_end_matches('*').parse::<i64>().ok().filter(|g| (2..=5).contains(g) && c >= 2);
-            match (g, t.replace(',', ".").parse::<f64>()) {
-                (Some(g), _) => {
-                    let st = match g {
-                        5 => 4,
-                        4 => 5,
-                        3 => 6,
-                        _ => 7,
-                    };
-                    if t.ends_with('*') {
-                        x.push_str(&s(rn, c, t, st));
-                    } else {
-                        x.push_str(&format!("<c r=\"{}{}\" s=\"{}\"><v>{}</v></c>", col(c), rn, st, g));
-                    }
-                }
-                (None, Ok(n)) if c >= 2 && !t.is_empty() => x.push_str(&format!("<c r=\"{}{}\" s=\"3\"><v>{}</v></c>", col(c), rn, n)),
-                _ => x.push_str(&s(rn, c, t, 3)),
+            let st = match fills.get(k).and_then(|f| f.get(c)).map(|f| f.as_str()).unwrap_or("") {
+                "C6EFCE" => 4,
+                "DDEBF7" => 5,
+                "FFEB9C" => 6,
+                "F8CBAD" => 7,
+                _ => 3,
+            };
+            // числа («4», «3,5», «12») — числами, с пометками («2*») — текстом
+            match t.replace(',', ".").parse::<f64>() {
+                Ok(n) if !t.is_empty() && t.len() < 15 => x.push_str(&format!("<c r=\"{}{}\" s=\"{}\"><v>{}</v></c>", col(c), rn, st, n)),
+                _ => x.push_str(&s(rn, c, t, st)),
             }
         }
         x.push_str("</row>");

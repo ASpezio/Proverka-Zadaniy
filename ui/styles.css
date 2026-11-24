@@ -561,9 +561,13 @@ pre.code { margin: 0; padding: 14px; border-radius: 12px; background: #0e1029; c
 .jt { border-collapse: collapse; width: 100%; font-size: 13.5px; }
 .jt th, .jt td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: center; white-space: nowrap; }
 .jt th { font-weight: 600; color: var(--ink-2); font-size: 12.5px; background: var(--paper-2); position: sticky; top: 0; }
-.jt td.name, .jt th.name { text-align: left; position: sticky; left: 0; background: var(--card); z-index: 1; min-width: 220px; }
-.jt th.name { background: var(--paper-2); z-index: 2; }
-.jt tr:hover td { background: rgba(122,60,240,.04); }
+.jt td.num, .jt th.num { position: sticky; left: 0; background: var(--card); z-index: 1; width: 38px; min-width: 38px; color: var(--ink-3); font-variant-numeric: tabular-nums; padding-left: 8px; padding-right: 4px; }
+.jt td.name, .jt th.name { text-align: left; position: sticky; left: 38px; background: var(--card); z-index: 1; min-width: 220px; box-shadow: 1px 0 0 var(--line); }
+.jt th.name, .jt th.num { background: var(--paper-2); z-index: 3; }
+.jt th { z-index: 2; }
+/* подсветка строки — непрозрачная: закреплённые столбцы не должны просвечивать (иначе видны оценки под ними) */
+.jt tr:hover td { background-color: color-mix(in srgb, var(--card) 96%, #7a3cf0); }
+.jt tr:hover td.name, .jt tr:hover td.num { background-color: color-mix(in srgb, var(--card) 96%, #7a3cf0); }
 .jt td.cell { cursor: pointer; min-width: 64px; }
 .jt td.cell:hover { background: rgba(29,37,80,.06); }
 .jt .gm { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 50%; font: 600 15px var(--font-head); border: 1.8px solid currentColor; }
@@ -1315,3 +1319,63 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .upd-notes { max-height: 240px; overflow: auto; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-s, 8px); background: var(--paper); font-size: 13.5px; }
 .cmp.dis { opacity: .45; cursor: default; }
 .lq-prog[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- журнал: темы, тесты, свои столбцы, календарь */
+.j-filter { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-bottom: 12px; font-size: 13.5px; color: var(--ink-2); }
+.j-filter label { display: inline-flex; gap: 8px; align-items: center; }
+.j-filter select { min-width: 170px; }
+.j-actions { flex-wrap: wrap; }
+.j-actions .j-sp { flex: 1; }
+.jt th.th-topic { cursor: pointer; vertical-align: bottom; line-height: 1.2; }
+.jt th.th-topic:hover { color: var(--ink); background: color-mix(in srgb, var(--paper-2) 85%, #7a3cf0); }
+.jt .th-code { display: block; }
+.jt .th-kind { display: inline-block; margin-top: 3px; padding: 0 6px; border-radius: 6px; font-size: 10.5px; font-weight: 600; background: color-mix(in srgb, var(--uv) 14%, transparent); color: var(--uv); }
+.jt th.k-custom .th-kind { background: var(--line); color: var(--ink-2); }
+.jt .th-date { display: block; font-size: 10.5px; font-weight: 500; color: var(--ink-3); margin-top: 2px; }
+.jt th.overdue .th-date { color: var(--pen); }
+.jt th.k-test { border-bottom: 2px solid color-mix(in srgb, var(--uv) 45%, transparent); }
+.jt th.sum { font-size: 11.5px; }
+.jt th.own { color: var(--uv); }
+.jt td.avg.sub { font-size: 14px; color: var(--ink-2); }
+.jt td.custom .cv { font: 600 14px var(--font-ui); font-variant-numeric: tabular-nums; }
+.jt .miss.due { color: var(--pen); opacity: .55; }
+.jt .gm.f { box-shadow: 0 0 0 3px color-mix(in srgb, var(--uv) 45%, transparent); }
+.gm.mini { width: 20px !important; height: 20px !important; font-size: 11px !important; display: inline-grid; place-items: center; border-radius: 50%; border: 1.5px solid currentColor; vertical-align: middle; }
+.j-legend .gm.g2 { color: var(--g2); } .j-legend .gm.g4 { color: var(--g4); }
+.j-legend .gm.v { background: var(--pen); color: #fff; border-color: var(--pen); }
+.j-legend .gm.f { box-shadow: 0 0 0 3px color-mix(in srgb, var(--uv) 45%, transparent); }
+.tp-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.tp-table th { text-align: left; font-size: 12px; color: var(--ink-3); font-weight: 600; padding: 4px 6px; }
+.tp-table td { padding: 6px; border-top: 1px solid var(--line); vertical-align: middle; }
+.tp-table select, .tp-table input { width: 100%; min-width: 120px; }
+.avg-def { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 10px; border: 1px solid var(--line); border-radius: var(--r-s, 8px); margin-bottom: 8px; }
+.avg-def .avg-codes { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.cal-modal { width: min(980px, 100%); }
+.cal-nav { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.cal-nav b { min-width: 150px; text-align: center; text-transform: capitalize; font: 600 16px var(--font-head); }
+.cal-filter { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.cal-grid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 4px; }
+.cal-h { font-size: 11.5px; color: var(--ink-3); text-align: center; padding: 2px 0; }
+.cal-d { min-height: 84px; display: flex; flex-direction: column; gap: 3px; align-items: stretch; text-align: left; padding: 5px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); cursor: pointer; font: inherit; color: inherit; overflow: hidden; }
+.cal-d.empty { border: none; background: none; cursor: default; }
+.cal-d:hover:not(.empty) { border-color: var(--ink-3); }
+.cal-d.today { border-color: var(--uv); box-shadow: inset 0 0 0 1px var(--uv); }
+.cal-n { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.cal-it { display: block; font-size: 11.5px; font-weight: 600; padding: 2px 5px; border-radius: 5px; background: color-mix(in srgb, var(--uv) 12%, transparent); color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cal-it i { font-style: normal; font-weight: 400; color: var(--ink-3); margin-left: 4px; }
+.cal-it.k-test { background: color-mix(in srgb, #0e9f77 16%, transparent); }
+.cal-it.due { background: color-mix(in srgb, var(--pen) 14%, transparent); }
+.cal-rows { display: grid; gap: 4px; }
+.cal-row { display: grid; grid-template-columns: 90px 90px 1fr auto; gap: 10px; align-items: center; text-align: left; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); font: inherit; color: inherit; cursor: pointer; }
+.cal-row:hover { border-color: var(--ink-3); }
+.cal-gs { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; }
+@media (max-width: 720px) { .cal-d { min-height: 56px; } .cal-it i { display: none; } .cal-row { grid-template-columns: 1fr 1fr; } }
+.an-modal { width: min(920px, 100%); }
+.an-dist { display: flex; height: 22px; border-radius: 6px; overflow: hidden; gap: 1px; }
+.an-dist i { display: grid; place-items: center; font-style: normal; font-size: 11px; font-weight: 600; color: #fff; min-width: 18px; }
+.an-dist .d5 { background: var(--g5); } .an-dist .d4 { background: var(--g4); } .an-dist .d3 { background: var(--g3); } .an-dist .d2 { background: var(--g2); } .an-dist .d0 { background: var(--line); color: var(--ink-3); }
+.an-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+.an-li { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
+.an-li b.bad, .hist-sum b.bad { color: var(--pen); }
+@media (max-width: 720px) { .an-cols { grid-template-columns: 1fr; } }
+.nowrap { white-space: nowrap; }

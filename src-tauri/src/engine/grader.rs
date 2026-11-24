@@ -531,7 +531,7 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
     }
     core.running.store(false, Ordering::SeqCst);
     let cancelled = core.cancel.load(Ordering::SeqCst);
-    if !cancelled && core.settings().get("journal_auto").bool_or(true) {
+    if !cancelled && core.settings().get("journal_auto").bool_or(false) {
         let n = core.journal_add_current();
         if n > 0 {
             core.log(&format!("В журнал группы записано оценок: {}", n));

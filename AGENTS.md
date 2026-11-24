@@ -138,6 +138,17 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.2: журнал, темы, Moodle
+* `journal.json` (version 2): `entries` + `topics` (группа → шифр → `Topic {kind: work|test|custom|"", title, subject, semester, issued, deadline, note, unit}`) + `averages` (группа → [(название, [шифры])]). Пустой `kind` — по названию (`journal::auto_kind`: «тест», test, quiz, опрос). `custom` не идёт в средние и долги.
+* Долг: тема не `custom` и (у кого-то уже есть оценка или прошёл срок). Семестр по дате выдачи (`semester_of_date`: сен–янв — 1-й, фев–авг — 2-й).
+* Запись в журнал только вручную: `journal_add_current`; `settings.journal_auto` по умолчанию `false`.
+* Срок из календаря работает как срок работы: `Core::deadline_of(ws, w)` (используется в `refinalize` и `mcp::submit_grade`).
+* API: `journal_view {f_semester, f_subject}` (фильтры называются так, потому что `subject` занят полезной нагрузкой импорта и тем), `journal_topic`, `journal_fill {group, codes, grade}`, `journal_averages`, `journal_calendar`, `set_subject {set, subject}`, `group_delete {name, entries}`, `journal_export {cols}`.
+* Moodle: `moodle::column_info` разбирает заголовки «Задание: …»/«Тест: …» и вид в последних скобках (Значение, Проценты, Буква, Отзыв); `import_grades_as(rows, code, prefer)`; `export_gradebook_full(…, feedback, sep)`; `journal::mentions_ai` помечает отзыв (`Entry.flag = "ai_text"`).
+* CSV: `settings.csv_encoding` (`utf8bom` | `utf8` | `cp1251`, `moodle::encode_csv`), `settings.csv_sep`.
+* Уведомления: `main.rs::register_toast_id` пишет AUMID (`identifier`) в `HKCU\Software\Classes\AppUserModelId` — без этого Windows не показывает уведомления у неустановленного exe.
+* Файлы удаляются вместе с работами/заданиями/группами: `Core::cleanup_files()`.
+
 ### Репозиторий и релизы
 * GitHub: `ASpezio/Proverka-Zadaniy`. В репозиторий уходит только код: без данных преподавателя, работ, журналов, сборок (`.gitignore`).
 * В тестах, примерах и документации — **только вымышленные ФИО** (Лесовиков, Громобоева, Пряничков…).

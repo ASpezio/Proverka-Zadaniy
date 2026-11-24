@@ -18,6 +18,99 @@ pub struct Entry {
     pub comment: String,
     /// признаки стиля работы (`detect::style_features`) — для сравнения со следующими работами
     pub style: Vec<f64>,
+    /// пометка: «ai_text» — в отзыве (например, из Moodle) упоминается ИИ или нейросеть
+    pub flag: String,
+}
+
+/// Тема журнала (столбец) в группе: вид, предмет, семестр, когда выдана и до какого срока.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Topic {
+    /// "" — определить по названию, "work" — работа, "test" — тест, "custom" — свой столбец
+    /// (пропуски, посещения…): в средний балл и долги не входит
+    pub kind: String,
+    pub title: String,
+    pub subject: String,
+    /// "" — по дате выдачи или первой оценки
+    pub semester: String,
+    /// дата выдачи «2026-09-12»
+    pub issued: String,
+    /// срок сдачи «2026-09-20T23:59» или ""
+    pub deadline: String,
+    pub note: String,
+    /// единица своего столбца: «пар», «ч»
+    pub unit: String,
+}
+
+impl Topic {
+    pub fn to_json(&self) -> Json {
+        Json::obj()
+            .with("kind", self.kind.as_str())
+            .with("title", self.title.as_str())
+            .with("subject", self.subject.as_str())
+            .with("semester", self.semester.as_str())
+            .with("issued", self.issued.as_str())
+            .with("deadline", self.deadline.as_str())
+            .with("note", self.note.as_str())
+            .with("unit", self.unit.as_str())
+    }
+    pub fn from_json(j: &Json) -> Topic {
+        let f = |k: &str| j.get(k).str_or("").trim().to_string();
+        Topic { kind: f("kind"), title: f("title"), subject: f("subject"), semester: f("semester"), issued: f("issued"), deadline: f("deadline"), note: f("note"), unit: f("unit") }
+    }
+    pub fn is_empty(&self) -> bool {
+        *self == Topic::default()
+    }
+}
+
+/// Вид темы по названию: «Тестирование по разделу 2», «Итоговый тест», «Quiz 1» — тест.
+pub fn auto_kind(code: &str, title: &str) -> &'static str {
+    let t = format!("{} {}", code, title).to_lowercase();
+    if t.contains("тест") || t.contains("test") || t.contains("quiz") || t.contains("опрос") || t.contains("зачёт по тест") {
+        "test"
+    } else {
+        "work"
+    }
+}
+
+/// Слова в отзыве, по которым оценка помечается «упоминается ИИ».
+pub fn mentions_ai(text: &str) -> bool {
+    let low = format!(" {} ", text.to_lowercase().replace('ё', "е"));
+    let words = [" ии ", " ии,", " ии.", "(ии", " ии)", " ии!", "нейросет", "нейронн", "chatgpt", "chat gpt", "gpt", "искусственн", "сгенерир", "генерац", "deepseek", "gigachat", "гигачат", "yandexgpt", "алиса", " ai ", "claude", "gemini", "copilot", "чат-бот", "чатбот", "чат бот"];
+    words.iter().any(|w| low.contains(w))
+}
+
+/// «2026-09-20T23:59» / «2026-09-20» → секунды (как будто UTC, без часового пояса).
+pub fn parse_local(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 10 {
+        return None;
+    }
+    let y: i64 = s.get(0..4)?.parse().ok()?;
+    let m: i64 = s.get(5..7)?.parse().ok()?;
+    let d: i64 = s.get(8..10)?.parse().ok()?;
+    let (hh, mm) = if s.len() >= 16 { (s.get(11..13)?.parse().ok()?, s.get(14..16)?.parse().ok()?) } else { (23i64, 59i64) };
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // дни от 1970-01-01 (алгоритм Хиннанта)
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hh * 3600 + mm * 60)
+}
+
+/// Семестр по дате «2026-10-05»: сентябрь–январь — 1-й, февраль–август — 2-й семестр учебного года.
+pub fn semester_of_date(ymd: &str) -> String {
+    let (Some(y), Some(m)) = (ymd.get(0..4).and_then(|x| x.parse::<i64>().ok()), ymd.get(5..7).and_then(|x| x.parse::<i64>().ok())) else { return String::new() };
+    match m {
+        9..=12 => format!("1 семестр {}/{}", y, (y + 1) % 100),
+        1 => format!("1 семестр {}/{}", y - 1, y % 100),
+        _ => format!("2 семестр {}/{}", y - 1, y % 100),
+    }
 }
 
 impl Entry {
@@ -33,6 +126,7 @@ impl Entry {
             .with("variant", self.variant.as_str())
             .with("comment", self.comment.as_str())
             .with("style", Json::Arr(self.style.iter().map(|v| Json::Num((v * 1000.0).round() / 1000.0)).collect()))
+            .with("flag", self.flag.as_str())
     }
     fn from_json(j: &Json) -> Entry {
         Entry {
@@ -46,6 +140,7 @@ impl Entry {
             variant: j.get("variant").str_or(""),
             comment: j.get("comment").str_or(""),
             style: j.get("style").as_arr().iter().filter_map(|v| v.as_f64()).collect(),
+            flag: j.get("flag").str_or(""),
         }
     }
 }
@@ -73,6 +168,10 @@ pub struct Journal {
     pub teams: BTreeMap<String, BTreeMap<String, String>>,
     /// группа → ФИО → почта из Moodle (для выгрузки оценок обратно в Moodle)
     pub emails: BTreeMap<String, BTreeMap<String, String>>,
+    /// группа → код → тема (вид, предмет, семестр, даты) — это же календарь заданий
+    pub topics: BTreeMap<String, BTreeMap<String, Topic>>,
+    /// группа → свои средние: (название, коды тем)
+    pub averages: BTreeMap<String, Vec<(String, Vec<String>)>>,
 }
 
 impl Journal {
@@ -91,6 +190,18 @@ impl Journal {
                     if !map.is_empty() {
                         target.insert(g.clone(), map);
                     }
+                }
+            }
+            for (g, m) in doc.get("topics").as_obj() {
+                let map: BTreeMap<String, Topic> = m.as_obj().iter().map(|(k, v)| (k.clone(), Topic::from_json(v))).collect();
+                if !map.is_empty() {
+                    j.topics.insert(g.clone(), map);
+                }
+            }
+            for (g, list) in doc.get("averages").as_obj() {
+                let v: Vec<(String, Vec<String>)> = list.as_arr().iter().map(|a| (a.get("name").str_or(""), a.get("codes").str_list())).filter(|(n, c)| !n.is_empty() && !c.is_empty()).collect();
+                if !v.is_empty() {
+                    j.averages.insert(g.clone(), v);
                 }
             }
             j.groups = doc
@@ -120,8 +231,24 @@ impl Journal {
             }
             out
         };
+        let mut topics = Json::obj();
+        for (g, m) in &self.topics {
+            let mut o = Json::obj();
+            for (k, t) in m {
+                if !t.is_empty() {
+                    o.set(k, t.to_json());
+                }
+            }
+            topics.set(g, o);
+        }
+        let mut avgs = Json::obj();
+        for (g, list) in &self.averages {
+            avgs.set(g, Json::Arr(list.iter().map(|(n, c)| Json::obj().with("name", n.as_str()).with("codes", c.clone())).collect()));
+        }
         let doc = Json::obj()
-            .with("version", 1)
+            .with("version", 2)
+            .with("topics", topics)
+            .with("averages", avgs)
             .with("assigned", to_json(&self.assigned))
             .with("teams", to_json(&self.teams))
             .with("emails", to_json(&self.emails))
@@ -135,6 +262,150 @@ impl Journal {
         let tmp = self.path.with_extension("json.tmp");
         if std::fs::write(&tmp, doc.pretty()).is_ok() {
             let _ = std::fs::rename(&tmp, &self.path);
+        }
+    }
+
+    /// Тема группы (пустая, если не задана).
+    pub fn topic(&self, group: &str, code: &str) -> Topic {
+        self.topics.get(group).and_then(|m| m.get(code)).cloned().unwrap_or_default()
+    }
+
+    /// Вид темы: work | test | custom.
+    pub fn kind_of(&self, group: &str, code: &str) -> String {
+        let t = self.topic(group, code);
+        if !t.kind.is_empty() {
+            return t.kind;
+        }
+        auto_kind(code, &t.title).to_string()
+    }
+
+    pub fn set_topic(&mut self, group: &str, code: &str, t: Topic) {
+        let m = self.topics.entry(group.to_string()).or_default();
+        if t.is_empty() {
+            m.remove(code);
+        } else {
+            m.insert(code.to_string(), t);
+        }
+    }
+
+    /// Дополнить тему, не затирая заданное вручную (импорт, запись проверки).
+    pub fn touch_topic(&mut self, group: &str, code: &str, kind: &str, title: &str, subject: &str) {
+        let mut t = self.topic(group, code);
+        let before = t.clone();
+        if t.kind.is_empty() && !kind.is_empty() && kind != auto_kind(code, title) {
+            t.kind = kind.to_string();
+        }
+        if t.title.is_empty() && !title.is_empty() && title != code {
+            t.title = title.to_string();
+        }
+        if t.subject.is_empty() && !subject.is_empty() {
+            t.subject = subject.to_string();
+        }
+        if t != before {
+            self.set_topic(group, code, t);
+        }
+    }
+
+    /// Все коды тем группы: из оценок и из календаря.
+    pub fn codes_of(&self, group: &str) -> Vec<String> {
+        let mut c: Vec<String> = self.entries.iter().filter(|e| e.group == group).map(|e| e.code.clone()).collect();
+        if let Some(m) = self.topics.get(group) {
+            c.extend(m.keys().cloned());
+        }
+        c.sort();
+        c.dedup();
+        c
+    }
+
+    /// Удалить тему группы целиком: оценки, тему календаря, упоминания в своих средних.
+    pub fn delete_topic(&mut self, group: &str, code: &str) -> usize {
+        let before = self.entries.len();
+        self.entries.retain(|e| !(e.group == group && e.code == code));
+        if let Some(m) = self.topics.get_mut(group) {
+            m.remove(code);
+        }
+        if let Some(list) = self.averages.get_mut(group) {
+            for (_, c) in list.iter_mut() {
+                c.retain(|x| x != code);
+            }
+            list.retain(|(_, c)| !c.is_empty());
+        }
+        before - self.entries.len()
+    }
+
+    /// Переименовать тему группы (код столбца). Если такая уже есть — оценки объединяются.
+    pub fn rename_topic(&mut self, group: &str, from: &str, to: &str) {
+        if from == to || to.trim().is_empty() {
+            return;
+        }
+        let taken: Vec<String> = self.entries.iter().filter(|e| e.group == group && e.code == to).map(|e| e.student.clone()).collect();
+        self.entries.retain(|e| !(e.group == group && e.code == from && taken.contains(&e.student)));
+        for e in self.entries.iter_mut() {
+            if e.group == group && e.code == from {
+                e.code = to.to_string();
+            }
+        }
+        if let Some(m) = self.topics.get_mut(group) {
+            if let Some(t) = m.remove(from) {
+                m.entry(to.to_string()).or_insert(t);
+            }
+        }
+        if let Some(list) = self.averages.get_mut(group) {
+            for (_, c) in list.iter_mut() {
+                for x in c.iter_mut() {
+                    if x == from {
+                        *x = to.to_string();
+                    }
+                }
+                c.dedup();
+            }
+        }
+    }
+
+    /// «2» всем студентам списка, у кого нет оценки по теме (или по всем работам и тестам группы).
+    pub fn fill_missing(&mut self, group: &str, codes: &[String], grade: f64, now: u64) -> usize {
+        let roster = self.rosters.get(group).cloned().unwrap_or_default();
+        let mut students = roster.clone();
+        for e in self.entries.iter().filter(|e| e.group == group) {
+            if !students.contains(&e.student) {
+                students.push(e.student.clone());
+            }
+        }
+        let mut n = 0;
+        for c in codes {
+            if self.kind_of(group, c) == "custom" {
+                continue;
+            }
+            for s in &students {
+                if self.entries.iter().any(|e| e.group == group && &e.student == s && &e.code == c && e.grade.is_some()) {
+                    continue;
+                }
+                self.upsert(Entry { group: group.into(), student: s.clone(), code: c.clone(), grade: Some(grade), date: now, file: "не сдано".into(), comment: "работа не сдана".into(), ..Default::default() });
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Группа есть в реестре (её видно в «Группы и направления» на всех шагах).
+    pub fn ensure_group(&mut self, name: &str) {
+        let name = name.trim();
+        if !name.is_empty() && !self.groups.iter().any(|g| g.name == name) {
+            self.groups.push(GroupInfo { name: name.to_string(), ..Default::default() });
+        }
+    }
+
+    /// Удалить группу: реестр, список, варианты, пары, почту, темы и (по желанию) оценки.
+    pub fn delete_group(&mut self, name: &str, with_entries: bool) {
+        self.groups.retain(|g| g.name != name);
+        self.rosters.remove(name);
+        self.assigned.remove(name);
+        self.teams.remove(name);
+        if with_entries {
+            self.emails.remove(name);
+            self.topics.remove(name);
+            self.averages.remove(name);
+            self.entries.retain(|e| e.group != name);
         }
     }
 
@@ -214,6 +485,12 @@ impl Journal {
         }
         if let Some(a) = self.emails.remove(old) {
             self.emails.insert(new.to_string(), a);
+        }
+        if let Some(a) = self.topics.remove(old) {
+            self.topics.insert(new.to_string(), a);
+        }
+        if let Some(a) = self.averages.remove(old) {
+            self.averages.insert(new.to_string(), a);
         }
         for e in self.entries.iter_mut() {
             if e.group == old {
@@ -353,5 +630,33 @@ mod tests {
         assert_eq!(j.student_for("1гр", "ПР3_Арбузов.docx", Some("7")).0, "Арбузов Антон");
         assert_eq!(j.student_for("2гр", "Вариант 5.docx", Some("5")).0, "Вариант 5");
         assert_eq!(j.student_for("2гр", "Вариант 9В (Позже сроков).docx", Some("9")).0, "Вариант 9В");
+    }
+
+    #[test]
+    fn topics() {
+        assert_eq!(auto_kind("Тестирование по разделу 2", ""), "test");
+        assert_eq!(auto_kind("ПР3", "Практическая работа 3"), "work");
+        assert!(mentions_ai("Работа выполнена с помощью ИИ."));
+        assert!(mentions_ai("похоже на ChatGPT"));
+        assert!(!mentions_ai("Хорошо, но мало примеров"));
+        assert_eq!(semester_of_date("2026-10-05"), "1 семестр 2026/27");
+        assert_eq!(semester_of_date("2027-01-20"), "1 семестр 2026/27");
+        assert_eq!(semester_of_date("2027-03-01"), "2 семестр 2026/27");
+        assert_eq!(super::super::core::ymd(parse_local("2026-09-20T10:30").unwrap()), "2026-09-20");
+        assert_eq!(parse_local("2026-09-20T10:30").unwrap() % 86400, 10 * 3600 + 30 * 60);
+        let mut j = Journal::default();
+        j.rosters.insert("1гр".into(), vec!["Арбузов Антон".into(), "Баранкина Вера".into()]);
+        j.upsert(Entry { group: "1гр".into(), student: "Арбузов Антон".into(), code: "ПР1".into(), grade: Some(4.0), ..Default::default() });
+        j.upsert(Entry { group: "1гр".into(), student: "Арбузов Антон".into(), code: "ПР2".into(), grade: Some(5.0), ..Default::default() });
+        j.set_topic("1гр", "Пропуски", Topic { kind: "custom".into(), unit: "пар".into(), ..Default::default() });
+        assert_eq!(j.fill_missing("1гр", &j.codes_of("1гр"), 2.0, 1), 2);
+        assert_eq!(j.entries.iter().filter(|e| e.student == "Баранкина Вера").count(), 2);
+        j.rename_topic("1гр", "ПР2", "ПР1");
+        assert_eq!(j.entries.iter().filter(|e| e.student == "Арбузов Антон").count(), 1);
+        assert_eq!(j.delete_topic("1гр", "ПР1"), 2);
+        assert_eq!(j.codes_of("1гр"), vec!["Пропуски".to_string()]);
+        j.ensure_group("1гр");
+        j.delete_group("1гр", true);
+        assert!(j.groups.is_empty() && j.topics.is_empty() && j.entries.is_empty());
     }
 }

@@ -402,7 +402,9 @@ impl McpServer {
         llm.set("grade", super::core::norm_grade(args.get("grade").f64_or(2.0), half));
         llm.set("completeness", args.get("completeness").i64_or(100).clamp(0, 100));
         // новая проверка — прежнее решение по ИИ больше не действует
-        let v = core.finalize(&w, &scan, &llm, &pinfo, "");
+        let mut wd = w.clone();
+        wd.deadline = core.deadline_of(&ws, &w);
+        let v = core.finalize(&wd, &scan, &llm, &pinfo, "");
         let (grade, reasons, violation) = (v.grade, v.reasons.clone(), v.violation.clone());
         let args_llm = llm.clone();
         let mut ai_ev: Vec<String> = scan.evidence.iter().filter(|e| e.weight != "weak").map(|e| e.what.clone()).collect();
