@@ -1159,7 +1159,6 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let list = super::moodle::import_grades_as(&rows, &p.get("code").str_or(""), &p.get("prefer").str_or("auto"))?;
             let replace = p.get("replace").bool_or(false);
             let add_roster = p.get("roster").bool_or(true);
-            let half = core.settings().get("half_grades").bool_or(true);
             let (mut added, mut updated, mut skipped, mut new_students, mut flagged) = (0, 0, 0, 0, 0);
             let mut codes: Vec<String> = Vec::new();
             let mut tests: Vec<String> = Vec::new();
@@ -1200,7 +1199,8 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         group: group.clone(),
                         student: name,
                         code: im.code.clone(),
-                        grade: Some(super::core::norm_grade(im.grade, half)),
+                        // как в Moodle, до сотых: тест на 2,6 или 3,8 так и остаётся (не округляется до половинок)
+                        grade: Some(((im.grade.clamp(0.0, 5.0)) * 100.0).round() / 100.0),
                         violation: String::new(),
                         date: super::core::now_s(),
                         file: "из Moodle".into(),

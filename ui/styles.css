@@ -1379,3 +1379,6 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .an-li b.bad, .hist-sum b.bad { color: var(--pen); }
 @media (max-width: 720px) { .an-cols { grid-template-columns: 1fr; } }
 .nowrap { white-space: nowrap; }
+/* длинные названия тем (тесты Moodle) — в 2–3 строки, полностью — в подсказке */
+.jt th.th-topic .th-code { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; overflow: hidden; white-space: normal; max-width: 170px; margin: 0 auto; }
+.jt th.th-topic .th-code.long { width: 170px; }

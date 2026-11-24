@@ -3784,7 +3784,7 @@ function renderJournal() {
   const head = (t) => {
     const dates = [t.issued ? `выдано ${fmtDay(t.issued)}` : "", t.deadline ? `до ${fmtDay(t.deadline)}` : ""].filter(Boolean).join(" · ");
     return `<th class="th-topic k-${t.kind} ${t.overdue ? "overdue" : ""}" data-topic="${esc(t.code)}" title="${esc([t.title || t.code, KIND_NAME[t.kind], t.subject, t.semester, t.note].filter(Boolean).join(" • "))}. Щёлкните: вид, даты, «2» несдавшим, переименовать, удалить">
-      <span class="th-code">${esc(t.code)}</span>${t.kind !== "work" ? `<span class="th-kind">${t.kind === "test" ? "тест" : esc(t.unit || "своё")}</span>` : ""}${dates ? `<span class="th-date">${esc(dates)}</span>` : ""}</th>`;
+      <span class="th-code${t.code.length > 14 ? " long" : ""}">${esc(t.code)}</span>${t.kind !== "work" ? `<span class="th-kind">${t.kind === "test" ? "тест" : esc(t.unit || "своё")}</span>` : ""}${dates ? `<span class="th-date">${esc(dates)}</span>` : ""}</th>`;
   };
   const cell = (s, t) => {
     const x = s.cells[t.code];

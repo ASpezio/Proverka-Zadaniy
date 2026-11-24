@@ -351,6 +351,19 @@ pub fn to_five(v: f64, max: f64) -> f64 {
 /// (код, полное название, вид work|test, тип: value|percent|letter|feedback).
 pub fn column_info(h: &str) -> Option<(String, String, &'static str, &'static str)> {
     let low = h.to_lowercase();
+    // итог курса, который считает сам Moodle, — свой столбец: в средние журнала не идёт
+    if low.trim_start().starts_with("итоговая оценка за курс") || low.trim_start().starts_with("course total") {
+        let typ = if low.contains("(процент") || low.contains("(percent") {
+            "percent"
+        } else if low.contains("(букв") || low.contains("(letter") {
+            "letter"
+        } else if low.contains("(отзыв") || low.contains("(feedback") {
+            "feedback"
+        } else {
+            "value"
+        };
+        return Some(("Итог курса".into(), "Итоговая оценка за курс (Moodle)".into(), "custom", typ));
+    }
     let kinds: [(&str, &str); 12] = [
         ("задание:", "work"),
         ("assignment:", "work"),
@@ -397,6 +410,33 @@ pub fn column_info(h: &str) -> Option<(String, String, &'static str, &'static st
 
 /// Код работы из заголовка столбца журнала оценок Moodle:
 /// «Задание: Практическая работа 2 (Значение)» → «ПР2».
+/// Уточнить шифр по номеру с подпунктом в названии: («ПР4», «Практическая работа 4.2. …») → «ПР4.2».
+/// Если подпункта нет — полное название.
+pub fn sub_code(code: &str, name: &str) -> String {
+    let num: String = code.chars().filter(|c| c.is_ascii_digit()).collect();
+    if !num.is_empty() {
+        let ch: Vec<char> = name.chars().collect();
+        let nd: Vec<char> = num.chars().collect();
+        let mut i = 0;
+        while i + nd.len() < ch.len() {
+            let before_ok = i == 0 || !ch[i - 1].is_ascii_digit();
+            if before_ok && ch[i..i + nd.len()] == nd[..] && ch[i + nd.len()] == '.' {
+                let mut j = i + nd.len() + 1;
+                let st = j;
+                while j < ch.len() && ch[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j > st && j - st <= 2 {
+                    let sub: String = ch[st..j].iter().collect();
+                    return format!("{}.{}", code, sub);
+                }
+            }
+            i += 1;
+        }
+    }
+    name.to_string()
+}
+
 pub fn column_code(h: &str) -> Option<String> {
     column_info(h).map(|x| x.0)
 }
@@ -523,7 +563,30 @@ pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Resul
         }
     }
     // журнал оценок курса: по столбцу на каждый элемент и вид оценки
-    let infos: Vec<(usize, (String, String, &str, &str))> = head.iter().enumerate().filter_map(|(i, h)| column_info(h).map(|c| (i, c))).collect();
+    let mut infos: Vec<(usize, (String, String, &str, &str))> = head.iter().enumerate().filter_map(|(i, h)| column_info(h).map(|c| (i, c))).collect();
+    // «Практическая работа 4.1» и «4.2» дают один шифр ПР4 — разводим их, иначе оценки смешаются
+    let mut names_of: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for (_, (c, n, ..)) in &infos {
+        let v = names_of.entry(c.clone()).or_default();
+        if !v.contains(n) {
+            v.push(n.clone());
+        }
+    }
+    for (_, (c, n, ..)) in infos.iter_mut() {
+        if names_of.get(c.as_str()).map(|v| v.len() > 1).unwrap_or(false) {
+            *c = sub_code(c, n);
+        }
+    }
+    let mut seen: std::collections::BTreeMap<String, String> = Default::default();
+    for (_, (c, n, ..)) in infos.iter_mut() {
+        match seen.get(c.as_str()) {
+            Some(other) if other != n => *c = n.clone(),
+            Some(_) => {}
+            None => {
+                seen.insert(c.clone(), n.clone());
+            }
+        }
+    }
     if infos.is_empty() {
         return Err("Не понял формат файла. Подойдут: «таблица оценок» задания (Просмотр всех ответов → Действия с оценками → Скачать таблицу оценок) или экспорт журнала оценок курса (Оценки → Экспорт → CSV или Excel)".into());
     }
@@ -627,6 +690,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gradebook_subcodes_and_decimals() {
+        assert_eq!(sub_code("ПР4", "Практическая работа 4.2. Табулирование"), "ПР4.2");
+        assert_eq!(sub_code("ПР1", "Практическая работа №1. Аппаратное"), "Практическая работа №1. Аппаратное");
+        let info = column_info("Итоговая оценка за курс (Значение)").unwrap();
+        assert_eq!((info.0.as_str(), info.2, info.3), ("Итог курса", "custom", "value"));
+        let row = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<String>>();
+        let rows = vec![
+            row(&["Имя", "Фамилия", "Задание:Практическая работа 4.1. Основы (Значение)", "Задание:Практическая работа 4.2. Графики (Значение)", "Тест:Тестирование по Разделу 1 (Значение)", "Тест:Тестирование по Разделу 1 (Отзыв)", "Итоговая оценка за курс (Значение)"]),
+            row(&["Тихон", "Громобоев", "3", "4,5", "2,6", "<p>без ИИ не обошлось</p>", "3,24"]),
+        ];
+        let got = import_grades_as(&rows, "", "auto").unwrap();
+        let g = |c: &str| got.iter().find(|x| x.code == c).map(|x| x.grade);
+        assert_eq!(g("ПР4.1"), Some(3.0));
+        assert_eq!(g("ПР4.2"), Some(4.5));
+        assert!((g("Тестирование по Разделу 1").unwrap() - 2.6).abs() < 1e-9);
+        assert_eq!(got.iter().find(|x| x.code == "Итог курса").map(|x| x.kind.as_str()), Some("custom"));
+        assert!(got.iter().any(|x| x.comment.contains("ИИ")));
+    }
+
+    #[test]
     fn names() {
         assert_eq!(parse_name("Лесовиков Иван_123456_assignsubmission_file_ПР2.docx"), Some(("Лесовиков Иван".into(), "123456".into())));
         assert_eq!(parse_name("Громобоева Анна Сергеевна_77_assignsubmission_file"), Some(("Громобоева Анна Сергеевна".into(), "77".into())));
@@ -663,7 +746,7 @@ mod tests {
         let csv = "Имя,Фамилия,Адрес электронной почты,Задание: Практическая работа 1 (Значение),Задание: ПР2 Сети (Значение),Итоговая оценка за курс (Значение)\nАнна,Громобоева,anna@example.ru,5.00,-,4.50\nПётр,Ветерков,petr@example.ru,3.00,4.00,3.50";
         let g = import_grades(&parse_csv(csv).0, "").unwrap();
         let codes: Vec<&str> = g.iter().map(|x| x.code.as_str()).collect();
-        assert_eq!(codes, vec!["ПР1", "ПР1", "ПР2"]);
+        assert_eq!(codes, vec!["ПР1", "ПР1", "ПР2", "Итог курса", "Итог курса"]);
         assert_eq!(g[0].student, "Громобоева Анна");
         // проценты, буквы, отзывы, тесты
         let csv = "Фамилия;Имя;Адрес электронной почты;Задание: ПР1 Сети (Значение);Задание: ПР1 Сети (Проценты);Задание: ПР1 Сети (Буква);Задание: ПР1 Сети (Отзыв);Тест: Тестирование по разделу 1 (Значение)\nГромобоева;Анна;anna@example.ru;8,00;80,00 %;B-;<p>Похоже на ответ нейросети</p>;7,00\nВетерков;Пётр;petr@example.ru;10,00;100,00 %;A;;3,00";
