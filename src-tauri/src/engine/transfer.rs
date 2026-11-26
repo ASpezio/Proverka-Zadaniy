@@ -134,7 +134,9 @@ pub fn export(core: &Core, dest: &str, parts: Parts) -> Result<Json, String> {
                 format!("files/{:04}/{}/{}", k, parent, super::core::file_name(&p))
             };
             z.add(&entry, &b);
-            files.push(Json::obj().with("orig", p.as_str()).with("entry", entry.as_str()));
+            // время файла = когда работа сдана; без него после импорта все работы «сданы сейчас»
+            let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
+            files.push(Json::obj().with("orig", p.as_str()).with("entry", entry.as_str()).with("mtime", mtime));
         }
         z.add_str("session.json", &text);
         counts.set("works", sess.get("works").as_arr().len());
@@ -212,6 +214,12 @@ pub fn import(core: &Core, path: &str, want: Parts) -> Result<Json, String> {
                 continue;
             }
             let Some(b) = z.read(&entry) else { continue };
+            // импорт на том же компьютере: исходный файл на месте и не изменился — берём его
+            // (копия получила бы «сейчас» вместо времени сдачи; так чинятся и старые файлы экспорта)
+            if !entry.starts_with("data/") && std::fs::read(&orig).map(|x| x == b).unwrap_or(false) {
+                remap.push((orig.clone(), orig));
+                continue;
+            }
             let target: PathBuf = if let Some(rel) = entry.strip_prefix("data/") {
                 dd.join(rel)
             } else {
@@ -220,7 +228,18 @@ pub fn import(core: &Core, path: &str, want: Parts) -> Result<Json, String> {
             if let Some(parent) = target.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
+            if std::fs::read(&target).map(|x| x == b).unwrap_or(false) {
+                // уже на месте (тот же компьютер) — не перезаписываем, время файла сохраняется
+                remap.push((orig, target.to_string_lossy().to_string()));
+                continue;
+            }
             if std::fs::write(&target, &b).is_ok() {
+                let mt = f.get("mtime").f64_or(0.0) as u64;
+                if mt > 0 {
+                    if let Ok(fh) = std::fs::OpenOptions::new().write(true).open(&target) {
+                        let _ = fh.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mt));
+                    }
+                }
                 remap.push((orig, target.to_string_lossy().to_string()));
             }
         }

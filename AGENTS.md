@@ -138,6 +138,10 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.3.4 (время сдачи)
+* `Work.submitted` — время сдачи, запомненное при загрузке (`file_time`: mtime, для `moodle/` — с поправкой на пояс); хранится в session.json (`submitted`). `submitted_at` берёт его, а время файла — только если поля нет. Раньше после импорта/копирования mtime = «сейчас» → все работы «позже срока» → правило «максимум 3».
+* `transfer.rs`: в manifest у файла `mtime`, при импорте восстанавливается `set_modified`; если исходный файл (`orig`) на месте и совпадает байт в байт — используется он, копия не делается; файл в `data/`, уже лежащий на месте с тем же содержимым, не перезаписывается.
+
 ### Версия 1.3.3 (скорость)
 * `imgfit.rs`: `dims` читает размер по заголовку (JPEG/PNG/GIF/BMP/WebP); `fit`/`fit_b64` — копия с длинной стороной `settings.media.max_side` (по умолчанию 1600, 0 — выкл.) в `pages/<fnv>_s<max>.jpg|png`. Windows — PowerShell + System.Drawing (скрипт `pages/_shrink.ps1`, только ASCII, параметры через `PV_*` в окружении, поворот по EXIF), иначе ImageMagick `convert`. Ошибка — уходит оригинал. Подключено в распознавании страниц (`grader.rs`) и в `vision_text` (задание с фото, список с фото).
 * `build_direct_prompt_with`: порядок — критерии → условие → эталон → признаки ИИ и ловушки → работа (шапка, текст, ссылки) → автопроверка → финальная просьба. Общая часть для работ одного варианта одинакова — сервер берёт её из кэша.

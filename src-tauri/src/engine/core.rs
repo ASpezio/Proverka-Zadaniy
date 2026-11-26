@@ -80,6 +80,10 @@ pub struct Work {
     pub xlsx: Vec<(String, super::office::XlsxFacts)>,
     /// срок сдачи (секунды от 1970, UTC; 0 — не задан)
     pub deadline: u64,
+    /// когда сдана (секунды от 1970, UTC), запомнено при загрузке работы. Время файла
+    /// ненадёжно: перенос на другой компьютер, восстановление из файла экспорта или
+    /// открытие в Word делают файл «сданным сейчас» — и работа вдруг «позже срока».
+    pub submitted: u64,
 }
 
 /// «2026-11-24» из секунд (уже с поправкой на часовой пояс).
@@ -261,6 +265,14 @@ impl Work {
     /// Когда работа сдана (секунды от 1970, UTC). Файлы из архива Moodle хранят время
     /// сдачи «по часам» сервера (без часового пояса) — переводим по поясу компьютера.
     pub fn submitted_at(&self, data_dir: &Path) -> u64 {
+        if self.submitted > 0 {
+            return self.submitted;
+        }
+        self.file_time(data_dir)
+    }
+
+    /// Время изменения файла работы (для ответов Moodle — с поправкой на пояс).
+    pub fn file_time(&self, data_dir: &Path) -> u64 {
         let Some(t) = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()) else { return 0 };
         if Path::new(&self.path).starts_with(data_dir.join("moodle")) {
             let tz = super::report::TZ_MIN.load(Ordering::Relaxed) * 60;
@@ -1267,7 +1279,9 @@ impl Core {
                 extra_kinds: embedded_kinds(&bytes),
                 xlsx: super::office::xlsx_facts(&bytes).map(|f| vec![(file_name(&p), f)]).unwrap_or_default(),
                 deadline: 0,
+                submitted: 0,
             };
+            w.submitted = w.file_time(&self.data_dir);
             // файлы в папке студента Moodle, которые не читаются (схема draw.io, архив…), — тоже сданы
             for f in moodle_folder_files(&p) {
                 let k = detect::file_kind(&f);
@@ -2337,6 +2351,9 @@ impl Core {
             if w.deadline > 0 {
                 o.set("deadline", w.deadline);
             }
+            if w.submitted > 0 {
+                o.set("submitted", w.submitted);
+            }
             if let Some(oc) = ws.outcomes.get(&w.id) {
                 if oc.status == "done" || oc.override_grade.is_some() {
                     o.set("outcome", oc.to_json(&w.id, &w.path));
@@ -2372,10 +2389,14 @@ impl Core {
         let mut students: HashMap<String, String> = HashMap::new();
         let mut sources: HashMap<String, Vec<String>> = HashMap::new();
         let mut deadlines: HashMap<String, u64> = HashMap::new();
+        let mut submitted: HashMap<String, u64> = HashMap::new();
         for w in doc.get("works").as_arr() {
             let p = w.get("path").str_or("");
             if let Some(d) = w.get("deadline").as_f64().filter(|d| *d > 0.0) {
                 deadlines.insert(p.clone(), d as u64);
+            }
+            if let Some(d) = w.get("submitted").as_f64().filter(|d| *d > 0.0) {
+                submitted.insert(p.clone(), d as u64);
             }
             let src = w.get("sources").str_list();
             if !src.is_empty() {
@@ -2399,6 +2420,9 @@ impl Core {
             }
             if let Some(d) = deadlines.get(&w.path) {
                 w.deadline = *d;
+            }
+            if let Some(d) = submitted.get(&w.path) {
+                w.submitted = *d;
             }
             if let Some(src) = sources.get(&w.path) {
                 self.attach_sources(w, src);
