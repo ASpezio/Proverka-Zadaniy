@@ -2848,6 +2848,7 @@ VIEWS.check = (v) => {
           <p class="small" style="margin:0 0 10px;max-width:80ch">Из Word, PowerPoint и Excel нейросеть всегда получает диаграммы (тип, заголовок, данные рядов), схемы SmartArt, надписи и фигуры, WordArt, формулы, таблицы, примечания, заметки к слайдам, переходы и анимации.</p>
           <label class="switch"><input type="checkbox" id="mediaOn" ${st.media?.images !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Смотреть картинки внутри документов</b><small>Скриншоты, фото, рисунки-схемы описывает модель с поддержкой изображений (vision), описание добавляется к тексту работы. Одинаковые картинки у разных студентов описываются один раз. Если модель изображения не читает, работа проверяется по тексту.</small></span></label>
           <div class="rule-row" style="margin:8px 0 0 54px"><span class="muted small">не больше картинок на работу</span><select class="select input" id="mediaMax">${[5, 10, 20, 40, 60].map((n) => `<option ${+(st.media?.max_images ?? 20) === n ? "selected" : ""}>${n}</option>`).join("")}</select></div>
+          <div class="rule-row" style="margin:12px 0 0 0" title="Фото с телефона (4000×3000) некоторые модели превращают в тысячи токенов. Уменьшенная копия распознаётся в разы быстрее, а почерк читается так же. Касается и фото рукописей, и картинок в документах, и заданий и списков с фото."><span class="muted small">Большие фото перед отправкой нейросети уменьшать до</span><select class="select input" id="mediaSide">${[[0, "не уменьшать"], [1024, "1024 px — быстрее всего"], [1280, "1280 px"], [1600, "1600 px — рекомендуется"], [2048, "2048 px — мелкий почерк"]].map(([v, t]) => `<option value="${v}" ${+(st.media?.max_side ?? 1600) === v ? "selected" : ""}>${t}</option>`).join("")}</select></div>
         </div>
 
         <h3 class="sec">Критерии для нейросети</h3>
@@ -2902,7 +2903,7 @@ VIEWS.check = (v) => {
   // ограничения применяются и к уже проверенным работам — обновляем оценки
   $$("[data-rule],[data-rule-v]", v).forEach((el) => (el.onchange = async () => { await saveSettings({ rules: rulesPatch() }); try { await refresh(); } catch (_) {} }));
   $("#aiMultiN").onchange = () => saveSettings({ penalties: penPatch() });
-  $("#mediaOn").onchange = $("#mediaMax").onchange = () => saveSettings({ media: { images: $("#mediaOn").checked, max_images: +$("#mediaMax").value } });
+  $("#mediaOn").onchange = $("#mediaMax").onchange = $("#mediaSide").onchange = () => saveSettings({ media: { images: $("#mediaOn").checked, max_images: +$("#mediaMax").value, max_side: +$("#mediaSide").value } });
   $("#linksOn").onchange = $("#linksMax").onchange = () => saveSettings({ links: { enabled: $("#linksOn").checked, max: +$("#linksMax").value } });
   $("#penOn").onchange = () => { $("#penBox").classList.toggle("on", $("#penOn").checked); saveSettings({ penalties: penPatch() }); };
   $$("[data-pen]").forEach((c) => (c.onchange = () => saveSettings({ penalties: penPatch() })));

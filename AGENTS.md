@@ -138,6 +138,11 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.3.3 (скорость)
+* `imgfit.rs`: `dims` читает размер по заголовку (JPEG/PNG/GIF/BMP/WebP); `fit`/`fit_b64` — копия с длинной стороной `settings.media.max_side` (по умолчанию 1600, 0 — выкл.) в `pages/<fnv>_s<max>.jpg|png`. Windows — PowerShell + System.Drawing (скрипт `pages/_shrink.ps1`, только ASCII, параметры через `PV_*` в окружении, поворот по EXIF), иначе ImageMagick `convert`. Ошибка — уходит оригинал. Подключено в распознавании страниц (`grader.rs`) и в `vision_text` (задание с фото, список с фото).
+* `build_direct_prompt_with`: порядок — критерии → условие → эталон → признаки ИИ и ловушки → работа (шапка, текст, ссылки) → автопроверка → финальная просьба. Общая часть для работ одного варианта одинакова — сервер берёт её из кэша.
+* `grader::order_by_variant`: очередь проверки сортируется по (набор заданий, вариант), внутри варианта порядок прежний.
+
 ### Версия 1.3.2 (исправления)
 * `journal_roster` с пустым списком убирает студентов, варианты и пары, но не группу (`ensure_group`); `group_save` без `old_name` и с `roster` не трогает существующую группу (`Journal::has_group`), переименование в занятое имя запрещено.
 * `group_delete` с `works: true` удаляет и работы группы из текущей проверки (иначе группа возвращается в списки).

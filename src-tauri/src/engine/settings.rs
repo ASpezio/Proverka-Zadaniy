@@ -43,7 +43,7 @@ pub fn defaults() -> Json {
         // открывать ссылки из работ студентов (Google Документы, Диски, GitHub, сайты)
         .with("links", Json::obj().with("enabled", false).with("max", 15))
         // картинки внутри Word/PowerPoint/Excel: описывает модель с поддержкой изображений
-        .with("media", Json::obj().with("images", true).with("max_images", 20))
+        .with("media", Json::obj().with("images", true).with("max_images", 20).with("max_side", 1600))
         .with(
             "penalties",
             Json::obj()

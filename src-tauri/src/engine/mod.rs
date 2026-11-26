@@ -12,6 +12,7 @@ pub mod docx;
 pub mod extras;
 pub mod grader;
 pub mod history;
+pub mod imgfit;
 pub mod http;
 pub mod journal;
 pub mod json;

@@ -321,6 +321,35 @@ pub fn chat_cancellable(core: &Arc<Core>, p: &Provider, msgs: &[Msg], tools: &[T
 
 // ------------------------------------------------------------------ запуск
 
+/// Очередь проверки: работы одного задания и варианта — подряд. Условие и эталон
+/// у них совпадают, и сервер нейросети не перечитывает их для каждой работы.
+/// Внутри варианта порядок прежний.
+pub fn order_by_variant(core: &Arc<Core>, mut ids: Vec<String>) -> Vec<String> {
+    let keys: HashMap<String, (String, Option<i64>, String)> = {
+        let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+        ids.iter()
+            .filter_map(|id| {
+                let w = ws.works.iter().find(|w| &w.id == id)?;
+                let set = core.set_for_work(&ws, w).map(|s| s.id.clone()).unwrap_or_default();
+                let sc = core.scan(&ws, w);
+                let v = sc.variant_used.or(sc.variant_in_name).or(sc.variant_in_text).unwrap_or_default();
+                Some((id.clone(), (set, v.trim().parse::<i64>().ok(), v)))
+            })
+            .collect()
+    };
+    let none = (String::new(), None, String::new());
+    ids.sort_by(|a, b| {
+        let (ka, kb) = (keys.get(a).unwrap_or(&none), keys.get(b).unwrap_or(&none));
+        ka.0.cmp(&kb.0).then_with(|| match (ka.1, kb.1) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            _ => ka.2.cmp(&kb.2),
+        })
+    });
+    ids
+}
+
 /// Проверка всех выбранных работ (запускается в отдельном потоке).
 pub fn run(core: Arc<Core>, ids: Vec<String>) {
     if core.running.swap(true, Ordering::SeqCst) {
@@ -335,6 +364,7 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
         return;
     };
     core.compute_plagiarism();
+    let ids = order_by_variant(&core, ids);
     let total = ids.len();
     *core.queue.lock().unwrap_or_else(|e| e.into_inner()) = ids.clone();
     core.run_tokens_in.store(0, Ordering::SeqCst);
@@ -629,7 +659,8 @@ fn transcribe(core: &Arc<Core>, p: &Provider, wid: &str) -> Result<(), String> {
         let r = (|| -> Result<String, String> {
             emit_progress(core, wid, "running", "vision", &format!("{} {} из {}", if optional { "Смотрю картинку" } else { "Распознаю текст с изображения" }, i + 1, n));
             let bytes = std::fs::read(&pg.file).map_err(|e| format!("Не удалось открыть изображение «{}»: {}", super::core::file_name(&pg.src), e))?;
-            let mime = super::docx::image_mime(&pg.file).to_string();
+            // большое фото с телефона — уменьшенная копия: быстрее и дешевле для модели
+            let (mime, bytes) = super::imgfit::fit(core, super::docx::image_mime(&pg.file), bytes);
             let inside_doc = pg.src == main_path && !super::docx::is_image(&pg.src) && !pg.src.to_lowercase().ends_with(".pdf");
             let ask = if inside_doc {
                 format!("Рисунок {} из {} внутри документа студента. Перепиши весь текст с него и опиши, что изображено: скриншот какой программы и что в нём сделано, схема, график или диаграмма (с подписями и значениями), фото.", i + 1, n)
@@ -876,7 +907,7 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
     }
     match work.get("variant_source").str_or("").as_str() {
         "roster" => head.push_str(&format!("Студент не указал вариант; по списку группы у него вариант {} — проверяй по нему.\n", work.get("variant_checked").str_or(""))),
-        "content" => head.push_str(&format!("Студент не указал номер варианта; условие ниже подобрано по похожести содержания (вариант {}). Номер варианта не придумывай.\n", work.get("variant_checked").str_or(""))),
+        "content" => head.push_str(&format!("Студент не указал номер варианта; условие выше подобрано по похожести содержания (вариант {}). Номер варианта не придумывай.\n", work.get("variant_checked").str_or(""))),
         _ => {}
     }
     let files = work.get("files").str_list();
@@ -903,14 +934,23 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
     // чем меньше контекст, тем компактнее служебные части
     let lvl = if max_chars < 7000 { 2 } else if max_chars < 13000 { 1 } else { 0 };
     let lim = |a: [usize; 3]| a[lvl];
-    let mut tail = String::new();
+    // Порядок частей запроса — от общего к частному: критерии и условие одинаковы
+    // для всех работ задания (варианта), поэтому идут первыми — сервер (LM Studio,
+    // llama.cpp) помнит начало прошлого запроса и не перечитывает совпадающую часть.
+    // Всё, что относится к конкретной работе, — после.
+    let mut common = String::new();
+    if let Some(c) = crit.as_str() {
+        common.push_str(&format!("# КРИТЕРИИ ПРЕПОДАВАТЕЛЯ\n{}\n\n", text::clip(c, lim([2500, 1200, 500]))));
+    }
+    // ловушки и признаки ИИ из ключа — часть условия и ключа, тоже общие
+    let mut variant_extra = String::new();
     let ai_row = key.get("ai_signs_from_key").str_or("");
     if !ai_row.is_empty() {
-        tail.push_str(&format!("# ПРИЗНАКИ ИИ ИЗ КЛЮЧА ПРЕПОДАВАТЕЛЯ\n{}\n\n", text::clip(&ai_row, lim([1500, 800, 400]))));
+        variant_extra.push_str(&format!("# ПРИЗНАКИ ИИ ИЗ КЛЮЧА ПРЕПОДАВАТЕЛЯ\n{}\n\n", text::clip(&ai_row, lim([1500, 800, 400]))));
     }
     let h = traps.get("hidden_fragments").str_list();
     if !h.is_empty() {
-        tail.push_str("# СКРЫТЫЕ ЛОВУШКИ В УСЛОВИИ (студент их не видел)\n");
+        variant_extra.push_str("# СКРЫТЫЕ ЛОВУШКИ В УСЛОВИИ (студент их не видел)\n");
         let mut used = 0;
         for x in h {
             if used > lim([1800, 900, 400]) {
@@ -918,14 +958,15 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
             }
             let line = format!("- «{}»\n", x.chars().take(lim([400, 250, 160])).collect::<String>());
             used += line.chars().count();
-            tail.push_str(&line);
+            variant_extra.push_str(&line);
         }
         let m = traps.get("marker_words").str_list();
         if !m.is_empty() {
-            tail.push_str(&format!("Слова-маркеры ИИ: {}\n", m.join(", ")));
+            variant_extra.push_str(&format!("Слова-маркеры ИИ: {}\n", m.join(", ")));
         }
-        tail.push('\n');
+        variant_extra.push('\n');
     }
+    let mut tail = String::new();
     tail.push_str("# АВТОМАТИЧЕСКАЯ ПРОВЕРКА (без нейросети)\n");
     // Excel: формулы и диаграммы проверены по самому файлу — это факты, а не догадки
     for x in scan.get("excel_findings").str_list() {
@@ -968,9 +1009,6 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
         tail.push_str(&format!("- {}\n", n));
     }
     tail.push('\n');
-    if let Some(c) = crit.as_str() {
-        tail.push_str(&format!("# КРИТЕРИИ ПРЕПОДАВАТЕЛЯ\n{}\n\n", text::clip(c, lim([2500, 1200, 500]))));
-    }
     tail.push_str("Проверь работу и верни один JSON-объект по описанной схеме.");
 
     // --- крупные части делят оставшийся бюджет
@@ -990,13 +1028,23 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
             links_head.push_str(&format!("- {} — не открылась: {}\n", l.get("url").str_or(""), l.get("error").str_or("")));
         }
     }
-    let fixed = head.chars().count() + tail.chars().count() + links_head.chars().count() + 600;
+    let fixed = common.chars().count() + variant_extra.chars().count() + head.chars().count() + tail.chars().count() + links_head.chars().count() + 600;
     let avail = max_chars.saturating_sub(fixed).max(1500);
     let links_len: usize = link_parts.iter().map(|(h, t)| h.chars().count() + t.chars().count()).sum();
     let sizes = [work_t.chars().count(), key_t.chars().count(), task_t.chars().count(), links_len];
     let a = allocate(avail, &sizes, &[0.4, 0.25, 0.15, 0.2]);
 
-    let mut s = head;
+    let mut s = common;
+    if !task.is_null() {
+        s.push_str(&format!("# УСЛОВИЕ ({}, вариант {})\n{}\n\n", task.get("assignment").str_or(""), task.get("variant").str_or(""), text::clip(&task_t, a[2].max(300))));
+    } else {
+        s.push_str("# УСЛОВИЕ\nНе загружено — оценивай по смыслу работы.\n\n");
+    }
+    if !key.is_null() {
+        s.push_str(&format!("# ЭТАЛОННЫЕ ОТВЕТЫ ПРЕПОДАВАТЕЛЯ (вариант {})\n{}\n\n", key.get("variant").str_or(""), text::clip(&key_t, a[1].max(300))));
+    }
+    s.push_str(&variant_extra);
+    s.push_str(&head);
     s.push_str("<<<НАЧАЛО РАБОТЫ\n");
     let wb = a[0].max(400);
     let work_fit = if work_t.chars().count() > wb && mode == "summary" {
@@ -1026,14 +1074,6 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
             s.push_str("\nКОНЕЦ МАТЕРИАЛОВ ПО ССЫЛКАМ>>>\n");
         }
         s.push('\n');
-    }
-    if !task.is_null() {
-        s.push_str(&format!("# УСЛОВИЕ ({}, вариант {})\n{}\n\n", task.get("assignment").str_or(""), task.get("variant").str_or(""), text::clip(&task_t, a[2].max(300))));
-    } else {
-        s.push_str("# УСЛОВИЕ\nНе загружено — оценивай по смыслу работы.\n\n");
-    }
-    if !key.is_null() {
-        s.push_str(&format!("# ЭТАЛОННЫЕ ОТВЕТЫ ПРЕПОДАВАТЕЛЯ (вариант {})\n{}\n\n", key.get("variant").str_or(""), text::clip(&key_t, a[1].max(300))));
     }
     s.push_str(&tail);
     Ok(s)
@@ -1460,7 +1500,8 @@ pub fn vision_text(core: &Arc<Core>, system: &str, ask: &str, images: &[(String,
     if p.model.is_empty() {
         return Err("Не выбрана модель — откройте раздел «Нейросеть и MCP»".into());
     }
-    let msgs = vec![Msg::System(system.to_string()), Msg::UserImages { text: ask.to_string(), images: images.to_vec() }];
+    let images: Vec<(String, String)> = images.iter().map(|(m, b)| super::imgfit::fit_b64(core, m, b)).collect();
+    let msgs = vec![Msg::System(system.to_string()), Msg::UserImages { text: ask.to_string(), images }];
     let mut p2 = p.clone();
     p2.max_tokens = p2.max_tokens.max(4096);
     p2.temperature = 0.1;
