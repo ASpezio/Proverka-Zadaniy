@@ -2035,6 +2035,7 @@ VIEWS.model = async (v) => {
         <label class="field"><span>Максимум символов работы</span><input class="input" type="number" min="2000" step="1000" id="maxChars" value="${st.max_work_chars || 16000}"></label>
       </div>
       <p class="small muted" style="margin:8px 0 0">Локальная модель обычно обрабатывает работы по одной; для облака можно 3–4. Если работа не помещается в контекст модели, приложение само сократит запрос — как именно, выбирается в разделе «Длинные работы и приватность».</p>
+      <label class="switch" style="margin-top:14px"><input type="checkbox" id="reuseCopies" ${st.reuse_copies !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Копии не проверять заново</b><small>Если работа почти целиком совпадает с уже проверенной (то же задание и вариант, те же картинки, текст совпадает на 90 % и больше), она получает её разбор без запроса к нейросети. Оценку приложение пересчитывает для каждой работы: списывание, срок сдачи, признаки ИИ — как обычно.</small></span></label>
     </div>`)}
     ${fold("mcp", "MCP-сервер приложения", "Подключить инструменты проверки к LM Studio, Claude Desktop, Cursor", `<div class="card pad" id="mcpBox"><div class="spinner"></div></div>`)}`;
   setupFolds(v);
@@ -2046,6 +2047,7 @@ VIEWS.model = async (v) => {
   setupModeTabs(st.mode || "direct");
   $("#conc").onchange = (e) => saveSettings({ concurrency: Math.max(1, Math.min(8, +e.target.value || 1)) });
   $("#maxChars").onchange = (e) => saveSettings({ max_work_chars: Math.max(2000, +e.target.value || 16000) });
+  $("#reuseCopies").onchange = (e) => saveSettings({ reuse_copies: e.target.checked });
   if (act) editProvider(act.id);
   loadMcp();
   if (!S.detect) detectLocal(false);

@@ -39,6 +39,8 @@ pub fn defaults() -> Json {
         .with("active_provider", "lmstudio")
         .with("mode", "direct")
         .with("concurrency", 1)
+        // почти одинаковые работы получают разбор уже проверенной (без нейросети)
+        .with("reuse_copies", true)
         .with("max_work_chars", 16000)
         // открывать ссылки из работ студентов (Google Документы, Диски, GitHub, сайты)
         .with("links", Json::obj().with("enabled", false).with("max", 15))

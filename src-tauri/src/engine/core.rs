@@ -1874,7 +1874,10 @@ impl Core {
             .iter()
             .filter_map(|cid| ws.works.iter().find(|w| &w.id == cid))
             .map(|w| {
-                let t = std::fs::metadata(&w.path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(u64::MAX);
+                let t = match w.submitted_at(&self.data_dir) {
+                    0 => u64::MAX,
+                    t => t,
+                };
                 let who = if w.student.is_empty() { w.name.clone() } else { w.student.clone() };
                 (t, natural_key(&w.name), w.id.clone(), who)
             })

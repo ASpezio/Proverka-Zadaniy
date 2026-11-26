@@ -350,6 +350,115 @@ pub fn order_by_variant(core: &Arc<Core>, mut ids: Vec<String>) -> Vec<String> {
     ids
 }
 
+/// Насколько текст копии должен совпадать с проверенной работой, чтобы взять её разбор
+/// (доля общих фрагментов от всех, без текста условия и эталона).
+const COPY_SAME: f64 = 0.9;
+
+enum Reuse {
+    No,
+    /// похожая работа сейчас проверяется в другом потоке — подождать её
+    Wait,
+    /// (id образца, название, совпадение, разбор нейросети)
+    From(String, String, f64, Json),
+}
+
+/// Копия уже проверенной в этом запуске работы: тот же набор заданий и вариант, те же
+/// картинки и ссылки, текст (без условия) совпадает почти целиком.
+fn find_copy_source(core: &Arc<Core>, wid: &str, done: &std::collections::HashSet<String>, busy: &std::collections::HashSet<String>) -> Reuse {
+    if !core.settings().get("reuse_copies").bool_or(true) {
+        return Reuse::No;
+    }
+    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(w) = ws.works.iter().find(|w| w.id == wid) else { return Reuse::No };
+    let key = |x: &super::core::Work| {
+        let set = core.set_for_work(&ws, x);
+        let sc = core.scan(&ws, x);
+        let v = sc.variant_used.or(sc.variant_in_name).or(sc.variant_in_text).unwrap_or_default();
+        let mut pages: Vec<u64> = x.pages.iter().map(|p| p.hash).collect();
+        pages.sort_unstable();
+        let mut urls = x.all_urls();
+        urls.sort();
+        (set.map(|s| s.id.clone()), v, pages, urls)
+    };
+    let mine = key(w);
+    // кандидаты — пары из антиплагиата и одинаковые работы напарников
+    let mut cands: Vec<String> = Vec::new();
+    for (a, b, _) in &ws.plag {
+        if a == wid { cands.push(b.clone()) } else if b == wid { cands.push(a.clone()) }
+    }
+    for (a, b) in &ws.team_dups {
+        if a == wid { cands.push(b.clone()) } else if b == wid { cands.push(a.clone()) }
+    }
+    if cands.is_empty() {
+        return Reuse::No;
+    }
+    let task_sh: std::collections::HashSet<u64> = core
+        .set_for_work(&ws, w)
+        .map(|s| s.variants.values().flat_map(|v| super::detect::shingle_set(&format!("{}\n{}", v.task_visible, v.key))).collect())
+        .unwrap_or_default();
+    let own = |t: &str| -> std::collections::HashSet<u64> { super::detect::shingle_set(t).difference(&task_sh).copied().collect() };
+    let mine_sh = own(&w.visible);
+    let mut wait = false;
+    let mut best: Option<(f64, String)> = None;
+    for cid in cands {
+        let Some(c) = ws.works.iter().find(|x| x.id == cid) else { continue };
+        if key(c) != mine {
+            continue;
+        }
+        let same = if c.hash == w.hash && c.size == w.size {
+            1.0
+        } else {
+            let other = own(&c.visible);
+            let union = mine_sh.union(&other).count();
+            if union < 20 {
+                continue;
+            }
+            mine_sh.intersection(&other).count() as f64 / union as f64
+        };
+        if same < COPY_SAME {
+            continue;
+        }
+        if done.contains(&cid) {
+            if best.as_ref().map(|(s, _)| same > *s).unwrap_or(true) {
+                best = Some((same, cid));
+            }
+        } else if busy.contains(&cid) {
+            wait = true;
+        }
+    }
+    if let Some((same, cid)) = best {
+        let o = ws.outcomes.get(&cid);
+        if let Some(o) = o.filter(|o| o.status == "done" && !o.llm.is_null()) {
+            let c = ws.works.iter().find(|x| x.id == cid).map(|x| if x.student.is_empty() { x.name.clone() } else { x.student.clone() }).unwrap_or_default();
+            return Reuse::From(cid, c, same, o.llm.clone());
+        }
+    }
+    if wait { Reuse::Wait } else { Reuse::No }
+}
+
+/// Разбор копии — по образцу: оценка, ошибки и отзыв пересчитываются правилами
+/// приложения для самой копии (списывание, ИИ, срок, рубрика).
+fn apply_copy(core: &Arc<Core>, wid: &str, src_name: &str, same: f64, llm: &Json, tag: &str) -> Result<(), String> {
+    reset_tokens(core, wid);
+    {
+        let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(o) = ws.outcomes.get_mut(wid) {
+            o.log.clear();
+            o.review.clear();
+        }
+    }
+    let client = McpClient::new(core.clone(), tag);
+    client.initialize()?;
+    let mut j = llm.clone();
+    j.set("work_id", wid);
+    client.call("submit_grade", j)?;
+    let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(o) = ws.outcomes.get_mut(wid) {
+        o.review.insert(0, format!("Разбор взят у работы «{}»: тексты совпадают на {:.0} %, поэтому нейросеть эту работу отдельно не читала. Правила списывания применены как обычно. Если нужно, перепроверьте её отдельно.", src_name, same * 100.0));
+    }
+    Ok(())
+}
+
 /// Проверка всех выбранных работ (запускается в отдельном потоке).
 pub fn run(core: Arc<Core>, ids: Vec<String>) {
     if core.running.swap(true, Ordering::SeqCst) {
@@ -417,9 +526,16 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
     let done = Arc::new(Mutex::new(0usize));
     let provider = Arc::new(Mutex::new(provider));
     let mut handles = Vec::new();
+    // для копий: какие работы уже проверены нейросетью в этом запуске и какие проверяются сейчас
+    let checked: Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+    let busy: Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
+    let waited: Arc<Mutex<std::collections::HashSet<String>>> = Default::default();
     for t in 0..conc.min(total.max(1)) {
         let core = core.clone();
         let done = done.clone();
+        let checked = checked.clone();
+        let busy = busy.clone();
+        let waited = waited.clone();
         let provider = provider.clone();
         let second = second.clone();
         let anon = anon.clone();
@@ -445,6 +561,7 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                 };
                 emit_progress(&core, &wid, "done", "cache", &format!("Без изменений — результат прошлой проверки ({}), оценка {}", super::report::fmt_dt(when), grade.map(super::core::fmt_grade).unwrap_or("—".into())));
                 core.log(&format!("{}: без изменений с прошлой проверки — взят сохранённый результат, нейросеть не вызывалась", wid));
+                checked.lock().unwrap_or_else(|e| e.into_inner()).insert(wid.clone());
                 let d = {
                     let mut d = done.lock().unwrap_or_else(|e| e.into_inner());
                     *d += 1;
@@ -454,15 +571,45 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                 (core.emit)("run_state", Json::obj().with("running", true).with("done", d).with("total", core.run_total.load(Ordering::SeqCst)).to_string());
                 continue;
             }
+            // копия работы, которую нейросеть уже проверила в этом запуске, — берём её разбор
+            let reuse = {
+                let c = checked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let b = busy.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                find_copy_source(&core, &wid, &c, &b)
+            };
+            if let Reuse::Wait = reuse {
+                // образец проверяется в другом потоке: один раз откладываем копию в конец очереди
+                let mut q = core.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if !q.is_empty() && waited.lock().unwrap_or_else(|e| e.into_inner()).insert(wid.clone()) {
+                    q.push(wid.clone());
+                    continue;
+                }
+            }
             CURRENT.with(|c| *c.borrow_mut() = wid.clone());
+            busy.lock().unwrap_or_else(|e| e.into_inner()).insert(wid.clone());
             let t0 = Instant::now();
             let p_now = provider.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let res = check_one(&core, &p_now, &wid, &format!("поток {}", t + 1));
+            let copied = match &reuse {
+                Reuse::From(_, name, same, _) => Some((name.clone(), *same)),
+                _ => None,
+            };
+            let res = match &reuse {
+                Reuse::From(_, name, same, llm) => apply_copy(&core, &wid, name, *same, llm, &format!("поток {}", t + 1)).map(|_| None),
+                _ => check_one(&core, &p_now, &wid, &format!("поток {}", t + 1)),
+            };
+            busy.lock().unwrap_or_else(|e| e.into_inner()).remove(&wid);
+            if res.is_ok() && copied.is_none() {
+                checked.lock().unwrap_or_else(|e| e.into_inner()).insert(wid.clone());
+            }
             // уточнённый контекст (из ошибки сервера) — для следующих работ
             if let Ok(Some(n)) = &res {
                 provider.lock().unwrap_or_else(|e| e.into_inner()).num_ctx = *n;
             }
-            let res = res.and_then(|_| {
+            let res = res.and_then(|r| {
+                // копия: вторые модели смотрели образец
+                if copied.is_some() {
+                    return Ok(r);
+                }
                 for (k, sp) in second.iter().enumerate() {
                     if should_stop(&core) {
                         break;
@@ -514,7 +661,13 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                         o.fingerprint = fp;
                     }
                     core.cache_store(&wid);
-                    emit_progress(&core, &wid, "done", "done", &format!("Готово за {:.1} с — оценка {}", ms as f64 / 1000.0, grade.map(super::core::fmt_grade).unwrap_or("—".into())));
+                    match &copied {
+                        Some((name, same)) => {
+                            core.log(&format!("{}: совпадает с работой «{}» на {:.0} % — разбор взят у неё, нейросеть не вызывалась", wid, name, same * 100.0));
+                            emit_progress(&core, &wid, "done", "copy", &format!("Копия работы «{}» ({:.0} %) — разбор взят у неё, оценка {}", name, same * 100.0, grade.map(super::core::fmt_grade).unwrap_or("—".into())));
+                        }
+                        None => emit_progress(&core, &wid, "done", "done", &format!("Готово за {:.1} с — оценка {}", ms as f64 / 1000.0, grade.map(super::core::fmt_grade).unwrap_or("—".into()))),
+                    }
                 }
                 Err(e) => {
                     let stopped = core.cancel.load(Ordering::SeqCst) || e == STOPPED;
