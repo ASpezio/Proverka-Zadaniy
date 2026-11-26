@@ -138,6 +138,12 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.3.1
+* Никаких системных окон для вопросов: `askConfirm` — модальное окно в приложении. Событие ядра `notify` main.rs пересылает в окно как `notice` (`showNotice`), уведомление Windows — только если окно не перед глазами (кроме `test`).
+* Папка данных переносится: `data_dir_move` копирует данные и пишет `moved_to.txt` в стандартную папку (`core::standard_data_dir`, `moved_dir`); переносной режим важнее.
+* Журнал: порядок строк — только в интерфейсе (`JSORT`, `sortStudents`, localStorage `jSort`); раздача вариантов «по алфавиту».
+* Свои стили: `settings.custom_styles` [{id, name, base, opts}], CSS — `customStyleCss` под `:root[data-cstyle]` и `.pv[data-cstyle]`, `data-skin`/`data-style` — стиль-основа.
+
 ### Версия 1.3: Moodle напрямую, рубрика, история
 * `moodle_ws.rs` — REST веб-служб Moodle (`Ws::call`, `get_token` через login/token.php, `grade_rows` → строки как у экспорта журнала оценок, `save_grade`). API: `moodle_ws_connect|disconnect|courses|course|fetch|grades|push`. Ключ — `settings.moodle_ws.token` (в экспорт без «ключей» не попадает). `moodle_ws_fetch` складывает ответы в папку как у архива «Скачать все ответы» и вызывает `moodle_import`; `moodle_ws_grades` подаёт строки в `moodle_import_grades` (`p.rows`, `p.scales`).
 * Тема журнала помнит заголовок и шкалу Moodle (`Topic.moodle`, `mscale`) и короткое имя (`short`, `journal::auto_short`); `moodle::export_gradebook_named` выгружает под ними.

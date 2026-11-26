@@ -609,7 +609,36 @@ pub fn default_data_dir() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir());
     let dir = base.join("proverka");
     migrate_data_dir(&base.join("ru.pspu.proverka"), &dir);
+    // папку данных можно перенести (Настройки → «О программе» → «Сменить папку»):
+    // в стандартной папке остаётся только указатель `moved_to.txt`
+    if let Some(p) = moved_dir(&dir) {
+        return p;
+    }
     dir
+}
+
+/// Стандартная папка данных (без учёта переноса и переносного режима).
+pub fn standard_data_dir() -> PathBuf {
+    let base = std::env::var("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("XDG_CONFIG_HOME").map(PathBuf::from))
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    base.join("proverka")
+}
+
+/// Куда перенесены данные: путь из `moved_to.txt` стандартной папки, если та папка доступна.
+pub fn moved_dir(std_dir: &Path) -> Option<PathBuf> {
+    let t = std::fs::read_to_string(std_dir.join("moved_to.txt")).ok()?;
+    let p = PathBuf::from(t.trim());
+    if t.trim().is_empty() || p == std_dir {
+        return None;
+    }
+    // флешка не вставлена или диск отключён — работаем в стандартной папке, указатель не трогаем
+    if std::fs::create_dir_all(&p).is_err() || !p.is_dir() {
+        return None;
+    }
+    Some(p)
 }
 
 /// Переносной режим: данные лежат рядом с программой, в папке «Данные» (например, на флешке).

@@ -68,7 +68,7 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         let settings_lock = method == "set_settings" && {
             // во время проверки можно менять только то, что не влияет на неё: оформление, звук, трей
             let s = p.get("settings");
-            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects" | "reminders" | "backup"))
+            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_styles" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects" | "reminders" | "backup"))
         };
         if LOCKED_WHILE_RUNNING.contains(&method) || settings_lock {
             return Err(LOCK_MESSAGE.into());
@@ -2353,11 +2353,72 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             Ok(super::history::arc_summary(&core.data_dir).with("removed", n))
         }
 
+        "data_dir_move" => {
+            // перенести настройки, сессию и журнал в другую папку; вступает в силу после перезапуска
+            let to = std::path::PathBuf::from(p.get("dir").str_or("").trim());
+            let std_dir = super::core::standard_data_dir();
+            if to.as_os_str().is_empty() {
+                return Err("Выберите папку".into());
+            }
+            if super::core::portable_dir().map(|d| d == core.data_dir).unwrap_or(false) {
+                return Err("Включён переносной режим: данные лежат в папке «Данные» рядом с программой. Чтобы перенести их, сначала выключите переносной режим (удалите portable.txt рядом с программой).".into());
+            }
+            // «вернуть стандартную» — тоже перенос, в стандартную папку
+            let to = if p.get("reset").bool_or(false) { std_dir.clone() } else { to };
+            if to == core.data_dir {
+                return Err("Данные уже лежат в этой папке".into());
+            }
+            if to.starts_with(&core.data_dir) {
+                return Err("Нельзя перенести данные внутрь их же папки".into());
+            }
+            std::fs::create_dir_all(&to).map_err(|e| format!("Не удалось создать папку {}: {}", to.display(), e))?;
+            if to != std_dir && to.join("settings.json").exists() && !p.get("use_existing").bool_or(false) {
+                return Ok(Json::obj().with("exists", true).with("dir", to.to_string_lossy().to_string()));
+            }
+            core.save_session();
+            core.save_settings();
+            core.journal.lock().unwrap_or_else(|e| e.into_inner()).save();
+            let mut n = 0;
+            if !(to.join("settings.json").exists() && p.get("use_existing").bool_or(false)) {
+                fn copy_dir(a: &std::path::Path, b: &std::path::Path, skip: &std::path::Path) -> usize {
+                    let _ = std::fs::create_dir_all(b);
+                    let mut n = 0;
+                    if let Ok(rd) = std::fs::read_dir(a) {
+                        for e in rd.flatten() {
+                            let p = e.path();
+                            if p == skip || e.file_name() == "moved_to.txt" {
+                                continue;
+                            }
+                            let t = b.join(e.file_name());
+                            if p.is_dir() {
+                                n += copy_dir(&p, &t, skip);
+                            } else if std::fs::copy(&p, &t).is_ok() {
+                                n += 1;
+                            }
+                        }
+                    }
+                    n
+                }
+                n = copy_dir(&core.data_dir, &to, &to);
+                // прежняя папка — чтобы пути в сессии поправились при первом запуске из новой
+                let _ = std::fs::write(to.join("data_dir.txt"), core.data_dir.to_string_lossy().as_bytes());
+            }
+            let _ = std::fs::create_dir_all(&std_dir);
+            if to == std_dir {
+                let _ = std::fs::remove_file(std_dir.join("moved_to.txt"));
+            } else {
+                std::fs::write(std_dir.join("moved_to.txt"), to.to_string_lossy().as_bytes()).map_err(|e| format!("Не удалось запомнить новую папку: {}", e))?;
+            }
+            core.log(&format!("Папка данных: {} → {} (после перезапуска)", core.data_dir.display(), to.display()));
+            Ok(Json::obj().with("dir", to.to_string_lossy().to_string()).with("files", n).with("restart", true))
+        }
+
         "portable_info" => {
             let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
             Ok(Json::obj()
                 .with("portable", super::core::portable_dir().map(|d| d == core.data_dir).unwrap_or(false))
                 .with("data_dir", core.data_dir.to_string_lossy().to_string())
+                .with("standard", core.data_dir == super::core::standard_data_dir())
                 .with("exe_dir", exe_dir.map(|d| d.to_string_lossy().to_string()).unwrap_or_default()))
         }
 

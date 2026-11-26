@@ -104,7 +104,7 @@ pub fn export(core: &Core, dest: &str, parts: Parts) -> Result<Json, String> {
         if !parts.settings {
             // только оформление
             let mut only = Json::obj();
-            for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_fonts", "sound", "sound_pack", "sound_volume", "animations"] {
+            for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_styles", "custom_fonts", "sound", "sound_pack", "sound_volume", "animations"] {
                 if !st.get(k).is_null() {
                     only.set(k, st.get(k).clone());
                 }
@@ -303,14 +303,14 @@ pub fn import(core: &Core, path: &str, want: Parts) -> Result<Json, String> {
                     next.set("moodle_ws", cur.get("moodle_ws").clone());
                 }
                 if !(want.looks && has.looks) {
-                    for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_fonts"] {
+                    for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_styles", "custom_fonts"] {
                         next.set(k, cur.get(k).clone());
                     }
                 }
                 cur = next;
                 done.push("настройки");
             } else {
-                for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_fonts"] {
+                for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_styles", "custom_fonts"] {
                     if !incoming.get(k).is_null() {
                         cur.set(k, incoming.get(k).clone());
                     }

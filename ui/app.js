@@ -82,10 +82,47 @@ async function pickFiles({ directory = false, filters = true, multiple = true, t
   return p ? p.split(";").map((s) => s.trim()).filter(Boolean) : [];
 }
 
-async function askConfirm(text) {
-  if (TAURI && TAURI.dialog?.ask) return await TAURI.dialog.ask(text, { title: "Проверка заданий", kind: "warning", okLabel: "Да", cancelLabel: "Отмена" });
-  return confirm(text);
+/** Вопрос «да/нет» — окном внутри приложения (не системным окном Windows). */
+function askConfirm(text, { ok = "Да", cancel = "Отмена", title = "Подтвердите" } = {}) {
+  return new Promise((resolve) => {
+    const m = document.createElement("div");
+    m.className = "modal-veil ask-veil";
+    m.innerHTML = `<div class="modal ask" role="alertdialog" aria-modal="true" style="width:min(480px,100%)">
+      <div class="modal-head"><h2>${esc(title)}</h2></div>
+      <div class="modal-body"><p style="margin:0;white-space:pre-line">${esc(text)}</p></div>
+      <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" data-a="0">${esc(cancel)}</button><button class="btn primary" data-a="1">${esc(ok)}</button></div></div>`;
+    document.body.appendChild(m);
+    requestAnimationFrame(() => m.classList.add("on"));
+    SND.play("pop");
+    const done = (v) => { m.classList.remove("on"); document.removeEventListener("keydown", key, true); setTimeout(() => m.remove(), 250); resolve(v); };
+    const key = (e) => { if (e.key === "Escape") { e.stopPropagation(); done(false); } if (e.key === "Enter") { e.preventDefault(); done(true); } };
+    document.addEventListener("keydown", key, true);
+    m.querySelectorAll("[data-a]").forEach((b) => (b.onclick = () => done(b.dataset.a === "1")));
+    m.onclick = (e) => { if (e.target === m) done(false); };
+    m.querySelector('[data-a="1"]').focus();
+  });
 }
+
+/** Сообщения ядра (проверка завершилась с ошибками, ждут решения по ИИ, скоро срок…) — в окне приложения.
+ *  Уведомление Windows приходит, только когда окно свёрнуто или в фоне. */
+function showNotice(n) {
+  if (!n || n.kind === "done" || n.kind === "update") return; // об этом приложение уже говорит само
+  const go_ = { ai: ["Открыть проверку", () => go("check")], errors: ["Открыть проверку", () => go("check")], deadline: ["Открыть журнал", () => go("journal")] }[n.kind];
+  const box = $("#notices") || (() => { const d = document.createElement("div"); d.id = "notices"; d.setAttribute("aria-live", "polite"); document.body.appendChild(d); return d; })();
+  const el = document.createElement("div");
+  el.className = "notice " + (n.kind === "errors" ? "err" : "");
+  el.innerHTML = `<div class="n-body"><b>${esc(n.title || "Проверка заданий")}</b>${n.body ? `<span>${esc(n.body)}</span>` : ""}</div>
+    <div class="n-act">${go_ ? `<button class="btn sm" data-n="go">${esc(go_[0])}</button>` : ""}<button class="btn sm ghost" data-n="x" title="Закрыть">×</button></div>`;
+  const close = () => { el.classList.add("out"); setTimeout(() => el.remove(), 300); };
+  el.querySelector('[data-n="x"]').onclick = close;
+  el.querySelector('[data-n="go"]')?.addEventListener("click", () => { close(); go_[1](); });
+  box.appendChild(el);
+  SND.play("notify");
+  // вопросы и ошибки висят, пока их не закроют; остальное уходит само
+  if (!["ai", "errors", "deadline"].includes(n.kind)) setTimeout(close, 9000);
+}
+onEvent("notice", showNotice);
+if (!TAURI) onEvent("notify", showNotice);
 
 /** Небольшое окно ввода текста (в окне приложения prompt() ненадёжен). */
 function askText(title, value = "", placeholder = "") {
@@ -3940,8 +3977,9 @@ function openMoodleJournal() {
           <label class="rg-n">с <input class="input sm" id="mjFrom" type="number" min="1" value="1"></label>
           <label class="rg-n">по <input class="input sm" id="mjTo" type="number" min="1" value="${Math.max(0, ...sets().map((x) => x.variant_count || 0)) || 30}"></label>
           <label class="rg-chk"><input type="checkbox" id="mjPair" checked> один на пару</label>
+          <label class="rg-chk" title="Первый вариант — первому по алфавиту, а не первому в списке группы"><input type="checkbox" id="mjAlpha"> по алфавиту</label>
           <button class="btn sm" id="mjDeal">Раздать</button></div>
-        <p class="small muted" style="margin:0">Варианты раздаются с первого человека в списке группы: «с 1 по 30», «с 1 по 12» — после последнего снова с первого. Посмотреть и поправить руками — «Список и варианты».</p>
+        <p class="small muted" style="margin:0">Варианты раздаются с первого человека в списке группы (или с первого по алфавиту): «с 1 по 30», «с 1 по 12» — после последнего снова с первого. Посмотреть и поправить руками — «Список и варианты».</p>
       </div></details>
     </div>
     <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" id="mjClose">Закрыть</button></div></div>`;
@@ -4038,7 +4076,8 @@ function openMoodleJournal() {
     if (!gr?.roster.length) { toast("Сначала загрузите список группы — «Список и варианты»", "err"); return; }
     const teams = gr.teams || {};
     const units = [];
-    gr.roster.forEach((name) => { const t = $("#mjPair", m).checked && teams[name]; const u = t ? units.find((x) => x.team === t) : null; if (u) u.names.push(name); else units.push({ team: t || null, names: [name] }); });
+    const order = $("#mjAlpha", m).checked ? [...gr.roster].sort(ruCmp) : gr.roster;
+    order.forEach((name) => { const t = $("#mjPair", m).checked && teams[name]; const u = t ? units.find((x) => x.team === t) : null; if (u) u.names.push(name); else units.push({ team: t || null, names: [name] }); });
     const vals = dealVariants(units.length, $("#mjDealMode", m).value, +$("#mjFrom", m).value || 1, +$("#mjTo", m).value || 1);
     const variants = {};
     units.forEach((u, i) => u.names.forEach((n) => { if (vals[i]) variants[n] = vals[i]; }));
@@ -4051,6 +4090,20 @@ function openMoodleJournal() {
 }
 
 // ---------------------------------------------------------------- 6. Журнал группы
+/** Порядок строк журнала (только показ: список группы и раздача вариантов не меняются). */
+const JSORT = [["list", "как в списке группы"], ["az", "по алфавиту А–Я"], ["za", "по алфавиту Я–А"], ["avg", "по среднему: лучшие сверху"], ["avg_up", "по среднему: слабые сверху"], ["debts", "по долгам: больше сверху"]];
+function jSort() { if (S.jSortV) return S.jSortV; try { return localStorage.getItem("jSort") || "list"; } catch (e) { return "list"; } }
+const ruCmp = (a, b) => a.localeCompare(b, "ru", { sensitivity: "base" });
+function sortStudents(list, g) {
+  const v = jSort(), a = [...list];
+  const avg = (s) => (s.avg == null ? -1 : +s.avg);
+  if (v === "az") a.sort((x, y) => ruCmp(x.name, y.name));
+  else if (v === "za") a.sort((x, y) => ruCmp(y.name, x.name));
+  else if (v === "avg") a.sort((x, y) => avg(y) - avg(x) || ruCmp(x.name, y.name));
+  else if (v === "avg_up") a.sort((x, y) => (avg(x) < 0 ? 99 : avg(x)) - (avg(y) < 0 ? 99 : avg(y)) || ruCmp(x.name, y.name));
+  else if (v === "debts") a.sort((x, y) => (y.missing || 0) - (x.missing || 0) || ruCmp(x.name, y.name));
+  return a;
+}
 S.jFilter = { semester: "", subject: "" };
 try { Object.assign(S.jFilter, JSON.parse(localStorage.getItem("jFilter") || "{}")); } catch (e) { /* нет хранилища */ }
 /** Журнал с текущим фильтром (семестр, предмет). */
@@ -4100,6 +4153,7 @@ function renderJournal() {
   const filterBar = `<div class="j-filter">
       <label>Семестр <select class="select input sm" id="jfSem"><option value="">все</option>${(j.semesters || []).map((x) => `<option ${x === filt.semester ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
       <label>Предмет <select class="select input sm" id="jfSub"><option value="">все</option>${(j.subjects || []).map((x) => `<option ${x === filt.subject ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+      <label>Порядок <select class="select input sm" id="jfSort">${JSORT.map(([v, t]) => `<option value="${v}" ${v === jSort() ? "selected" : ""}>${t}</option>`).join("")}</select></label>
       ${filt.semester || filt.subject ? `<button class="btn sm ghost" id="jfReset">Сбросить</button>` : ""}
     </div>`;
   if (!j.groups.length) {
@@ -4143,7 +4197,7 @@ function renderJournal() {
       <thead><tr><th class="num">№</th><th class="name">Студент</th>${topics.map(head).join("")}
         <th class="sum">Средний</th>${showW ? `<th class="sum">По работам</th>` : ""}${g.has_tests ? `<th class="sum">По тестам</th>` : ""}${own.map((a) => `<th class="sum own" title="${esc(a.codes.join(", "))}">${esc(a.name)}</th>`).join("")}
         <th class="sum">Нарушения</th><th class="sum">Долги</th></tr></thead>
-      <tbody>${g.students.map((s, i) => `<tr style="animation:fadeIn .4s ${Math.min(i, 30) * 18}ms both">
+      <tbody>${sortStudents(g.students, g).map((s, i) => `<tr style="animation:fadeIn .4s ${Math.min(i, 30) * 18}ms both">
         <td class="num">${i + 1}</td>
         <td class="name ${s.in_roster || !g.roster.length ? "" : "notroster"}" data-stud="${esc(s.name)}" title="${s.in_roster || !g.roster.length ? "Щёлкните: история студента, переименовать, удалить" : "Нет в списке группы — щёлкните: история, переименовать, объединить или удалить"}">${esc(s.name)}${g.teams?.[s.name] ? ` <span class="j-var" title="Работает в паре">пара ${esc(g.teams[s.name])}</span>` : ""}${g.variants?.[s.name] ? ` <span class="j-var" title="Вариант по списку группы">в. ${esc(g.variants[s.name])}</span>` : ""}</td>
         ${topics.map((t) => cell(s, t)).join("")}
@@ -4159,6 +4213,8 @@ function renderJournal() {
     await loadJournal(); renderJournal();
   };
   $("#jfSem").onchange = refilter; $("#jfSub").onchange = refilter;
+  $("#jfSort").onchange = (e) => { try { localStorage.setItem("jSort", e.target.value); } catch (x) { /* нет хранилища */ } S.jSortV = e.target.value; renderJournal(); };
+  $(".jt th.name")?.addEventListener("click", () => { const v = jSort() === "az" ? "za" : "az"; try { localStorage.setItem("jSort", v); } catch (x) { /* нет хранилища */ } S.jSortV = v; renderJournal(); });
   $("#jfReset")?.addEventListener("click", () => { $("#jfSem").value = ""; $("#jfSub").value = ""; refilter(); });
   $$(".group-tabs [data-g]").forEach((b) => (b.onclick = () => { if (b.dataset.g === "__new") editRoster(""); else { S.jGroup = b.dataset.g; renderJournal(); } }));
   $("#jRoster").onclick = () => editRoster(S.jGroup);
@@ -4495,6 +4551,8 @@ function editRoster(group) {
       <label class="rg-n" title="Последний вариант (сколько вариантов в задании)">по <input class="input sm" id="rgN" type="number" min="1" max="999" value="${nVar}"></label>
       <button class="btn sm" id="rgDeal">Раздать</button>
       <label class="rg-chk" title="Напарники получают один вариант на двоих"><input type="checkbox" id="rgPairVar" checked> одинаковый у пары</label>
+      <label class="rg-chk" title="Первый вариант — первому по алфавиту; порядок списка не меняется"><input type="checkbox" id="rgAlpha"> по алфавиту</label>
+      <button class="btn sm ghost" id="rgSortAz" title="Расставить сам список группы по алфавиту">Список — по алфавиту А–Я</button>
     </div>
     <div class="rg-tools">
       <span class="rg-tools-t">Пары</span>
@@ -4520,7 +4578,8 @@ function editRoster(group) {
     const mode = $("#rgMode").value;
     // единицы раздачи: пара (одинаковый номер в «Пара») или отдельный студент
     const units = [];
-    rows.forEach((r) => {
+    const order = $("#rgAlpha").checked ? [...rows].sort((a, b) => ruCmp(a.name, b.name)) : rows;
+    order.forEach((r) => {
       const t = $("#rgPairVar").checked && String(r.team || "").trim();
       const u = t ? units.find((x) => x.team === t) : null;
       if (u) u.rows.push(r); else units.push({ team: t || null, rows: [r] });
@@ -4530,6 +4589,7 @@ function editRoster(group) {
     render();
     toast(mode === "clear" ? "Варианты убраны" : "Варианты розданы — не забудьте сохранить");
   };
+  $("#rgSortAz").onclick = () => { rows.sort((a, b) => ruCmp(a.name, b.name)); render(); toast("Список расставлен по алфавиту — не забудьте сохранить"); };
   $("#rgPairs").onclick = () => { rows.forEach((r, i) => (r.team = String(Math.floor(i / 2) + 1))); render(); toast(rows.length % 2 ? "Пары составлены, последний студент — один в паре" : "Пары составлены по порядку списка"); };
   $("#rgNoPairs").onclick = () => { rows.forEach((r) => (r.team = "")); render(); };
   const merge = (list, from) => {
@@ -4782,7 +4842,51 @@ const STYLES = [
   { id: "terminal", name: "Терминал", note: "чёрный экран, зелёный моноширинный текст", palette: false, dark: true, ui: ["Cascadia Code", "Consolas"], head: ["Cascadia Code", "Consolas"] },
   { id: "neon", name: "Неон", note: "ночь, светящиеся контуры и градиенты", palette: false, dark: true, ui: ["Inter"], head: ["Inter"] },
 ];
-const styleOf = (id) => STYLES.find((x) => x.id === id) || STYLES[0];
+/** Свои стили: основа — один из готовых стилей, поверх — скругления, тени, рамки, фон листа, плотность, кнопки. */
+const customStyles = () => (settings().custom_styles || []).filter((x) => x && x.id && STYLES.some((b) => b.id === x.base));
+const styleOf = (id) => {
+  const b = STYLES.find((x) => x.id === id);
+  if (b) return b;
+  const c = customStyles().find((x) => x.id === id);
+  if (c) { const base = STYLES.find((x) => x.id === c.base); return { ...base, id: c.id, name: c.name, note: `свой стиль на основе «${base.name}»`, custom: c, skin: base.id }; }
+  return STYLES[0];
+};
+const skinOf = (st) => st.skin || st.id;
+const CS_DEF = { radius: 14, shadow: "base", border: 1, pattern: "base", margin: "base", density: "normal", btn: "base", caps: false, blur: 0 };
+/** CSS своего стиля: переопределения поверх стиля-основы для :root[data-cstyle] и превью. */
+function customStyleCss(c) {
+  const o = { ...CS_DEF, ...(c.opts || {}) };
+  const R = `:root[data-cstyle="${c.id}"]`, P = `.pv[data-cstyle="${c.id}"]`;
+  const sel = (x) => `${R} ${x}, ${P} ${x}`;
+  const out = [];
+  const r = Math.max(0, Math.min(30, +o.radius));
+  out.push(`${R}, ${P} { --r-s: ${Math.round(r * 0.57)}px; --r-m: ${r}px; --r-l: ${Math.round(r * 1.57)}px; }`);
+  out.push(`${sel(".card")}, ${sel(".modal")}, ${sel(".drawer")}, ${sel(".sheet")} { border-radius: var(--r-l) !important; }`);
+  out.push(`${sel(".btn")}, ${sel(".input")}, ${sel(".select")}, ${sel(".chip")} { border-radius: ${o.btn === "pill" ? "999px" : o.btn === "square" ? "2px" : "var(--r-s)"} !important; }`);
+  const sh = { none: "none", soft: "0 1px 0 rgba(0,0,0,.04), 0 10px 30px -14px rgba(0,0,0,.25)", strong: "0 2px 0 rgba(0,0,0,.06), 0 18px 40px -12px rgba(0,0,0,.45)", hard: "5px 5px 0 var(--ink)" }[o.shadow];
+  if (sh) out.push(`${R}, ${P} { --card-shadow: ${sh}; } ${sel(".card")} { box-shadow: ${sh} !important; }`);
+  const bw = Math.max(0, Math.min(4, +o.border));
+  out.push(`${sel(".card")}, ${sel(".btn")}, ${sel(".input")} { border-width: ${bw}px !important; ${bw ? "border-style: solid !important;" : ""} }`);
+  const pat = {
+    grid: "linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px)",
+    lines: "linear-gradient(var(--grid) 1px, transparent 1px)",
+    dots: "radial-gradient(var(--grid) 1.3px, transparent 1.7px)",
+    none: "none",
+  }[o.pattern];
+  if (pat) out.push(`${sel(".sheet")} { background-image: ${pat} !important; background-size: 22px 22px !important; }`);
+  if (o.margin === "on") out.push(`${sel(".margin-line")} { display: block !important; }`);
+  if (o.margin === "off") out.push(`${sel(".margin-line")} { display: none !important; }`);
+  if (o.density === "compact") out.push(`${sel(".view")} { padding-top: 22px !important; padding-bottom: 40px !important; } ${sel(".card.pad")}, ${sel(".pad")} { padding: 12px 14px !important; } ${sel(".btn")} { padding-top: 6px !important; padding-bottom: 6px !important; }`);
+  if (o.density === "roomy") out.push(`${sel(".view")} { padding-top: 46px !important; padding-bottom: 80px !important; } ${sel(".card.pad")}, ${sel(".pad")} { padding: 26px 28px !important; } ${sel(".btn")} { padding-top: 11px !important; padding-bottom: 11px !important; }`);
+  if (o.caps) out.push(`${sel(".page-title")}, ${sel("h2")}, ${sel("h3")} { text-transform: uppercase; letter-spacing: .04em; }`);
+  if (+o.blur > 0) out.push(`${sel(".card")}, ${sel(".rail")} { backdrop-filter: blur(${Math.min(30, +o.blur)}px); background-color: color-mix(in srgb, var(--card) 72%, transparent) !important; }`);
+  return out.join("\n");
+}
+function installCustomStyleCss() {
+  let el = document.getElementById("customStyleCss");
+  if (!el) { el = document.createElement("style"); el.id = "customStyleCss"; document.head.appendChild(el); }
+  el.textContent = customStyles().map(customStyleCss).join("\n");
+}
 const firstFont = (list) => list.find((f) => fontAvailable(f)) || list[list.length - 1];
 
 const THEME_AUTO = { id: "auto", name: "Как в Windows", note: "светлая днём, тёмная — если в системе тёмный режим" };
@@ -4929,9 +5033,11 @@ function applyTheme(id, styleId = settings().look_style) {
   root.dataset.theme = real;
   // стиль: на окне приложения и окнах поверх него; на <html> — только его цвета (data-skin),
   // чтобы превью других стилей в «Оформлении» не перекрашивались выбранным
-  root.dataset.skin = st.id;
+  installCustomStyleCss();
+  root.dataset.skin = skinOf(st);
+  if (st.custom) root.dataset.cstyle = st.id; else delete root.dataset.cstyle;
   delete root.dataset.style;
-  [$("#app"), $("#drawer"), $("#toasts"), ...$$(".modal-veil")].forEach((el) => { if (el && !el.querySelector(".look-modal")) el.dataset.style = st.id; });
+  [$("#app"), $("#drawer"), $("#toasts"), ...$$(".modal-veil")].forEach((el) => { if (el && !el.querySelector(".look-modal")) el.dataset.style = skinOf(st); });
   const dark = st.palette ? t.dark : st.dark;
   if (dark) root.dataset.dark = ""; else delete root.dataset.dark;
   renderSetState();
@@ -4995,7 +5101,7 @@ function stylePreview(st) {
     const t = allThemes().find((x) => x.id === resolveTheme(settings().theme || "paper")) || THEMES[0];
     f += ";" + Object.entries(themeVars(t)).map(([k, v]) => `${k}:${v}`).join(";");
   }
-  return `<div class="pv-frame"><div class="pv" data-style="${st.id}" style="${esc(f)}">
+  return `<div class="pv-frame"><div class="pv" data-style="${skinOf(st)}" ${st.custom ? `data-cstyle="${esc(st.id)}"` : ""} style="${esc(f)}">
     <aside class="rail"><div class="brand"><div><div class="brand-name">Проверка заданий</div><div class="brand-sub">проверка работ</div></div></div>
       <nav class="steps"><div class="ribbon"></div>${["Задания", "Работы", "Нейросеть", "Проверка"].map((t, i) => `<div class="step ${i === 1 ? "active" : i === 0 ? "done" : ""}"><span class="step-n">${i + 1}</span><span class="step-t">${t}</span></div>`).join("")}</nav></aside>
     <div class="sheet-wrap"><div class="sheet"><div class="margin-line"></div><div class="view">
@@ -5058,6 +5164,76 @@ function editTheme(t0, done) {
 }
 
 /** Файл оформления: стиль, цвета (своя схема целиком), шрифты с файлами своих шрифтов. */
+/** Экспорт одного своего стиля в файл (вместе с цветовой схемой и шрифтами, если они свои). */
+async function exportStyle(c) {
+  const out = { type: "proverka-look", version: 1, created: new Date().toISOString(), name: c.name, style: c.base, custom_style: c };
+  const path = await pickSave(`${c.name.replace(/[\\/:*?"<>|]/g, "_")}.json`, "json");
+  if (!path) return;
+  try { await api("save_text", { path, text: JSON.stringify(out, null, 1) }); toast("Стиль сохранён в файл"); } catch (e) { toast(String(e), "err"); }
+}
+
+/** Редактор своего стиля: основа + настройки; всё приложение сразу показывает результат. */
+function editStyle(c0, done) {
+  const isNew = !c0;
+  const c = c0 ? JSON.parse(JSON.stringify(c0)) : { id: "s" + Date.now().toString(36), name: "Мой стиль", base: styleOf(settings().look_style).skin || styleOf(settings().look_style).id, opts: { ...CS_DEF } };
+  c.opts = { ...CS_DEF, ...(c.opts || {}) };
+  const before = { look_style: settings().look_style, custom_styles: settings().custom_styles || [] };
+  const m = document.createElement("div");
+  m.className = "modal-veil";
+  const opt = (id, label, list, val) => `<label class="field"><span>${label}</span><select class="select input" data-cs="${id}">${list.map(([v, t]) => `<option value="${v}" ${String(val) === String(v) ? "selected" : ""}>${t}</option>`).join("")}</select></label>`;
+  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(760px,100%)">
+    <div class="modal-head"><h2>${isNew ? "Новый стиль" : "Стиль «" + esc(c.name) + "»"}</h2></div>
+    <div class="modal-body" style="display:grid;gap:12px">
+      <p class="small muted" style="margin:0">Берётся готовый стиль, поверх — ваши настройки. Окно приложения сразу показывает, как это выглядит; «Отмена» всё вернёт.</p>
+      <div class="grid2">
+        <label class="field"><span>Название</span><input class="input" id="csName" value="${esc(c.name)}" maxlength="40"></label>
+        ${opt("base", "Основа", STYLES.map((x) => [x.id, x.name]), c.base)}
+        <label class="field"><span>Скругление углов: <b id="csRv">${c.opts.radius}</b> px</span><input type="range" data-cs="radius" min="0" max="30" step="1" value="${c.opts.radius}"></label>
+        ${opt("btn", "Кнопки и поля", [["base", "как в основе"], ["pill", "капсулы"], ["square", "прямые углы"]], c.opts.btn)}
+        ${opt("shadow", "Тени карточек", [["base", "как в основе"], ["none", "без теней"], ["soft", "мягкие"], ["strong", "глубокие"], ["hard", "жёсткие (сдвиг)"]], c.opts.shadow)}
+        <label class="field"><span>Толщина рамок: <b id="csBv">${c.opts.border}</b> px</span><input type="range" data-cs="border" min="0" max="4" step="1" value="${c.opts.border}"></label>
+        ${opt("pattern", "Фон листа", [["base", "как в основе"], ["grid", "клетка"], ["lines", "линейка"], ["dots", "точки"], ["none", "чистый"]], c.opts.pattern)}
+        ${opt("margin", "Красные поля", [["base", "как в основе"], ["on", "есть"], ["off", "нет"]], c.opts.margin)}
+        ${opt("density", "Плотность", [["compact", "плотно"], ["normal", "обычно"], ["roomy", "просторно"]], c.opts.density)}
+        <label class="field"><span>Матовое стекло: <b id="csGv">${c.opts.blur}</b> px</span><input type="range" data-cs="blur" min="0" max="24" step="2" value="${c.opts.blur}"></label>
+      </div>
+      ${swHtml("csCaps", !!c.opts.caps, "Заголовки прописными буквами", "")}
+      <p class="small muted" style="margin:0">Цвета берутся из выбранной цветовой схемы (у стилей «Брутализм», «Газета», «Терминал», «Неон» — свои цвета основы), шрифты — из раздела «Шрифты».</p>
+    </div>
+    <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" id="csNo">Отмена</button><button class="btn primary" id="csOk">${isNew ? "Создать" : "Сохранить"}</button></div></div>`;
+  document.body.appendChild(m);
+  requestAnimationFrame(() => m.classList.add("on"));
+  // живой показ: временно подменяем стиль (без сохранения)
+  const live = () => {
+    const list = [...before.custom_styles.filter((x) => x.id !== c.id), c];
+    S.state.settings = { ...settings(), custom_styles: list, look_style: c.id };
+    applyTheme(settings().theme || "paper", c.id);
+  };
+  live();
+  m.querySelectorAll("[data-cs]").forEach((el) => (el.oninput = el.onchange = () => {
+    const k = el.dataset.cs;
+    if (k === "base") c.base = el.value; else c.opts[k] = el.type === "range" ? +el.value : el.value;
+    $("#csRv", m).textContent = c.opts.radius; $("#csBv", m).textContent = c.opts.border; $("#csGv", m).textContent = c.opts.blur;
+    live();
+  }));
+  $("#csCaps", m).onchange = (e) => { c.opts.caps = e.target.checked; live(); };
+  $("#csName", m).oninput = (e) => { c.name = e.target.value.trim() || "Мой стиль"; };
+  const close = () => { m.classList.remove("on"); setTimeout(() => m.remove(), 250); };
+  $("#csNo", m).onclick = () => {
+    S.state.settings = { ...settings(), ...before };
+    applyTheme(settings().theme || "paper", before.look_style);
+    close();
+  };
+  $("#csOk", m).onclick = async () => {
+    c.name = $("#csName", m).value.trim() || "Мой стиль";
+    const list = [...before.custom_styles.filter((x) => x.id !== c.id), c];
+    await saveSettings({ custom_styles: list, look_style: c.id });
+    applyTheme(settings().theme || "paper", c.id);
+    toast(isNew ? `Стиль «${c.name}» создан` : "Стиль сохранён");
+    close(); done && done();
+  };
+}
+
 async function exportLook(onlyTheme = null) {
   const st = settings();
   const out = { type: "proverka-look", version: 1, created: new Date().toISOString() };
@@ -5065,6 +5241,8 @@ async function exportLook(onlyTheme = null) {
   else {
     out.name = "Оформление";
     out.style = st.look_style || "notebook";
+    const cs = customStyles().find((x) => x.id === out.style);
+    if (cs) { out.custom_style = cs; out.style = cs.base; }
     const tid = st.theme || "paper";
     out.theme = customThemes().find((x) => x.id === tid) || tid;
     out.font_ui = st.font_ui || "Inter"; out.font_head = st.font_head || "Lora"; out.font_size = +st.font_size || 14.5;
@@ -5096,6 +5274,18 @@ async function importLook() {
     }
   } else if (typeof j.theme === "string" && THEMES.some((t) => t.id === j.theme)) patch.theme = j.theme;
   if (j.style && STYLES.some((x) => x.id === j.style)) patch.look_style = j.style;
+  // свой стиль (из «Экспорт оформления» или «Экспорт стиля»)
+  const cs = j.custom_style;
+  if (cs && typeof cs === "object" && STYLES.some((x) => x.id === cs.base)) {
+    const mine = settings().custom_styles || [];
+    const same = mine.find((x) => x.name === cs.name && x.base === cs.base && JSON.stringify(x.opts || {}) === JSON.stringify(cs.opts || {}));
+    if (same) patch.look_style = same.id;
+    else {
+      const c = { id: "s" + Date.now().toString(36), name: String(cs.name || "Стиль из файла").slice(0, 60), base: cs.base, opts: { ...CS_DEF, ...(cs.opts || {}) } };
+      patch.custom_styles = [...mine, c];
+      patch.look_style = c.id;
+    }
+  }
   const fonts = [...(settings().custom_fonts || [])];
   for (const f of Array.isArray(j.fonts) ? j.fonts : []) {
     try {
@@ -5129,6 +5319,10 @@ function openLook() {
     <div class="modal-body">
       <div class="lk-sec"><h3>Стиль</h3><p class="small muted">Меняет весь вид приложения: фон, панели, рамки, тени, кнопки и заголовки. Вместе со стилем ставятся подходящие шрифты (их можно поменять ниже). Меняется сразу — можно пробовать прямо во время проверки.</p>
         <div class="st-grid">${STYLES.map((x) => `<button class="st-card ${x.id === curStyle ? "on" : ""}" data-st="${x.id}">${stylePreview(x)}<span class="th-name">${esc(x.name)}</span><small>${esc(x.note)}</small></button>`).join("")}</div>
+        <div class="th-group-t">Свои стили</div>
+        <div class="st-grid">${customStyles().map((c) => { const x = styleOf(c.id); return `<button class="st-card ${x.id === curStyle ? "on" : ""}" data-st="${esc(x.id)}">${stylePreview(x)}<span class="th-name">${esc(x.name)}</span><small>${esc(x.note)}</small><span class="th-tools"><span role="button" tabindex="0" data-cs-edit="${esc(c.id)}" title="Изменить">✎</span><span role="button" tabindex="0" data-cs-exp="${esc(c.id)}" title="Экспорт в файл">⤓</span><span role="button" tabindex="0" data-cs-del="${esc(c.id)}" title="Удалить">✕</span></span></button>`; }).join("")}
+          <button class="th-card-btn th-new st-new" id="lkNewStyle"><span class="th-plus">+</span><span class="th-name">Создать стиль</span><small>на основе готового: скругления, тени, рамки, фон, плотность</small></button>
+          <button class="th-card-btn th-new st-new" id="lkImpStyle"><span class="th-plus">⤒</span><span class="th-name">Импорт стиля</span><small>из файла .json</small></button></div>
       </div>
       <div class="lk-sec" id="lkPal"><h3>Цветовая схема</h3><p class="small muted">Цвета листа, боковой панели и акцента для стилей «Тетрадь», «Стекло», «Windows 11», «Минимализм» и «Мягкий».</p>
         <div class="lk-note" id="lkPalNote" hidden>У стиля «<span id="lkPalStyle"></span>» свои цвета — цветовая схема к нему не применяется.</div>
@@ -5220,6 +5414,18 @@ function openLook() {
   $("#lkSize", m).onchange = (e) => saveSettings({ font_size: +e.target.value });
   const reopen = () => { close(); setTimeout(openLook, 260); };
   $("#lkNewTheme", m).onclick = () => editTheme(null, reopen);
+  $("#lkNewStyle", m).onclick = () => editStyle(null, reopen);
+  $("#lkImpStyle", m).onclick = async () => { if (await importLook()) reopen(); };
+  $$("[data-cs-edit]", m).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); editStyle(customStyles().find((c) => c.id === b.dataset.csEdit), reopen); }));
+  $$("[data-cs-exp]", m).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); exportStyle(customStyles().find((c) => c.id === b.dataset.csExp)); }));
+  $$("[data-cs-del]", m).forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation();
+    const c = customStyles().find((x) => x.id === b.dataset.csDel);
+    if (!(await askConfirm(`Удалить стиль «${c.name}»?`))) return;
+    const patch = { custom_styles: (settings().custom_styles || []).filter((x) => x.id !== c.id) };
+    if (settings().look_style === c.id) patch.look_style = c.base;
+    await saveSettings(patch); applyTheme(settings().theme || "paper", settings().look_style); reopen();
+  }));
   $$("[data-th-edit]", m).forEach((b) => (b.onclick = (e) => { e.stopPropagation(); editTheme(customThemes().find((t) => t.id === b.dataset.thEdit), reopen); }));
   $$("[data-th-del]", m).forEach((b) => (b.onclick = async (e) => {
     e.stopPropagation();
@@ -5433,7 +5639,7 @@ async function openSettings() {
       <div class="small muted">Оценки, отзывы и признаки ИИ предлагает нейросеть — она может ошибаться. Окончательное решение остаётся за преподавателем.</div>
       ${info.data_dir ? `<div class="small muted" style="margin-top:4px">Настройки, сессия и журнал: ${esc(info.data_dir)}</div>` : ""}
       <div class="section-actions" style="margin-top:10px">
-        ${info.data_dir ? `<button class="btn sm" id="sData">Открыть папку данных</button>` : ""}
+        ${info.data_dir ? `<button class="btn sm" id="sData">Открыть папку данных</button><button class="btn sm" id="sDataMove" title="Например, на диск D: или в папку Яндекс.Диска">Сменить папку…</button><span id="sDataStd"></span>` : ""}
         ${info.exe ? `<button class="btn sm" id="sHelp">Открыть инструкцию</button>` : ""}
       </div>
     </div>`);
@@ -5485,7 +5691,28 @@ async function openSettings() {
   let bkDir = "";
   api("backups").then((r) => { bkDir = r.dir; bkRender(r.list); }).catch(() => ($("#bkList").innerHTML = ""));
   $("#bkNow").onclick = async () => { try { const r = await api("backup_now"); bkRender(r.list); toast(r.external_error ? `Копия сохранена здесь, но не в вашу папку: ${r.external_error}` : r.external ? "Копия сохранена — и в вашу папку" : "Копия сохранена", r.external_error ? "err" : "ok"); } catch (e) { toast(String(e), "err"); } };
+  const moveData = async (dir, reset = false, use_existing = false) => {
+    try {
+      const r = await api("data_dir_move", { dir, reset, use_existing });
+      if (r.exists) {
+        const use = await askChoice(`В папке «${r.dir}» уже есть данные приложения`, [["use", "Работать с ними (текущие останутся в прежней папке)"], ["no", "Отмена"]]);
+        if (use === "use") return moveData(dir, false, true);
+        return;
+      }
+      await askConfirm(`Готово${r.files ? `: скопировано файлов ${r.files}` : ""}. Новая папка: ${r.dir}.\n\nПерезапустите приложение — оно начнёт работать с этой папкой. Прежняя папка остаётся как есть (это ещё и копия).`, { ok: "Понятно", cancel: "Закрыть", title: "Папка данных перенесена" });
+    } catch (e) { toast(String(e), "err"); }
+  };
+  $("#sDataMove")?.addEventListener("click", async () => {
+    const d = await pickFiles({ directory: true, multiple: false, title: "Новая папка для настроек, сессии и журнала" });
+    if (!d.length) return;
+    if (!(await askConfirm(`Перенести настройки, сессию и журнал в «${d[0]}»? Данные скопируются туда, и после перезапуска приложение будет работать с ними.`))) return;
+    moveData(d[0]);
+  });
   api("portable_info").then((pi) => {
+    if (!pi.standard && !pi.portable && $("#sDataStd")) {
+      $("#sDataStd").innerHTML = `<button class="btn sm ghost" id="sDataBack">Вернуть стандартную</button>`;
+      $("#sDataBack").onclick = async () => { if (await askConfirm("Вернуть данные в стандартную папку (%APPDATA%\\proverka)? Текущие данные скопируются туда.")) moveData("", true); };
+    }
     const box = $("#sPortable");
     if (!box) return;
     box.innerHTML = pi.portable

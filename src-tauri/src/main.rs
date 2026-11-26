@@ -276,6 +276,8 @@ fn main() {
                 }
                 // уведомление Windows — если включено и (по настройке) окно не перед глазами
                 if event == "notify" {
+                    // предупреждения и вопросы — всегда в окне приложения; Windows — только если окно не перед глазами
+                    let _ = handle.emit("notice", payload.clone());
                     show_notification(&handle, &payload);
                     return;
                 }
@@ -338,7 +340,8 @@ fn show_notification<R: tauri::Runtime>(app: &tauri::AppHandle<R>, payload: &str
     if !engine::notify::wanted(&st, &j.get("kind").str_or("")) {
         return;
     }
-    if engine::notify::only_background(&st) && j.get("kind").str_or("") != "test" {
+    // окно перед глазами — сообщение уже показано в самом приложении, отдельное уведомление Windows не нужно
+    if j.get("kind").str_or("") != "test" {
         let in_front = app
             .get_webview_window("main")
             .map(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false) && w.is_focused().unwrap_or(false))
