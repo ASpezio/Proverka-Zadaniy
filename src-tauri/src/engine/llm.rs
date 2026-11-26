@@ -240,7 +240,15 @@ pub fn grade_schema() -> Json {
                 .with("ai_evidence", arr_str.clone())
                 .with("errors", arr_str)
                 .with("grade", Json::obj().with("type", "number").with("minimum", 2).with("maximum", 5))
-                .with("summary", s("string")),
+                .with("summary", s("string"))
+                // баллы по рубрике преподавателя (если она задана для задания)
+                .with(
+                    "rubric",
+                    Json::obj().with("type", "array").with(
+                        "items",
+                        Json::obj().with("type", "object").with("properties", Json::obj().with("name", s("string")).with("points", s("number")).with("comment", s("string"))).with("required", vec!["name".to_string(), "points".into()]),
+                    ),
+                ),
         )
         .with(
             "required",

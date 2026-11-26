@@ -13,8 +13,58 @@ permissions:
   contents: write
 
 jobs:
+  # интерфейс: devserver + Chromium открывают все шаги, журнал, настройки и окна;
+  # ошибка JavaScript или пустой экран — сборка останавливается до выпуска релиза
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/devserver
+
+      - name: Тесты ядра
+        working-directory: tools/devserver
+        run: cargo test --release
+
+      - name: Сервер для интерфейса
+        working-directory: tools/devserver
+        run: cargo build --release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Chromium
+        run: |
+          npm install --no-save playwright@1.47.2
+          npx playwright install --with-deps chromium
+
+      - name: Проверка интерфейса
+        run: |
+          mkdir -p ui-data ui-shots
+          PROVERKA_DATA=$PWD/ui-data tools/devserver/target/release/devserver serve 8790 ui > devserver.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8790/ > /dev/null && break; sleep 1; done
+          node tools/ui_smoke.js http://127.0.0.1:8790 ui-shots
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: ui-shots/*.png
+          if-no-files-found: ignore
+
   windows:
+    needs: ui
     runs-on: windows-latest
+    # подпись exe — только если в настройках репозитория есть сертификат
+    # (Settings → Secrets → Actions: SIGN_PFX_BASE64 и SIGN_PFX_PASSWORD); без него сборка как обычно
+    env:
+      SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
+      SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +79,6 @@ jobs:
       - name: Тесты ядра
         working-directory: tools/devserver
         run: cargo test --release
-        continue-on-error: true
 
       - name: Версия сборки
         shell: pwsh
@@ -48,7 +97,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item src-tauri/target/release/ProverkaZadaniy.exe dist/ProverkaZadaniy.exe
-          Copy-Item src-tauri/target/release/ProverkaZadaniy.exe "Проверка заданий.exe"
+
+      - name: Подпись программы
+        if: env.SIGN_PFX_BASE64 != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX_BASE64))
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" | Sort-Object FullName -Descending | Select-Object -First 1
+          "SIGNTOOL=$($st.FullName)" >> $env:GITHUB_ENV
+          & $st.FullName sign /f $pfx /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist/ProverkaZadaniy.exe
+          if ($LASTEXITCODE -ne 0) { throw "signtool: ошибка $LASTEXITCODE" }
 
       # установщик (NSIS — есть на сборочных машинах GitHub; если нет — ставится);
       # не собрался — релиз всё равно выходит с ProverkaZadaniy.exe
@@ -62,7 +121,27 @@ jobs:
           if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress | Out-Null; $nsis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
           & $nsis /V2 "/DVERSION=$env:VERSION" tools/setup.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis завершился с ошибкой $LASTEXITCODE" }
+          if ($env:SIGN_PFX_BASE64) {
+            $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+            & $env:SIGNTOOL sign /f $pfx /p $env:SIGN_PFX_PASSWORD /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 dist/Proverka-Setup.exe
+          }
           Get-ChildItem dist
+
+      # установщик ставит программу в выбранную папку без вопросов (/S /D=…) и удаляет её
+      - name: Проверка установщика
+        if: hashFiles('dist/Proverka-Setup.exe') != ''
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "ProverkaTest"
+          Start-Process dist/Proverka-Setup.exe -ArgumentList "/S", "/D=$dir" -Wait
+          if (-not (Test-Path (Join-Path $dir "Проверка заданий.exe"))) { throw "Установщик не положил программу в $dir" }
+          if (-not (Test-Path (Join-Path $dir "Удалить.exe"))) { throw "Нет программы удаления" }
+          $key = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ProverkaZadaniy" -ErrorAction SilentlyContinue
+          if (-not $key -or $key.InstallLocation -ne $dir) { throw "Нет записи в «Приложениях» или неверная папка" }
+          Start-Process (Join-Path $dir "Удалить.exe") -ArgumentList "/S", "_?=$dir" -Wait
+          if (Test-Path (Join-Path $dir "Проверка заданий.exe")) { throw "Программа удаления не удалила файлы" }
+          "Установщик: установка и удаление прошли"
 
       - uses: actions/upload-artifact@v4
         with:

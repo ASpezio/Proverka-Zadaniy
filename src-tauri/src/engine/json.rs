@@ -46,6 +46,12 @@ impl Json {
             items.push((k.to_string(), v));
         }
     }
+    /// Убрать ключ из объекта.
+    pub fn remove(&mut self, k: &str) {
+        if let Json::Obj(items) = self {
+            items.retain(|(kk, _)| kk != k);
+        }
+    }
     pub fn push(&mut self, v: impl Into<Json>) {
         if let Json::Arr(a) = self {
             a.push(v.into());

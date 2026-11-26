@@ -445,6 +445,11 @@ pub struct PlagPair {
 
 const K: usize = 6;
 
+/// Отпечатки текста (как при поиске списывания) — для архива прошлых лет.
+pub fn shingle_set(text: &str) -> HashSet<u64> {
+    shingles(&text::words(text))
+}
+
 fn shingles(words: &[String]) -> HashSet<u64> {
     let mut set = HashSet::new();
     if words.len() < K {

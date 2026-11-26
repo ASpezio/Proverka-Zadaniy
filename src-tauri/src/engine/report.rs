@@ -465,6 +465,13 @@ fn today() -> String {
     format!("{:02}.{:02}.{}", d, m, y)
 }
 
+/// «2026-11-26» из секунд (в часовом поясе компьютера).
+pub fn date_ymd(epoch: u64) -> String {
+    let secs = epoch as i64 + TZ_MIN.load(std::sync::atomic::Ordering::Relaxed) * 60;
+    let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;

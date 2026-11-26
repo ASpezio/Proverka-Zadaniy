@@ -138,6 +138,15 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.3: Moodle напрямую, рубрика, история
+* `moodle_ws.rs` — REST веб-служб Moodle (`Ws::call`, `get_token` через login/token.php, `grade_rows` → строки как у экспорта журнала оценок, `save_grade`). API: `moodle_ws_connect|disconnect|courses|course|fetch|grades|push`. Ключ — `settings.moodle_ws.token` (в экспорт без «ключей» не попадает). `moodle_ws_fetch` складывает ответы в папку как у архива «Скачать все ответы» и вызывает `moodle_import`; `moodle_ws_grades` подаёт строки в `moodle_import_grades` (`p.rows`, `p.scales`).
+* Тема журнала помнит заголовок и шкалу Moodle (`Topic.moodle`, `mscale`) и короткое имя (`short`, `journal::auto_short`); `moodle::export_gradebook_named` выгружает под ними.
+* Рубрика: `core::Rubric` (`settings.rubrics[set.id]`), `Rubric::apply` в `refinalize` и `mcp::submit` — оценка по сумме баллов (`llm.rubric*`, `model_grade`); текст для модели — `get_grading_criteria` с `work_id`; критерии входят в отпечаток кэша. API `rubric_set` пересчитывает проверенные работы.
+* `history.rs`: сверка (`calibration.json`, `cal_add` в `journal_add_current`, `cal_summary` → API `calibration`) и архив прошлых лет (`archive/<id>.txt`: мета + шинглы; `arc_matches` в `compute_plagiarism` → `Workspace.archive_hits`, работа: `archive_hits`). API `archive_summary|list|add_paths|delete`.
+* Отчёты: `journal_debtors`, `journal_student_report`, `defense_plan`, `defense_candidates`; напоминания `reminders_check` (вид уведомления `deadline`, отправленные — `settings.reminders.sent`).
+* Копии в свою папку: `Core::backup_external` (`settings.backup.dir`), из `backup_daily`/`backup_now`. Переносной режим: `core::portable_dir()` (рядом с exe `portable.txt` или `Данные/settings.json`), `rewrite_moved_dir` + `data_dir.txt` чинят пути после переезда; API `portable_info|portable_enable`.
+* CI: задание `ui` (Linux) — тесты ядра и `tools/ui_smoke.js` (devserver + Chromium, вымышленные данные); `windows` — сборка, необязательная подпись (`SIGN_PFX_BASE64`/`SIGN_PFX_PASSWORD`), установщик и его тихая установка/удаление. Моки: `tools/mock_llm.py` (понимает рубрику), `tools/mock_moodle.py`.
+
 ### Версия 1.2: журнал, темы, Moodle
 * `journal.json` (version 2): `entries` + `topics` (группа → шифр → `Topic {kind: work|test|custom|"", title, subject, semester, issued, deadline, note, unit}`) + `averages` (группа → [(название, [шифры])]). Пустой `kind` — по названию (`journal::auto_kind`: «тест», test, quiz, опрос). `custom` не идёт в средние и долги.
 * Долг: тема не `custom` и (у кого-то уже есть оценка или прошёл срок). Семестр по дате выдачи (`semester_of_date`: сен–янв — 1-й, фев–авг — 2-й).

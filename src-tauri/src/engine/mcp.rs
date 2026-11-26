@@ -45,7 +45,7 @@ pub fn tool_defs() -> Vec<(String, String, Json)> {
         t("get_ai_traps", "Скрытые ловушки против нейросетей, внедрённые в условие варианта (белый текст 1 пт), и слова-маркеры.", schema(wid(), &["work_id"])),
         t("scan_work", "Автоматическая проверка работы без нейросети: найденные ловушки, утечки скрытого текста, признаки ответа чат-бота, вариант по содержанию.", schema(wid(), &["work_id"])),
         t("check_plagiarism", "Совпадения текста этой работы с работами других студентов (возможное списывание).", schema(wid(), &["work_id"])),
-        t("get_grading_criteria", "Критерии оценивания преподавателя и дополнительные указания.", schema(Json::obj(), &[])),
+        t("get_grading_criteria", "Критерии оценивания преподавателя и дополнительные указания. С work_id — ещё и рубрика задания (баллы по критериям), если преподаватель её задал.", schema(wid(), &[])),
         t("get_work_links", "Содержимое ссылок из работы (Google Документы/Таблицы/Презентации, Google и Яндекс Диск, GitHub, сайты), если преподаватель разрешил их открывать.", schema(wid(), &["work_id"])),
         t(
             "submit_grade",
@@ -69,7 +69,14 @@ pub fn tool_defs() -> Vec<(String, String, Json)> {
                     .with("ai_confidence", Json::obj().with("type", "number").with("description", "Уверенность 0–1"))
                     .with("ai_evidence", Json::obj().with("type", "array").with("items", Json::obj().with("type", "string")).with("description", "Конкретные признаки ИИ"))
                     .with("errors", Json::obj().with("type", "array").with("items", Json::obj().with("type", "string")).with("description", "Содержательные ошибки; в каждой — короткая точная цитата из работы в «…», где ошибка допущена"))
-                    .with("summary", p_str("Обоснование оценки для ведомости, 1–3 предложения")),
+                    .with("summary", p_str("Обоснование оценки для ведомости, 1–3 предложения"))
+                    .with(
+                        "rubric",
+                        Json::obj().with("type", "array").with("description", "Баллы по критериям рубрики (если get_grading_criteria её выдал), в том же порядке").with(
+                            "items",
+                            schema(Json::obj().with("name", p_str("Критерий")).with("points", Json::obj().with("type", "number").with("description", "Сколько баллов из максимума")).with("comment", p_str("Почему столько")), &["name", "points"]),
+                        ),
+                    ),
                 &["work_id", "grade", "completeness", "ai_detected", "summary"],
             ),
         ),
@@ -341,7 +348,20 @@ impl McpServer {
                     .with("note", if list.is_empty() { String::new() } else { format!("Решение о списывании принимает приложение по правилу преподавателя ({}). Оценивай работу по содержанию.", if info.note.is_empty() { "совпадение = «2»".to_string() } else { info.note.clone() }) })
                     .with("matches", Json::Arr(list.iter().map(|(n, s)| Json::obj().with("work", n.as_str()).with("similarity_percent", (s * 100.0).round())).collect())))
             }
-            "get_grading_criteria" => Ok(Json::Str(self.criteria_text())),
+            "get_grading_criteria" => {
+                let mut t = self.criteria_text();
+                if !wid.is_empty() {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(w) = ws.works.iter().find(|w| w.id == wid) {
+                        let r = core.rubric_for(&ws, w);
+                        if !r.items.is_empty() {
+                            t.push_str("\n\n");
+                            t.push_str(&r.prompt());
+                        }
+                    }
+                }
+                Ok(Json::Str(t))
+            }
             "get_work_links" => {
                 let enabled = core.settings().get("links").get("enabled").bool_or(false);
                 let (urls, mut docs) = {
@@ -395,7 +415,7 @@ impl McpServer {
         let plag = pinfo.list.clone();
         // нормализуем ответ модели
         let mut llm = Json::obj();
-        for k in ["grade", "completeness", "variant", "tasks", "ai_detected", "ai_confidence", "ai_evidence", "errors", "summary"] {
+        for k in ["grade", "completeness", "variant", "tasks", "ai_detected", "ai_confidence", "ai_evidence", "errors", "summary", "rubric"] {
             llm.set(k, args.get(k).clone());
         }
         let half = core.settings().get("half_grades").bool_or(true);
@@ -404,6 +424,9 @@ impl McpServer {
         // новая проверка — прежнее решение по ИИ больше не действует
         let mut wd = w.clone();
         wd.deadline = core.deadline_of(&ws, &w);
+        // рубрика: оценка — по сумме баллов
+        let rub = core.rubric_for(&ws, &w);
+        rub.apply(&mut llm, half);
         let v = core.finalize(&wd, &scan, &llm, &pinfo, "");
         let (grade, reasons, violation) = (v.grade, v.reasons.clone(), v.violation.clone());
         let args_llm = llm.clone();

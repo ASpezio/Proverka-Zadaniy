@@ -36,7 +36,15 @@ pub fn check(core: &Core) -> Result<Json, String> {
     let h = vec![("User-Agent".to_string(), "proverka-zadaniy".to_string()), ("Accept".to_string(), "application/vnd.github+json".to_string())];
     let r = core.http.request("GET", &url, &h, None, 20).map_err(|e| format!("Не удалось связаться с GitHub: {}", e))?;
     if r.status == 404 {
-        return Ok(Json::obj().with("available", false).with("current", env!("CARGO_PKG_VERSION")).with("message", "Опубликованных версий пока нет"));
+        // 404 бывает в двух случаях: релизов ещё нет — или репозиторий закрыт (для приложения
+        // закрытый репозиторий выглядит как несуществующий). Различаем по самому репозиторию.
+        let repo = core.http.request("GET", &format!("https://api.github.com/repos/{}", REPO), &h, None, 20).map(|x| x.status).unwrap_or(0);
+        let msg = if repo == 404 {
+            "Не удалось открыть страницу релизов: репозиторий на GitHub закрыт (приватный) или удалён. Обновления работают только у открытого репозитория — или скачайте новую версию со страницы Releases вручную."
+        } else {
+            "В репозитории ещё нет опубликованных версий"
+        };
+        return Ok(Json::obj().with("available", false).with("current", env!("CARGO_PKG_VERSION")).with("message", msg).with("closed", repo == 404));
     }
     if r.status >= 400 {
         return Err(format!("GitHub ответил ошибкой {}", r.status));

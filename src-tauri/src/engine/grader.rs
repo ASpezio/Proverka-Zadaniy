@@ -851,7 +851,7 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
     let traps = client.call("get_ai_traps", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
     let scan = client.call("scan_work", Json::obj().with("work_id", wid))?;
     let plag = client.call("check_plagiarism", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
-    let crit = client.call("get_grading_criteria", Json::obj()).unwrap_or(Json::Null);
+    let crit = client.call("get_grading_criteria", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
     let links = client.call("get_work_links", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
 
     // --- неизменяемые части (с умеренными пределами)

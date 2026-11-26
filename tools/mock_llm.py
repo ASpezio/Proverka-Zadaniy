@@ -19,7 +19,21 @@ def quote(prompt):
                 return " в «" + " ".join(words[:4]) + "»"
     return ""
 
+def add_rubric(prompt, v):
+    """Баллы по рубрике преподавателя, если она есть в запросе: 80 % от максимума каждого критерия."""
+    if "РУБРИКА ПРЕПОДАВАТЕЛЯ" not in prompt:
+        return v
+    rub = []
+    for m in re.finditer(r"^\d+\) (.+?) — до ([\d.,]+) балл", prompt, re.M):
+        mx = float(m.group(2).replace(",", "."))
+        rub.append({"name": m.group(1), "points": round(mx * 0.8, 1), "comment": "мок: почти всё верно"})
+    v["rubric"] = rub
+    return v
+
 def verdict(prompt):
+    return add_rubric(prompt, _verdict(prompt))
+
+def _verdict(prompt):
     strong = "СИЛЬНЫЙ признак" in prompt
     medium = prompt.count("средний признак")
     words = len(prompt.split("<<<НАЧАЛО РАБОТЫ")[-1].split("КОНЕЦ РАБОТЫ>>>")[0].split())

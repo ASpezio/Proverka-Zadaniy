@@ -39,6 +39,12 @@ pub struct Topic {
     pub note: String,
     /// единица своего столбца: «пар», «ч»
     pub unit: String,
+    /// короткое имя для шапки журнала («Тест Р1» вместо длинного названия теста)
+    pub short: String,
+    /// заголовок элемента в Moodle («Задание:Практическая работа 1») — под ним оценки уходят обратно
+    pub moodle: String,
+    /// шкала элемента в Moodle («100»), если не 5
+    pub mscale: String,
 }
 
 impl Topic {
@@ -52,14 +58,59 @@ impl Topic {
             .with("deadline", self.deadline.as_str())
             .with("note", self.note.as_str())
             .with("unit", self.unit.as_str())
+            .with("short", self.short.as_str())
+            .with("moodle", self.moodle.as_str())
+            .with("mscale", self.mscale.as_str())
     }
     pub fn from_json(j: &Json) -> Topic {
         let f = |k: &str| j.get(k).str_or("").trim().to_string();
-        Topic { kind: f("kind"), title: f("title"), subject: f("subject"), semester: f("semester"), issued: f("issued"), deadline: f("deadline"), note: f("note"), unit: f("unit") }
+        Topic { kind: f("kind"), title: f("title"), subject: f("subject"), semester: f("semester"), issued: f("issued"), deadline: f("deadline"), note: f("note"), unit: f("unit"), short: f("short"), moodle: f("moodle"), mscale: f("mscale") }
     }
     pub fn is_empty(&self) -> bool {
         *self == Topic::default()
     }
+}
+
+/// Короткое имя для шапки журнала, если шифр длинный: «Тестирование по Разделу 1. …» → «Тест Р1»,
+/// «Итоговый тест» → «Итог. тест». Пустая строка — сокращать не нужно или не получается.
+pub fn auto_short(code: &str, title: &str) -> String {
+    if code.chars().count() <= 14 {
+        return String::new();
+    }
+    let src = if title.is_empty() { code } else { title };
+    let low = src.to_lowercase().replace('ё', "е");
+    let is_test = auto_kind(code, title) == "test";
+    // номер после «раздел», «модуль», «тема»
+    let num_after = |w: &str| -> Option<String> {
+        let i = low.find(w)? + w.len();
+        let rest: String = low[i..].chars().skip_while(|c| c.is_alphabetic() || *c == ' ' || *c == '№').take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        let rest = rest.trim_end_matches('.').to_string();
+        if rest.is_empty() { None } else { Some(rest) }
+    };
+    for (w, short) in [("раздел", "Р"), ("модул", "М"), ("тема", "Т"), ("глав", "Гл")] {
+        if let Some(n) = num_after(w) {
+            return if is_test { format!("Тест {}{}", short, n) } else { format!("{}{}", short, n) };
+        }
+    }
+    if is_test {
+        let pre = if low.contains("общий итогов") {
+            "Общий итог. тест"
+        } else if low.contains("итогов") {
+            "Итог. тест"
+        } else if low.contains("ознакомит") {
+            "Ознак. тест"
+        } else if low.contains("семестров") {
+            "Сем. тест"
+        } else if low.contains("входн") {
+            "Входной тест"
+        } else if low.contains("промежуточн") {
+            "Промеж. тест"
+        } else {
+            ""
+        };
+        return pre.to_string();
+    }
+    String::new()
 }
 
 /// Вид темы по названию: «Тестирование по разделу 2», «Итоговый тест», «Quiz 1» — тест.
@@ -321,6 +372,25 @@ impl Journal {
         }
         if t.subject.is_empty() && !subject.is_empty() {
             t.subject = subject.to_string();
+        }
+        if t != before {
+            self.set_topic(group, code, t);
+        }
+    }
+
+    /// Тема пришла из Moodle: запомнить заголовок и шкалу элемента (для выгрузки обратно)
+    /// и придумать короткое имя, если шифр длинный.
+    pub fn note_moodle(&mut self, group: &str, code: &str, header: &str, scale: f64) {
+        let mut t = self.topic(group, code);
+        let before = t.clone();
+        if !header.is_empty() {
+            t.moodle = header.to_string();
+        }
+        if scale > 0.0 && (scale - 5.0).abs() > 1e-9 {
+            t.mscale = super::core::fmt_grade(scale).replace(',', ".");
+        }
+        if t.short.is_empty() {
+            t.short = auto_short(code, &t.title);
         }
         if t != before {
             self.set_topic(group, code, t);

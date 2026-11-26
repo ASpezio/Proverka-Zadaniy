@@ -58,6 +58,7 @@ const LOCKED_WHILE_RUNNING: &[&str] = &[
     "local_stop",
     "import_all",
     "update_apply",
+    "rubric_set",
 ];
 
 pub const LOCK_MESSAGE: &str = "Нейросеть сейчас проверяет работы — изменения недоступны. Дождитесь окончания или нажмите «Остановить».";
@@ -67,7 +68,7 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         let settings_lock = method == "set_settings" && {
             // во время проверки можно менять только то, что не влияет на неё: оформление, звук, трей
             let s = p.get("settings");
-            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects"))
+            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects" | "reminders" | "backup"))
         };
         if LOCKED_WHILE_RUNNING.contains(&method) || settings_lock {
             return Err(LOCK_MESSAGE.into());
@@ -118,7 +119,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             core.save_session();
             core.journal.lock().unwrap_or_else(|e| e.into_inner()).save();
             core.backup_daily();
-            Ok(Json::obj().with("list", core.backups()))
+            // и в свою папку — заново, даже если сегодня копия уже была
+            let ext = core.backup_external(true);
+            Ok(Json::obj().with("list", core.backups()).with("external", match &ext { Ok(Some(p)) => Json::from(p.as_str()), _ => Json::Null }).with("external_error", match &ext { Err(e) => Json::from(e.as_str()), _ => Json::Null }))
         }
 
         "add_paths" => {
@@ -534,7 +537,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 *ws = w2;
             }
             // порог совпадения и «сколько одинаковых можно зачесть» — пересчитываем итоги
-            if !new.get("penalties").is_null() {
+            if !new.get("penalties").is_null() || !new.get("archive").is_null() {
                 core.compute_plagiarism();
             }
             // ограничения оценки применяются и к уже проверенным работам
@@ -1155,8 +1158,13 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             if group.is_empty() {
                 return Err("Выберите группу".into());
             }
-            let bytes = std::fs::read(&path).map_err(|e| format!("не удалось открыть файл: {}", e))?;
-            let rows = super::moodle::table_rows(&path, &bytes);
+            // строки могут прийти готовыми (оценки, загруженные из Moodle напрямую)
+            let rows: Vec<Vec<String>> = if !p.get("rows").as_arr().is_empty() {
+                p.get("rows").as_arr().iter().map(|r| r.as_arr().iter().map(|c| c.str_or("")).collect()).collect()
+            } else {
+                let bytes = std::fs::read(&path).map_err(|e| format!("не удалось открыть файл: {}", e))?;
+                super::moodle::table_rows(&path, &bytes)
+            };
             let list = super::moodle::import_grades_as(&rows, &p.get("code").str_or(""), &p.get("prefer").str_or("auto"))?;
             let replace = p.get("replace").bool_or(false);
             let add_roster = p.get("roster").bool_or(true);
@@ -1199,6 +1207,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     if !codes.contains(&im.code) {
                         codes.push(im.code.clone());
                         j.touch_topic(&group, &im.code, &im.kind, &im.title, &subject);
+                        j.note_moodle(&group, &im.code, &im.header, p.get("scales").get(&im.header).as_f64().unwrap_or(im.scale));
                         if j.kind_of(&group, &im.code) == "test" {
                             tests.push(im.code.clone());
                         }
@@ -1273,6 +1282,223 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             Ok(v)
         }
 
+        // ------------------------------------------------ Moodle напрямую (веб-службы)
+        "moodle_ws_connect" => {
+            // адрес + ключ, или адрес + логин/пароль (ключ службы мобильного приложения)
+            let url = super::moodle_ws::normalize_base(&p.get("url").str_or(""));
+            if url.len() < 12 {
+                return Err("Укажите адрес сайта Moodle, например https://moodle.college.ru".into());
+            }
+            let mut token = p.get("token").str_or("").trim().to_string();
+            if token.is_empty() {
+                let user = p.get("username").str_or("");
+                let pass = p.get("password").str_or("");
+                if user.trim().is_empty() || pass.is_empty() {
+                    return Err("Укажите ключ доступа или логин и пароль от Moodle".into());
+                }
+                token = super::moodle_ws::get_token(&*core.http, &url, user.trim(), &pass, &p.get("service").str_or(""))?;
+            }
+            let ws = super::moodle_ws::Ws::new(&url, &token);
+            let info = ws.site_info(&*core.http)?;
+            let conf = Json::obj()
+                .with("url", url.as_str())
+                .with("token", token.as_str())
+                .with("site", info.get("sitename").str_or("").as_str())
+                .with("user", info.get("fullname").str_or("").as_str())
+                .with("userid", info.get("userid").f64_or(0.0));
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                st.set("moodle_ws", conf);
+            }
+            core.save_settings();
+            core.log(&format!("Moodle: подключено к «{}» как {}", info.get("sitename").str_or(""), info.get("fullname").str_or("")));
+            Ok(core.state_json())
+        }
+
+        "moodle_ws_disconnect" => {
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let url = st.get("moodle_ws").get("url").clone();
+                st.set("moodle_ws", Json::obj().with("url", url).with("token", "").with("site", "").with("user", "").with("userid", 0));
+            }
+            core.save_settings();
+            Ok(core.state_json())
+        }
+
+        "moodle_ws_courses" => {
+            let (ws, uid) = moodle_ws_of(core)?;
+            let list = ws.courses(&*core.http, uid)?;
+            let courses: Vec<Json> = list.iter().map(|c| Json::obj().with("id", c.get("id").f64_or(0.0)).with("name", c.get("fullname").str_or("").as_str()).with("short", c.get("shortname").str_or("").as_str())).collect();
+            Ok(Json::obj().with("courses", Json::Arr(courses)))
+        }
+
+        "moodle_ws_course" => {
+            // задания и группы курса
+            let (ws, _) = moodle_ws_of(core)?;
+            let cid = p.get("course").f64_or(0.0) as i64;
+            let assigns: Vec<Json> = ws
+                .assignments(&*core.http, cid)?
+                .iter()
+                .map(|a| Json::obj().with("id", a.get("id").f64_or(0.0)).with("name", a.get("name").str_or("").as_str()).with("duedate", a.get("duedate").f64_or(0.0)).with("grade", a.get("grade").f64_or(0.0)))
+                .collect();
+            let groups: Vec<Json> = ws.groups(&*core.http, cid).unwrap_or_default().iter().map(|g| Json::obj().with("id", g.get("id").f64_or(0.0)).with("name", g.get("name").str_or("").as_str())).collect();
+            Ok(Json::obj().with("assignments", Json::Arr(assigns)).with("groups", Json::Arr(groups)))
+        }
+
+        "moodle_ws_fetch" => {
+            // ответы задания → папка как у архива «Скачать все ответы» → обычная загрузка из Moodle
+            let (ws, _) = moodle_ws_of(core)?;
+            let cid = p.get("course").f64_or(0.0) as i64;
+            let aid = p.get("assign").f64_or(0.0) as i64;
+            let mgroup = p.get("mgroup").f64_or(0.0) as i64;
+            let users = ws.users(&*core.http, cid)?;
+            let in_group = |u: &Json| mgroup == 0 || u.get("groups").as_arr().iter().any(|g| g.get("id").f64_or(0.0) as i64 == mgroup);
+            let subs = ws.submissions(&*core.http, aid)?;
+            let aname = p.get("assign_name").str_or("задание");
+            let dest = core.data_dir.join("moodle").join(format!("{}-{}", super::moodle_ws::safe_name(&aname).chars().take(50).collect::<String>(), super::core::now_s()));
+            std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+            let (mut students, mut files, mut errors) = (0usize, 0usize, Vec::<String>::new());
+            for s in subs.iter().filter(|s| s.status == "submitted" || !s.files.is_empty() || !s.text.trim().is_empty()) {
+                let Some(u) = users.iter().find(|u| u.get("id").f64_or(0.0) as i64 == s.userid) else { continue };
+                if !in_group(u) {
+                    continue;
+                }
+                let full = u.get("fullname").str_or("");
+                let base = format!("{}_{}_assignsubmission_file_", super::moodle_ws::safe_name(&full), s.userid);
+                let mut any = false;
+                for f in &s.files {
+                    let dir = dest.join(&base);
+                    let _ = std::fs::create_dir_all(&dir);
+                    match ws.download(&*core.http, &f.url) {
+                        Ok(b) => {
+                            let fp = dir.join(super::moodle_ws::safe_name(&f.name));
+                            if std::fs::write(&fp, &b).is_ok() {
+                                // время сдачи — как в Moodle (по нему считается опоздание)
+                                let t = if f.mtime > 0 { f.mtime } else { s.modified };
+                                if t > 0 {
+                                    if let Ok(fh) = std::fs::File::options().write(true).open(&fp) {
+                                        let _ = fh.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(t));
+                                    }
+                                }
+                                files += 1;
+                                any = true;
+                            }
+                        }
+                        Err(e) => errors.push(format!("{} — {}: {}", full, f.name, e)),
+                    }
+                }
+                if !s.text.trim().is_empty() {
+                    let fp = dest.join(format!("{}_{}_assignsubmission_onlinetext_onlinetext.html", super::moodle_ws::safe_name(&full), s.userid));
+                    if std::fs::write(&fp, format!("<html><body>{}</body></html>", s.text)).is_ok() {
+                        files += 1;
+                        any = true;
+                    }
+                }
+                if any {
+                    students += 1;
+                }
+            }
+            if students == 0 {
+                let _ = std::fs::remove_dir_all(&dest);
+                return Err(if errors.is_empty() { "В этом задании пока нет ответов студентов (с учётом выбранной группы)".into() } else { format!("Не удалось скачать ответы: {}", errors.join("; ")) });
+            }
+            core.log(&format!("Moodle: скачано ответов {} (файлов {}) из «{}»", students, files, aname));
+            let mut p2 = p.clone();
+            p2.set("path", dest.to_string_lossy().to_string());
+            let mut st = handle_inner(core, "moodle_import", &p2)?;
+            st.set("fetched", Json::obj().with("students", students).with("files", files).with("errors", errors));
+            Ok(st)
+        }
+
+        "moodle_ws_grades" => {
+            // оценки и отзывы курса из Moodle → тот же разбор, что у файла экспорта
+            let (ws, _) = moodle_ws_of(core)?;
+            let cid = p.get("course").f64_or(0.0) as i64;
+            let mgroup = p.get("mgroup").f64_or(0.0) as i64;
+            let only: Option<Vec<i64>> = if mgroup > 0 {
+                Some(ws.users(&*core.http, cid)?.iter().filter(|u| u.get("groups").as_arr().iter().any(|g| g.get("id").f64_or(0.0) as i64 == mgroup)).map(|u| u.get("id").f64_or(0.0) as i64).collect())
+            } else {
+                None
+            };
+            let (rows, scales) = ws.grade_rows(&*core.http, cid, only.as_deref())?;
+            if rows.len() < 2 {
+                return Err("В курсе нет студентов с оценками (или у ключа нет доступа к журналу оценок)".into());
+            }
+            let mut p2 = p.clone();
+            p2.set("rows", Json::Arr(rows.into_iter().map(|r| Json::Arr(r.into_iter().map(Json::from).collect())).collect()));
+            p2.set("prefer", "value");
+            let mut sc = Json::obj();
+            for (h, m) in scales {
+                sc.set(&h, m);
+            }
+            p2.set("scales", sc);
+            handle_inner(core, "moodle_import_grades", &p2)
+        }
+
+        "moodle_ws_push" => {
+            // оценки (и отзывы) журнала группы → задания Moodle
+            let (ws, _) = moodle_ws_of(core)?;
+            let cid = p.get("course").f64_or(0.0) as i64;
+            let group = p.get("group").str_or("");
+            let with_fb = p.get("feedback").bool_or(false);
+            let dry = p.get("dry").bool_or(false);
+            let assigns = ws.assignments(&*core.http, cid)?;
+            let users = ws.users(&*core.http, cid)?;
+            let j = core.journal.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut codes = p.get("codes").str_list();
+            if codes.is_empty() {
+                codes = j.codes_of(&group).into_iter().filter(|c| j.kind_of(&group, c) == "work").collect();
+            }
+            // задание Moodle для темы: по заголовку из Moodle, полному названию или шифру
+            let norm = |s: &str| s.to_lowercase().replace('ё', "е").split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut plan: Vec<Json> = Vec::new();
+            let (mut sent, mut failed, mut no_user) = (0usize, Vec::<String>::new(), Vec::<String>::new());
+            for c in &codes {
+                let t = j.topic(&group, c);
+                let mname = t.moodle.splitn(2, ':').nth(1).map(|x| x.trim().to_string()).unwrap_or_default();
+                let manual = p.get("map").get(c).f64_or(0.0) as i64;
+                let a = assigns.iter().find(|a| manual > 0 && a.get("id").f64_or(0.0) as i64 == manual).or_else(|| {
+                    assigns.iter().find(|a| {
+                        let n = norm(&a.get("name").str_or(""));
+                        (!mname.is_empty() && n == norm(&mname)) || (!t.title.is_empty() && n == norm(&t.title)) || n == norm(c) || super::text::find_work_code(&a.get("name").str_or("")).map(|x| x == *c).unwrap_or(false)
+                    })
+                });
+                let Some(a) = a else {
+                    plan.push(Json::obj().with("code", c.as_str()).with("assign", Json::Null).with("n", 0));
+                    continue;
+                };
+                let aid = a.get("id").f64_or(0.0) as i64;
+                let max = a.get("grade").f64_or(0.0);
+                let entries: Vec<&super::journal::Entry> = j.entries.iter().filter(|e| e.group == group && &e.code == c && e.grade.is_some()).collect();
+                plan.push(Json::obj().with("code", c.as_str()).with("assign", a.get("name").str_or("").as_str()).with("assign_id", aid).with("n", entries.len()).with("scale", max <= 0.0));
+                if dry || max <= 0.0 {
+                    continue;
+                }
+                let emails = j.emails.get(&group).cloned().unwrap_or_default();
+                for e in entries {
+                    let mail = emails.get(&e.student).cloned().unwrap_or_default().to_lowercase();
+                    let u = users.iter().find(|u| (!mail.is_empty() && u.get("email").str_or("").to_lowercase() == mail) || super::moodle::same_person(&u.get("fullname").str_or(""), &e.student) || super::moodle::same_person(&format!("{} {}", u.get("lastname").str_or(""), u.get("firstname").str_or("")), &e.student));
+                    let Some(u) = u else {
+                        if !no_user.contains(&e.student) {
+                            no_user.push(e.student.clone());
+                        }
+                        continue;
+                    };
+                    let g = e.grade.unwrap_or(0.0);
+                    let val = if (max - 5.0).abs() < 1e-9 { g } else { g / 5.0 * max };
+                    let fb = if with_fb && !e.comment.trim().is_empty() { Some(e.comment.as_str()) } else { None };
+                    match ws.save_grade(&*core.http, aid, u.get("id").f64_or(0.0) as i64, val, fb) {
+                        Ok(()) => sent += 1,
+                        Err(er) => failed.push(format!("{} ({}): {}", e.student, c, er)),
+                    }
+                }
+            }
+            if !dry {
+                core.log(&format!("Moodle: отправлено оценок {}, ошибок {}", sent, failed.len()));
+            }
+            Ok(Json::obj().with("plan", Json::Arr(plan)).with("sent", sent).with("failed", failed).with("no_user", no_user).with("assignments", Json::Arr(assigns.iter().map(|a| Json::obj().with("id", a.get("id").f64_or(0.0)).with("name", a.get("name").str_or("").as_str())).collect())))
+        }
+
         "moodle_export_gradebook" => {
             // журнал группы → CSV для «Оценки → Импорт» в Moodle
             let path = p.get("path").str_or("");
@@ -1301,7 +1527,17 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let with_fb = p.get("feedback").bool_or(false);
             let sep = p.get("sep").str_or(";").chars().next().unwrap_or(';');
             let fb = |s: &str, c: &str| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).map(|e| e.comment.clone()).unwrap_or_default();
-            let csv = super::moodle::export_gradebook_full(&list, &codes, &|s, c| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).and_then(|e| e.grade), if with_fb { Some(&fb) } else { None }, sep);
+            // под именами элементов Moodle (если тема пришла из Moodle), иначе — под шифрами
+            let use_names = p.get("moodle_names").bool_or(true);
+            let items: Vec<(String, String, f64)> = codes
+                .iter()
+                .map(|c| {
+                    let t = j.topic(&group, c);
+                    let sc = t.mscale.replace(',', ".").parse::<f64>().unwrap_or(5.0);
+                    if use_names { (c.clone(), t.moodle.clone(), sc) } else { (c.clone(), String::new(), 5.0) }
+                })
+                .collect();
+            let csv = super::moodle::export_gradebook_named(&list, &items, &|s, c| j.entries.iter().find(|e| e.group == group && e.student == s && e.code == c).and_then(|e| e.grade), if with_fb { Some(&fb) } else { None }, sep);
             let bytes = super::moodle::encode_csv(&csv, &p.get("encoding").str_or("utf8bom"));
             std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
             Ok(Json::obj().with("path", path).with("codes", codes).with("no_email", no_mail))
@@ -1905,7 +2141,20 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     match p.get("action").str_or("set").as_str() {
                         "set" => {
                             j.ensure_group(g);
-                            j.set_topic(g, &code, super::journal::Topic::from_json(p.get("topic")));
+                            // заголовок и шкала Moodle в форме не редактируются — сохраняем прежние
+                            let old = j.topic(g, &code);
+                            let mut t = super::journal::Topic::from_json(p.get("topic"));
+                            if t.moodle.is_empty() {
+                                t.moodle = old.moodle;
+                            }
+                            if t.mscale.is_empty() {
+                                t.mscale = old.mscale;
+                            }
+                            // короткое имя меняется только там, где его поле есть в форме
+                            if p.get("topic").get("short").is_null() {
+                                t.short = old.short;
+                            }
+                            j.set_topic(g, &code, t);
                             // тема без даты и без оценок всё равно должна остаться столбцом
                             if j.topic(g, &code).is_empty() && !j.entries.iter().any(|e| &e.group == g && e.code == code) {
                                 j.set_topic(g, &code, super::journal::Topic { kind: super::journal::auto_kind(&code, "").into(), ..Default::default() });
@@ -1994,6 +2243,420 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             }
             core.save_settings();
             Ok(core.state_json())
+        }
+
+        "rubric_set" => {
+            // рубрика набора заданий: критерии с баллами и пороги оценок; проверенные работы пересчитываются
+            let set = p.get("set").str_or("");
+            if set.is_empty() {
+                return Err("Не указан набор заданий".into());
+            }
+            let r = super::core::Rubric::from_json(p.get("rubric"));
+            if r.p5 <= r.p4 || r.p4 <= r.p3 || r.p3 <= 0.0 || r.p5 > 100.0 {
+                return Err("Пороги оценок должны идти по возрастанию: «3» < «4» < «5» ≤ 100 %".into());
+            }
+            {
+                let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                let mut m = st.get("rubrics").clone();
+                if m.is_null() {
+                    m = Json::obj();
+                }
+                if r.items.is_empty() {
+                    m.remove(&set);
+                } else {
+                    let items: Vec<Json> = r.items.iter().map(|c| Json::obj().with("name", c.name.as_str()).with("max", c.max).with("desc", c.desc.as_str())).collect();
+                    m.set(&set, Json::obj().with("items", Json::Arr(items)).with("scale", Json::obj().with("5", r.p5).with("4", r.p4).with("3", r.p3)));
+                }
+                st.set("rubrics", m);
+            }
+            core.save_settings();
+            // пересчитать оценки уже проверенных работ этого набора
+            let ids: Vec<String> = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                ws.works.iter().filter(|w| core.set_for_work(&ws, w).map(|s| s.id == set).unwrap_or(false) && ws.outcomes.get(&w.id).map(|o| !o.llm.is_null()).unwrap_or(false)).map(|w| w.id.clone()).collect()
+            };
+            for id in &ids {
+                let _ = core.refinalize(id);
+            }
+            core.save_session();
+            Ok(core.state_json().with("recalculated", ids.len()))
+        }
+
+        // ------------------------------------------------ архив работ прошлых лет
+        "archive_summary" => Ok(super::history::arc_summary(&core.data_dir).with("settings", core.settings().get("archive").clone())),
+
+        "archive_list" => {
+            let code = p.get("code").str_or("");
+            let list: Vec<Json> = super::history::arc_load(&core.data_dir).iter().filter(|e| code.is_empty() || e.code == code).map(|e| e.meta().with("words", e.shingles.len())).collect();
+            Ok(Json::obj().with("items", Json::Arr(list)))
+        }
+
+        "archive_add_paths" => {
+            // работы прошлых лет из папки или файлов: только отпечатки текста, в текущую проверку не попадают
+            let code = p.get("code").str_or("").trim().to_string();
+            if code.is_empty() {
+                return Err("Укажите, какая это работа (шифр), например ПР3".into());
+            }
+            let group = p.get("group").str_or("").trim().to_string();
+            let year = p.get("year").i64_or(0);
+            // дата записи — 1 сентября указанного учебного года
+            let date = if year > 1990 { ((year - 1970) as f64 * 365.2425 * 86400.0 + 243.0 * 86400.0) as u64 } else { super::core::now_s() };
+            let files = super::core::Core::expand(&p.get("paths").str_list());
+            let (task_sh, title): (std::collections::HashSet<u64>, String) = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let set = ws.sets.iter().find(|s| s.code == code);
+                (
+                    set.map(|s| s.variants.values().flat_map(|v| super::detect::shingle_set(&format!("{}\n{}", v.task_visible, v.key))).collect()).unwrap_or_default(),
+                    set.map(|s| s.title.clone()).unwrap_or_default(),
+                )
+            };
+            let mut items = Vec::new();
+            let mut skipped: Vec<String> = Vec::new();
+            for (f, _) in files {
+                let Ok(bytes) = std::fs::read(&f) else { continue };
+                let name = super::core::file_name(&f);
+                let text = match super::core::extract_safe(&f, &bytes) {
+                    Ok(x) if !x.needs_pdf && !x.needs_images => x.visible(),
+                    _ => {
+                        skipped.push(name);
+                        continue;
+                    }
+                };
+                if text.split_whitespace().count() < 40 {
+                    skipped.push(name);
+                    continue;
+                }
+                // ФИО — из имени файла Moodle или из имени файла/папки
+                let student = super::moodle::parse_name(&name).map(|x| x.0).unwrap_or_else(|| {
+                    let stem = std::path::Path::new(&name).file_stem().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
+                    stem.replace(['_', '-'], " ").split_whitespace().take(3).collect::<Vec<_>>().join(" ")
+                });
+                items.push(super::history::ArcEntry {
+                    code: code.clone(),
+                    title: title.clone(),
+                    group: group.clone(),
+                    student,
+                    date,
+                    hash: format!("{:x}", super::core::fnv(&bytes)),
+                    shingles: super::detect::shingle_set(&text).difference(&task_sh).copied().collect(),
+                    ..Default::default()
+                });
+            }
+            let n = super::history::arc_add(&core.data_dir, items);
+            core.compute_plagiarism();
+            Ok(super::history::arc_summary(&core.data_dir).with("added", n).with("skipped", skipped))
+        }
+
+        "archive_delete" => {
+            let n = super::history::arc_delete(&core.data_dir, &p.get("ids").str_list(), &p.get("code").str_or(""));
+            core.compute_plagiarism();
+            Ok(super::history::arc_summary(&core.data_dir).with("removed", n))
+        }
+
+        "portable_info" => {
+            let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf()));
+            Ok(Json::obj()
+                .with("portable", super::core::portable_dir().map(|d| d == core.data_dir).unwrap_or(false))
+                .with("data_dir", core.data_dir.to_string_lossy().to_string())
+                .with("exe_dir", exe_dir.map(|d| d.to_string_lossy().to_string()).unwrap_or_default()))
+        }
+
+        "portable_enable" => {
+            // переносной режим: данные — в папку «Данные» рядом с программой; вступит в силу после перезапуска
+            let exe_dir = std::env::current_exe().ok().and_then(|e| e.parent().map(|p| p.to_path_buf())).ok_or("Не удалось определить папку программы")?;
+            let dest = exe_dir.join("Данные");
+            if dest == core.data_dir {
+                return Err("Переносной режим уже включён".into());
+            }
+            if dest.join("settings.json").exists() {
+                return Err(format!("В папке «{}» уже есть данные — переносной режим включится сам при следующем запуске", dest.display()));
+            }
+            std::fs::create_dir_all(&dest).map_err(|e| format!("Не удалось создать папку рядом с программой ({}): {}. Переносной режим работает, если программа лежит в папке, куда можно писать (например, на флешке).", dest.display(), e))?;
+            core.save_session();
+            core.save_settings();
+            core.journal.lock().unwrap_or_else(|e| e.into_inner()).save();
+            fn copy_dir(a: &std::path::Path, b: &std::path::Path) -> usize {
+                let _ = std::fs::create_dir_all(b);
+                let mut n = 0;
+                if let Ok(rd) = std::fs::read_dir(a) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let t = b.join(e.file_name());
+                        if p.is_dir() {
+                            n += copy_dir(&p, &t);
+                        } else if std::fs::copy(&p, &t).is_ok() {
+                            n += 1;
+                        }
+                    }
+                }
+                n
+            }
+            let n = copy_dir(&core.data_dir, &dest);
+            // прежняя папка — чтобы пути в сессии поправились при первом запуске из «Данных»
+            let _ = std::fs::write(dest.join("data_dir.txt"), core.data_dir.to_string_lossy().as_bytes());
+            let _ = std::fs::write(exe_dir.join("portable.txt"), "Переносной режим «Проверки заданий»: данные лежат в папке «Данные» рядом с программой.\r\nЧтобы вернуться к обычному режиму, удалите этот файл и папку «Данные» (сначала сделайте экспорт).\r\n");
+            Ok(Json::obj().with("dir", dest.to_string_lossy().to_string()).with("files", n))
+        }
+
+        "calibration" => Ok(super::history::cal_summary(&core.data_dir, &p.get("code").str_or(""))),
+
+        // ------------------------------------------------ отчёты по журналу
+        "journal_debtors" => {
+            // кто что должен: по группам, для куратора
+            let path = p.get("path").str_or("");
+            let only = p.get("group").str_or("");
+            let twos = p.get("twos").bool_or(true);
+            let v = journal_view(core, p);
+            let mut rows_all: Vec<(String, String, Vec<String>, Vec<String>)> = Vec::new(); // группа, ФИО, долги, «2»
+            for g in v.get("groups").as_arr() {
+                let gname = g.get("name").str_or("");
+                if !only.is_empty() && gname != only {
+                    continue;
+                }
+                let topics: Vec<&Json> = g.get("topics").as_arr().iter().filter(|t| t.get("kind").str_or("") != "custom").collect();
+                for s in g.get("students").as_arr() {
+                    if !s.get("in_roster").bool_or(true) {
+                        continue;
+                    }
+                    let mut debts = Vec::new();
+                    let mut low = Vec::new();
+                    for t in &topics {
+                        let code = t.get("code").str_or("");
+                        let label = { let sh = t.get("short").str_or(""); if sh.is_empty() { code.clone() } else { sh } };
+                        let c = s.get("cells").get(&code);
+                        match c.get("grade").as_f64() {
+                            None if t.get("due").bool_or(false) => debts.push(label),
+                            Some(x) if twos && x < 2.5 => low.push(format!("{} («{}»)", label, super::core::fmt_grade(x))),
+                            _ => {}
+                        }
+                    }
+                    if !debts.is_empty() || !low.is_empty() {
+                        rows_all.push((gname.clone(), s.get("name").str_or(""), debts, low));
+                    }
+                }
+            }
+            let title = if only.is_empty() { "Задолженности студентов".to_string() } else { format!("Задолженности студентов — {}", only) };
+            let heads: Vec<String> = vec!["№".into(), "Группа".into(), "Студент".into(), "Не сдано".into(), if twos { "На «2» (пересдать)".into() } else { String::new() }, "Всего".into()].into_iter().filter(|x: &String| !x.is_empty()).collect();
+            let rows: Vec<Vec<String>> = rows_all
+                .iter()
+                .enumerate()
+                .map(|(i, (g, n, d, l))| {
+                    let mut r = vec![(i + 1).to_string(), g.clone(), n.clone(), d.join(", ")];
+                    if twos {
+                        r.push(l.join(", "));
+                    }
+                    r.push((d.len() + l.len()).to_string());
+                    r
+                })
+                .collect();
+            let filt = [p.get("f_semester").str_or(""), p.get("f_subject").str_or("")].iter().filter(|x| !x.is_empty()).cloned().collect::<Vec<_>>().join(", ");
+            let sub = format!("Сформировано {}{}. Долг — работа, которую уже сдавали другие или у которой прошёл срок.", super::report::today_str(), if filt.is_empty() { String::new() } else { format!(" ({})", filt) });
+            let bytes = if path.to_lowercase().ends_with(".xlsx") {
+                let widths: Vec<u32> = heads.iter().map(|h| match h.as_str() { "№" => 5, "Группа" => 12, "Студент" => 30, "Всего" => 8, _ => 40 }).collect();
+                let fills: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|_| String::new()).collect()).collect();
+                super::report::xlsx_table_ex("Долги", &format!("{}  ({})", title, sub), &heads, &rows, &widths, &fills, 3)
+            } else {
+                let widths: Vec<u32> = heads.iter().map(|h| match h.as_str() { "№" => 500, "Группа" => 1200, "Студент" => 3000, "Всего" => 800, _ => 4200 }).collect();
+                let trows: Vec<Vec<(String, String)>> = rows.iter().map(|r| r.iter().map(|x| (x.clone(), String::new())).collect()).collect();
+                let mut blocks = vec![Block::Title(title.clone()), Block::Sub(sub)];
+                if rows.is_empty() {
+                    blocks.push(Block::Para("Задолженностей нет.".into()));
+                } else {
+                    blocks.push(Block::Table { heads: heads.clone(), widths, rows: trows });
+                }
+                super::report::docx_blocks(&title, &blocks, true)
+            };
+            std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path).with("students", rows_all.len()))
+        }
+
+        "journal_student_report" => {
+            // всё о студенте на одной странице: оценки по темам, средние, долги, пропуски, нарушения
+            let path = p.get("path").str_or("");
+            let group = p.get("group").str_or("");
+            let student = p.get("student").str_or("");
+            let v = journal_view(core, p);
+            let g = v.get("groups").as_arr().iter().find(|g| g.get("name").str_or("") == group).cloned().ok_or("Группа не найдена")?;
+            let s = g.get("students").as_arr().iter().find(|s| s.get("name").str_or("") == student).cloned().ok_or("Студент не найден")?;
+            let num = |x: &Json| x.as_f64().map(super::core::fmt_grade).unwrap_or_else(|| "—".into());
+            let mut blocks = vec![Block::Title(student.clone()), Block::Sub(format!("Группа {}. Сформировано {}.", group, super::report::today_str()))];
+            let mut avgs = vec![format!("Средний балл: {}", num(s.get("avg")))];
+            if g.get("has_works").bool_or(false) && g.get("has_tests").bool_or(false) {
+                avgs.push(format!("по работам: {}", num(s.get("avg_works"))));
+                avgs.push(format!("по тестам: {}", num(s.get("avg_tests"))));
+            }
+            for (name, val) in s.get("avg_own").as_obj() {
+                avgs.push(format!("{}: {}", name, num(val)));
+            }
+            blocks.push(Block::Bold(avgs.join(" • ")));
+            let mut rows: Vec<Vec<(String, String)>> = Vec::new();
+            let mut debts: Vec<String> = Vec::new();
+            for t in g.get("topics").as_arr() {
+                let code = t.get("code").str_or("");
+                let kind = t.get("kind").str_or("");
+                let c = s.get("cells").get(&code);
+                let grade = c.get("grade").as_f64();
+                if grade.is_none() && t.get("due").bool_or(false) {
+                    debts.push(code.clone());
+                }
+                let gtxt = match grade {
+                    Some(x) if kind == "custom" => format!("{}{}", super::core::fmt_grade(x), { let u = t.get("unit").str_or(""); if u.is_empty() { String::new() } else { format!(" {}", u) } }),
+                    Some(x) => super::core::fmt_grade(x),
+                    None if t.get("due").bool_or(false) => "не сдано".into(),
+                    None => "—".into(),
+                };
+                let viol = match c.get("violation").str_or("").as_str() { "ai" => "ИИ", "plagiarism" => "списывание", _ => "" };
+                let fill = if kind == "custom" { "" } else { match grade.map(super::report::grade_bucket) { Some(x) if x >= 5.0 => "D9F2E3", Some(x) if x >= 4.0 => "DCEBFB", Some(x) if x >= 3.0 => "FFF1CC", Some(_) => "FBDADA", None => "" } };
+                let title = t.get("title").str_or("");
+                let kind_l = match kind.as_str() { "test" => "тест", "custom" => "", _ => "работа" };
+                rows.push(vec![
+                    (if title.is_empty() { code.clone() } else { format!("{} — {}", code, title) }, String::new()),
+                    (kind_l.into(), String::new()),
+                    (gtxt, fill.into()),
+                    (viol.into(), if viol.is_empty() { String::new() } else { "FBDADA".into() }),
+                    (c.get("comment").str_or("").chars().take(300).collect(), String::new()),
+                ]);
+            }
+            blocks.push(Block::Table { heads: vec!["Тема".into(), "Вид".into(), "Оценка".into(), "Нарушение".into(), "Комментарий".into()], widths: vec![4200, 900, 1100, 1300, 6000], rows });
+            blocks.push(Block::Para(if debts.is_empty() { "Задолженностей нет.".into() } else { format!("Не сдано: {}.", debts.join(", ")) }));
+            std::fs::write(&path, super::report::docx_blocks(&student, &blocks, true)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path))
+        }
+
+        "defense_plan" => {
+            // кого вызвать на устную защиту: признаки ИИ, списывание, совпадение с архивом — с вопросами
+            let path = p.get("path").str_or("");
+            let only = p.get("group").str_or("");
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let mut items: Vec<(String, String, String, Vec<String>, Json)> = Vec::new(); // группа, студент, работа, причины, вопросы
+            for w in &ws.works {
+                if !only.is_empty() && w.group != only {
+                    continue;
+                }
+                let Some(o) = ws.outcomes.get(&w.id) else { continue };
+                let mut why: Vec<String> = Vec::new();
+                match o.violation.as_str() {
+                    "ai" => why.push(format!("признаки ИИ{}", if o.ai_evidence.is_empty() { String::new() } else { format!(": {}", o.ai_evidence.iter().take(2).cloned().collect::<Vec<_>>().join("; ")) })),
+                    "plagiarism" => why.push(format!("совпадает с работой: {}", o.plag.iter().map(|(n, sc)| format!("{} ({} %)", n, (sc * 100.0).round())).collect::<Vec<_>>().join(", "))),
+                    _ => {}
+                }
+                if o.violation.is_empty() && !o.ai_suspect.is_null() && o.ai_decision.is_empty() {
+                    why.push("есть подозрение на ИИ — решение не принято".into());
+                }
+                if let Some(h) = ws.archive_hits.get(&w.id) {
+                    why.push(format!("совпадает с работой прошлых лет: {}", h.iter().map(|(l, sc)| format!("{} ({} %)", l, (sc * 100.0).round())).collect::<Vec<_>>().join(", ")));
+                }
+                if why.is_empty() {
+                    continue;
+                }
+                let (who, _) = core.authors(&ws, w);
+                let code = core.set_for_work(&ws, w).map(|s| s.code.clone()).unwrap_or_default();
+                items.push((w.group.clone(), who.join(", "), if code.is_empty() { w.name.clone() } else { format!("{} ({})", code, w.name) }, why, o.oral.get("questions").clone()));
+            }
+            drop(ws);
+            items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+            let title = if only.is_empty() { "План устной защиты".to_string() } else { format!("План устной защиты — {}", only) };
+            let mut blocks = vec![Block::Title(title.clone()), Block::Sub(format!("Сформировано {}. Студентов: {}. Признаки — подсказка нейросети и автоматических проверок, решение за преподавателем.", super::report::today_str(), items.len()))];
+            let mut no_q = 0;
+            for (i, (g, who, work, why, qs)) in items.iter().enumerate() {
+                blocks.push(Block::Heading(format!("{}. {} — {}", i + 1, who, g)));
+                blocks.push(Block::Para(format!("Работа: {}", work)));
+                blocks.push(Block::Para(format!("Почему: {}.", why.join("; "))));
+                if qs.as_arr().is_empty() {
+                    no_q += 1;
+                    blocks.push(Block::Para("Вопросы не составлены (карточка работы → «Вопросы для устной защиты»).".into()));
+                } else {
+                    for (k, q) in qs.as_arr().iter().enumerate() {
+                        let exp = q.get("expect").str_or("");
+                        blocks.push(Block::Para(format!("{}) {}{}", k + 1, q.get("q").str_or(""), if exp.is_empty() { String::new() } else { format!(" — ожидается: {}", exp) })));
+                    }
+                }
+                blocks.push(Block::Para("Итог защиты: ☐ защитил(а), оценка ____   ☐ не защитил(а)".into()));
+            }
+            if items.is_empty() {
+                blocks.push(Block::Para("Работ с признаками ИИ или списывания нет — защита не нужна.".into()));
+            }
+            std::fs::write(&path, super::report::docx_blocks(&title, &blocks, false)).map_err(|e| format!("не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path).with("students", items.len()).with("no_questions", no_q))
+        }
+
+        "defense_candidates" => {
+            // работы для защиты без вопросов — интерфейс составит вопросы по очереди
+            let only = p.get("group").str_or("");
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let ids: Vec<String> = ws
+                .works
+                .iter()
+                .filter(|w| only.is_empty() || w.group == only)
+                .filter(|w| {
+                    ws.outcomes.get(&w.id).map(|o| (!o.violation.is_empty() || (!o.ai_suspect.is_null() && o.ai_decision.is_empty()) || ws.archive_hits.contains_key(&w.id)) && o.oral.get("questions").as_arr().is_empty() && !o.llm.is_null()).unwrap_or(false)
+                })
+                .map(|w| w.id.clone())
+                .collect();
+            Ok(Json::obj().with("ids", ids))
+        }
+
+        "reminders_check" => {
+            // сроки сдачи из календаря: скоро срок, а работу сдали не все
+            let rem = core.settings().get("reminders").clone();
+            let days = rem.get("days").f64_or(2.0).max(0.0);
+            let v = journal_view(core, &Json::obj());
+            let now = super::core::now_s() as i64;
+            let tz = report::TZ_MIN.load(Ordering::Relaxed) * 60;
+            let mut list: Vec<Json> = Vec::new();
+            let mut sent = rem.get("sent").clone();
+            if sent.is_null() {
+                sent = Json::obj();
+            }
+            let mut to_send: Vec<(String, String)> = Vec::new();
+            for g in v.get("groups").as_arr() {
+                let gname = g.get("name").str_or("");
+                let roster: Vec<&Json> = g.get("students").as_arr().iter().filter(|s| s.get("in_roster").bool_or(true)).collect();
+                for t in g.get("topics").as_arr() {
+                    let dl = t.get("deadline").str_or("");
+                    if dl.is_empty() || t.get("kind").str_or("") == "custom" {
+                        continue;
+                    }
+                    let Some(at) = super::journal::parse_local(&dl) else { continue };
+                    let at = at - tz;
+                    let left = at - now;
+                    if left < 0 || left as f64 > days * 86400.0 {
+                        continue;
+                    }
+                    let code = t.get("code").str_or("");
+                    let missing: Vec<String> = roster.iter().filter(|s| s.get("cells").get(&code).get("grade").is_null()).map(|s| s.get("name").str_or("")).collect();
+                    if missing.is_empty() {
+                        continue;
+                    }
+                    let item = Json::obj().with("group", gname.as_str()).with("code", code.as_str()).with("title", t.get("title").str_or("").as_str()).with("deadline", dl.as_str()).with("hours_left", (left / 3600) as i64).with("missing", missing.len()).with("of", roster.len());
+                    list.push(item);
+                    let key = format!("{}|{}|{}", gname, code, dl);
+                    if sent.get(&key).is_null() {
+                        sent.set(&key, now as f64);
+                        let when = if left < 86400 { format!("через {} ч", (left / 3600).max(1)) } else { format!("через {} дн.", (left + 43199) / 86400) };
+                        to_send.push((format!("Скоро срок {} у {}", code, gname), format!("Срок {} ({}), не сдали {} из {}", when, dl.replace('T', " "), missing.len(), roster.len())));
+                    }
+                }
+            }
+            if !to_send.is_empty() && rem.get("enabled").bool_or(true) {
+                {
+                    let mut st = core.settings.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut r = st.get("reminders").clone();
+                    if r.is_null() {
+                        r = Json::obj();
+                    }
+                    r.set("sent", sent);
+                    st.set("reminders", r);
+                }
+                core.save_settings();
+                let st = core.settings();
+                if super::notify::wanted(&st, "deadline") {
+                    for (t, b) in &to_send {
+                        super::notify::send(core, "deadline", t, b);
+                    }
+                }
+            }
+            Ok(Json::obj().with("items", Json::Arr(list)).with("notified", to_send.len()))
         }
 
         "journal_clear" => {
@@ -2141,7 +2804,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 if i < first_grade || i >= last_grade || kinds.get(&heads[i]).map(|k| k == "custom").unwrap_or(false) {
                     return "";
                 }
-                match x.trim_end_matches(['*', '•']).replace(',', ".").parse::<f64>().ok().map(|g| (g + 1e-9).round() as i64) {
+                match x.trim_end_matches(['*', '•']).replace(',', ".").parse::<f64>().ok().map(|g| super::report::grade_bucket(g) as i64) {
                     Some(5) => "C6EFCE",
                     Some(4) => "DDEBF7",
                     Some(3) => "FFEB9C",
@@ -2475,6 +3138,10 @@ pub fn journal_view(core: &Arc<Core>, p: &Json) -> Json {
                     .with("overdue", dl > 0 && dl < now)
                     .with("note", t.note.as_str())
                     .with("unit", t.unit.as_str())
+                    .with("short", if t.short.is_empty() { super::journal::auto_short(c, &t.title) } else { t.short.clone() })
+                    .with("short_set", t.short.as_str())
+                    .with("moodle", t.moodle.as_str())
+                    .with("mscale", t.mscale.as_str())
                     .with("graded", graded)
                     .with("due", is_due),
             );
@@ -2631,4 +3298,14 @@ fn save_font(core: &Core, name: &str, data: &[u8]) -> Result<String, String> {
     }
     std::fs::write(dir.join(&file), data).map_err(|e| e.to_string())?;
     Ok(file)
+}
+
+/// Настроенное подключение к Moodle: (клиент веб-служб, id пользователя).
+fn moodle_ws_of(core: &Arc<Core>) -> Result<(super::moodle_ws::Ws, i64), String> {
+    let c = core.settings().get("moodle_ws").clone();
+    let ws = super::moodle_ws::Ws::new(&c.get("url").str_or(""), &c.get("token").str_or(""));
+    if ws.token.is_empty() {
+        return Err("Moodle не подключён: Настройки → «Moodle напрямую»".into());
+    }
+    Ok((ws, c.get("userid").f64_or(0.0) as i64))
 }

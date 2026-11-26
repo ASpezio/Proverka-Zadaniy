@@ -1390,3 +1390,15 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .jc-any { margin-top: 10px; max-width: 280px; }
 .j-legend .nv-l { font: 700 10px/1 var(--font-ui); color: var(--g3); background: color-mix(in srgb, var(--g3) 14%, var(--card)); border-radius: 4px; padding: 2px 3px; }
 .j-legend .cm-l { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--ink-3); vertical-align: middle; }
+/* рубрика */
+.rub-sum { margin: 0 0 8px; color: var(--ink-2); }
+.rb-table input.input { width: 100%; }
+.rb-scale { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.rb-scale input { width: 70px; }
+.rub-table td.rub-pts { white-space: nowrap; }
+/* сверка модели с преподавателем */
+.cal-set .tp-table { margin-top: 8px; }
+.cal-down { color: var(--pen); }
+.cal-up { color: var(--g4, #2f6fd6); }
+.bk-ext { display: flex; gap: 8px; align-items: center; } .bk-ext .input { flex: 1; min-width: 0; }
+.jt .gm.long { font-size: 11.5px; letter-spacing: -0.02em; }

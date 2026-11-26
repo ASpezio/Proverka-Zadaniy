@@ -100,9 +100,19 @@ pub fn defaults() -> Json {
         // предметы (дисциплины) и предмет каждого набора заданий
         .with("subjects", Json::arr())
         .with("set_subjects", Json::obj())
+        // рубрики по наборам заданий: {id набора: {items: [{name, max, desc}], scale: {"5": 85, "4": 70, "3": 50}}}
+        .with("rubrics", Json::obj())
+        // архив работ прошлых лет: класть проверенные работы, сравнивать с той же работой (или со всеми)
+        .with("archive", Json::obj().with("enabled", true).with("all_codes", false))
+        // напоминания о сроках из календаря журнала: за сколько дней
+        // копия в свою папку (Яндекс.Диск, флешка): файл экспорта раз в день
+        .with("backup", Json::obj().with("dir", "").with("keep", 10).with("files", false))
+        .with("reminders", Json::obj().with("enabled", true).with("days", 2).with("sent", Json::obj()))
         // CSV: кодировка (utf8bom — понимают и Moodle, и Excel; utf8; cp1251) и разделитель
         .with("csv_encoding", "utf8bom")
         .with("csv_sep", ";")
+        // прямое подключение к Moodle (веб-службы): адрес сайта и ключ; пароль не хранится
+        .with("moodle_ws", Json::obj().with("url", "").with("token", "").with("site", "").with("user", "").with("userid", 0))
         .with("half_grades", true)
         .with("tray", Json::obj().with("close_to_tray", false).with("minimize_to_tray", false))
         .with("llama", Json::obj().with("bin_dir", "").with("models_dir", "").with("selected", Json::arr()).with("ctx", 16384).with("gpu", "gpu").with("kv_q8", true).with("extra", ""))

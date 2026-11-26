@@ -94,6 +94,12 @@ pub fn export(core: &Core, dest: &str, parts: Parts) -> Result<Json, String> {
                 })
                 .collect();
             st.set("providers", Json::Arr(provs));
+            // ключ Moodle — тоже секрет
+            let mut m = st.get("moodle_ws").clone();
+            if !m.is_null() {
+                m.set("token", "");
+                st.set("moodle_ws", m);
+            }
         }
         if !parts.settings {
             // только оформление
@@ -138,6 +144,11 @@ pub fn export(core: &Core, dest: &str, parts: Parts) -> Result<Json, String> {
         let text = std::fs::read_to_string(dd.join("journal.json")).unwrap_or_else(|_| "{}".into());
         z.add_str("journal.json", &text);
         counts.set("journal", json::parse(&text).map(|j| j.get("entries").as_arr().len()).unwrap_or(0));
+        // сверка с оценками преподавателя и архив прошлых лет — часть истории журнала
+        if let Ok(t) = std::fs::read_to_string(dd.join("calibration.json")) {
+            z.add_str("data/calibration.json", &t);
+        }
+        counts.set("archive", add_dir(&mut z, &dd.join("archive"), "data/archive"));
     }
     if parts.results {
         counts.set("results", add_dir(&mut z, &dd.join("results"), "data/results"));
@@ -252,6 +263,14 @@ pub fn import(core: &Core, path: &str, want: Parts) -> Result<Json, String> {
         }
         n
     };
+    if want.journal && has.journal {
+        if let Some(t) = z.read_string("data/calibration.json") {
+            let _ = std::fs::write(dd.join("calibration.json"), t);
+        }
+        if unpack("data/archive/") > 0 {
+            done.push("архив прошлых лет");
+        }
+    }
     if want.results && has.results && unpack("data/results/") > 0 {
         done.push("кэш результатов");
     }
@@ -279,6 +298,9 @@ pub fn import(core: &Core, path: &str, want: Parts) -> Result<Json, String> {
                     .collect();
                 if !provs.is_empty() {
                     next.set("providers", Json::Arr(provs));
+                }
+                if incoming.get("moodle_ws").get("token").str_or("").is_empty() && !cur.get("moodle_ws").is_null() {
+                    next.set("moodle_ws", cur.get("moodle_ws").clone());
                 }
                 if !(want.looks && has.looks) {
                     for k in ["theme", "look_style", "font_ui", "font_head", "font_size", "custom_themes", "custom_fonts"] {

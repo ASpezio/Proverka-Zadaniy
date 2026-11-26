@@ -509,6 +509,10 @@ pub struct Imported {
     pub kind: String,
     /// полное название элемента курса
     pub title: String,
+    /// заголовок столбца в Moodle без вида значения: «Задание:Практическая работа 4.1»
+    pub header: String,
+    /// шкала элемента в Moodle (5, 10, 100…), если оценка пришла из «Значения»
+    pub scale: f64,
 }
 
 /// Разбор таблицы Moodle: «таблица оценок» задания (одна работа, нужен `code`)
@@ -579,6 +583,8 @@ pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Resul
                     comment: c_fb.and_then(|i| r.get(i)).map(|x| strip_tags(x).chars().take(600).collect()).unwrap_or_default(),
                     kind: super::journal::auto_kind(code, "").to_string(),
                     title: String::new(),
+                    header: String::new(),
+                    scale: 5.0,
                 });
             }
             return Ok(out);
@@ -641,6 +647,10 @@ pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Resul
         // шкала столбца «Значение»
         let scale = |i: usize| guess_scale(&rows.iter().skip(1).filter_map(|r| r.get(i).and_then(|x| grade_value(x))).collect::<Vec<_>>());
         let scales: Vec<f64> = by_type.iter().map(|(i, t)| if *t == "value" { scale(*i) } else { 100.0 }).collect();
+        // заголовок для выгрузки обратно в Moodle — как у столбца «Значение» (или первого)
+        let vi = cols.iter().find(|(_, x)| x.3 == "value").or(cols.first()).map(|(i, _)| *i);
+        let header = vi.and_then(|i| head.get(i)).map(|h| header_base(h)).unwrap_or_default();
+        let item_scale = cols.iter().find(|(_, x)| x.3 == "value").map(|(i, _)| scale(*i)).unwrap_or(5.0);
         for r in rows.iter().skip(1) {
             let name = name_of(r);
             if name.is_empty() {
@@ -664,10 +674,27 @@ pub fn import_grades_as(rows: &[Vec<String>], code: &str, prefer: &str) -> Resul
                 comment: fb.and_then(|k| r.get(k)).map(|x| strip_tags(x).chars().take(600).collect()).unwrap_or_default(),
                 kind: kind.to_string(),
                 title: title.clone(),
+                header: header.clone(),
+                scale: item_scale,
             });
         }
     }
     Ok(out)
+}
+
+/// «Задание:Практическая работа 1 (Значение)» → «Задание:Практическая работа 1».
+pub fn header_base(h: &str) -> String {
+    let h = h.trim();
+    if let Some(i) = h.rfind(" (") {
+        if h.ends_with(')') {
+            let t = h[i + 2..h.len() - 1].to_lowercase();
+            let known = ["значен", "real", "value", "процент", "percent", "букв", "letter", "отзыв", "feedback", "комментар", "балл"];
+            if known.iter().any(|k| t.starts_with(k)) {
+                return h[..i].trim().to_string();
+            }
+        }
+    }
+    h.to_string()
 }
 
 /// CSV для «Оценки → Импорт → Файл CSV» в Moodle: почта, ФИО и по столбцу на работу.
@@ -677,22 +704,38 @@ pub fn export_gradebook(students: &[(String, String)], codes: &[String], grade: 
 
 /// То же, с отзывами (столбец «<работа> (отзыв)» сразу после оценки) и выбором разделителя.
 pub fn export_gradebook_full(students: &[(String, String)], codes: &[String], grade: &dyn Fn(&str, &str) -> Option<f64>, feedback: Option<&dyn Fn(&str, &str) -> String>, sep: char) -> String {
+    export_gradebook_named(students, &codes.iter().map(|c| (c.clone(), String::new(), 5.0)).collect::<Vec<_>>(), grade, feedback, sep)
+}
+
+/// Выгрузка в Moodle под именами элементов курса: если тема пришла из Moodle, столбцы называются
+/// как в его экспорте («Задание:Практическая работа 1 (Значение)» / «… (Отзыв)»), и Moodle при импорте
+/// сам узнаёт элементы. Оценка переводится в шкалу элемента (5 → 100 и т. п.).
+/// `items`: (шифр, заголовок Moodle или "", шкала элемента).
+pub fn export_gradebook_named(students: &[(String, String)], items: &[(String, String, f64)], grade: &dyn Fn(&str, &str) -> Option<f64>, feedback: Option<&dyn Fn(&str, &str) -> String>, sep: char) -> String {
+    let codes: Vec<String> = items.iter().map(|x| x.0.clone()).collect();
     let mut head = vec!["Адрес электронной почты".to_string(), "Полное имя".to_string()];
-    for c in codes {
-        head.push(c.clone());
+    for (c, h, _) in items {
+        if h.is_empty() {
+            head.push(c.clone());
+        } else {
+            head.push(format!("{} (Значение)", h));
+        }
         if feedback.is_some() {
-            head.push(format!("{} (отзыв)", c));
+            head.push(if h.is_empty() { format!("{} (отзыв)", c) } else { format!("{} (Отзыв)", h) });
         }
     }
+    let scale_of = |c: &str| items.iter().find(|x| x.0 == c).map(|x| if x.2 > 0.0 { x.2 } else { 5.0 }).unwrap_or(5.0);
     let mut rows: Vec<Vec<String>> = vec![head];
     for (name, email) in students {
         let mut r = vec![email.clone(), name.clone()];
         let mut any = false;
-        for c in codes {
+        for c in codes.iter().map(|x| x.as_str()) {
             match grade(name, c) {
                 Some(g) => {
                     any = true;
-                    r.push(super::core::fmt_grade(g).replace(',', "."));
+                    let sc = scale_of(c);
+                    let v = if (sc - 5.0).abs() < 1e-9 { g } else { (g / 5.0 * sc * 100.0).round() / 100.0 };
+                    r.push(super::core::fmt_grade(v).replace(',', "."));
                 }
                 None => r.push(String::new()),
             }
@@ -733,6 +776,15 @@ mod tests {
         assert!(super::super::journal::mentions_no_variant("какой  вариант? Файл не открывается"));
         assert!(!super::super::journal::mentions_no_variant("Вариант 3, всё верно"));
         assert_eq!(super::super::journal::comment_flags("ИИ. Вариант?"), "ai_text,no_variant");
+        // заголовок Moodle и шкала сохраняются для выгрузки обратно
+        let pr41 = got.iter().find(|x| x.code == "ПР4.1").unwrap();
+        assert_eq!(pr41.header, "Задание:Практическая работа 4.1. Основы");
+        assert_eq!(super::super::journal::auto_short("Тестирование по Разделу 1. Системы автоматизации", ""), "Тест Р1");
+        assert_eq!(super::super::journal::auto_short("Общий итоговый тест по курсу", ""), "Общий итог. тест");
+        assert_eq!(super::super::journal::auto_short("ПР1", ""), "");
+        let csv = export_gradebook_named(&[("Громобоев Тихон".into(), "t@example.com".into())], &[("ПР1".into(), "Задание:Практическая работа 1".into(), 100.0)], &|_, _| Some(4.0), Some(&|_: &str, _: &str| "хорошо".to_string()), ';');
+        assert!(csv.contains("Задание:Практическая работа 1 (Значение);Задание:Практическая работа 1 (Отзыв)"), "{}", csv);
+        assert!(csv.contains(";80;хорошо"), "{}", csv);
     }
 
     #[test]

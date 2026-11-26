@@ -10,7 +10,7 @@ use super::journal::{Entry, Journal};
 use super::json::{self, Json};
 use super::settings;
 use super::text;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -317,6 +317,8 @@ pub struct Workspace {
     pub plag: Vec<(String, String, f64)>,
     /// одинаковые работы напарников (одна работа пары, сданная двумя студентами)
     pub team_dups: Vec<(String, String)>,
+    /// совпадения с архивом работ прошлых лет: id работы → [(чья работа, доля)]
+    pub archive_hits: HashMap<String, Vec<(String, f64)>>,
 }
 
 pub struct Core {
@@ -597,6 +599,9 @@ pub fn ext_of(p: &str) -> String {
 /// Каталог данных: %APPDATA%\proverka, иначе ~/.config/proverka.
 /// Данные из старой папки `ru.pspu.proverka` при первом запуске переносятся сюда.
 pub fn default_data_dir() -> PathBuf {
+    if let Some(p) = portable_dir() {
+        return p;
+    }
     let base = std::env::var("APPDATA")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("XDG_CONFIG_HOME").map(PathBuf::from))
@@ -607,8 +612,36 @@ pub fn default_data_dir() -> PathBuf {
     dir
 }
 
+/// Переносной режим: данные лежат рядом с программой, в папке «Данные» (например, на флешке).
+/// Включается файлом `portable.txt` рядом с exe или уже существующей «Данные/settings.json».
+pub fn portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    let d = dir.join("Данные");
+    if dir.join("portable.txt").exists() || d.join("settings.json").exists() {
+        let _ = std::fs::create_dir_all(&d);
+        Some(d)
+    } else {
+        None
+    }
+}
+
+/// Папка данных переехала (флешка получила другую букву диска, данные перенесли в «Данные»):
+/// пути в сохранённом JSON, указывающие в прежнюю папку, — в текущую. Прежняя запоминается в `data_dir.txt`.
+pub fn rewrite_moved_dir(text: String, data_dir: &Path) -> String {
+    let Ok(old) = std::fs::read_to_string(data_dir.join("data_dir.txt")) else { return text };
+    let old = old.trim().to_string();
+    let new = data_dir.to_string_lossy().to_string();
+    if old.is_empty() || old == new {
+        return text;
+    }
+    let (oj, nj) = (Json::Str(old).to_string(), Json::Str(new).to_string());
+    text.replace(oj.trim_matches('"'), nj.trim_matches('"'))
+}
+
 /// Пути в сохранённом JSON (сессия, настройки), указывающие в старую папку данных, — в новую.
 pub fn rewrite_old_dir(text: String, data_dir: &Path) -> String {
+    let text = rewrite_moved_dir(text, data_dir);
     let Some(base) = data_dir.parent() else { return text };
     let old = base.join("ru.pspu.proverka").to_string_lossy().to_string();
     let new = data_dir.to_string_lossy().to_string();
@@ -693,6 +726,12 @@ impl Core {
         });
         core.restore_session();
         core.restoring.store(false, Ordering::SeqCst);
+        // где лежат данные сейчас — чтобы после переезда (другая буква флешки) поправить пути
+        if std::fs::read_to_string(core.data_dir.join("data_dir.txt")).map(|t| t.trim() != core.data_dir.to_string_lossy()).unwrap_or(true) {
+            core.save_session();
+            core.save_settings();
+            let _ = std::fs::write(core.data_dir.join("data_dir.txt"), core.data_dir.to_string_lossy().as_bytes());
+        }
         // правила оценки могли поменяться (новая версия, присоединённые файлы) —
         // пересчитываем итог уже проверенных работ по сохранённому ответу модели
         core.refinalize_all();
@@ -723,6 +762,41 @@ impl Core {
         while days.len() > 10 {
             let _ = std::fs::remove_dir_all(days.remove(0));
         }
+        let _ = self.backup_external(false);
+    }
+
+    /// Копия в свою папку (Яндекс.Диск, флешка): раз в день — файл экспорта
+    /// «Проверка заданий ГГГГ-ММ-ДД.proverka» (настройки без ключей, работы, журнал, кэш).
+    /// Восстанавливается обычным «Импортом». Хранятся последние `keep` файлов.
+    pub fn backup_external(&self, force: bool) -> Result<Option<String>, String> {
+        let b = self.settings().get("backup").clone();
+        let dir = b.get("dir").str_or("");
+        if dir.trim().is_empty() {
+            return Ok(None);
+        }
+        let dir = PathBuf::from(dir.trim());
+        if !dir.is_dir() {
+            return Err(format!("Папка для копий недоступна: {}", dir.display()));
+        }
+        let day = ymd(now_s() as i64 + super::report::TZ_MIN.load(Ordering::Relaxed) * 60);
+        let dest = dir.join(format!("Проверка заданий {}.proverka", day));
+        if dest.exists() && !force {
+            return Ok(None);
+        }
+        self.save_session();
+        self.journal.lock().unwrap_or_else(|e| e.into_inner()).save();
+        let parts = super::transfer::Parts { settings: true, keys: false, session: true, journal: true, results: true, looks: true, files: b.get("files").bool_or(false) };
+        super::transfer::export(self, &dest.to_string_lossy(), parts)?;
+        let keep = b.get("keep").f64_or(10.0).max(1.0) as usize;
+        let mut old: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.file_name().map(|n| { let n = n.to_string_lossy(); n.starts_with("Проверка заданий ") && n.ends_with(".proverka") }).unwrap_or(false)).collect())
+            .unwrap_or_default();
+        old.sort();
+        while old.len() > keep {
+            let _ = std::fs::remove_file(old.remove(0));
+        }
+        self.log(&format!("Резервная копия: {}", dest.display()));
+        Ok(Some(dest.to_string_lossy().to_string()))
     }
 
     /// Список резервных копий: (папка, сколько оценок в журнале, сколько работ в сессии).
@@ -900,7 +974,7 @@ impl Core {
     // -------------------------------------------------------------- загрузка
 
     /// Раскрывает папки в список файлов поддерживаемых форматов.
-    fn expand(paths: &[String]) -> Vec<(String, Option<String>)> {
+    pub fn expand(paths: &[String]) -> Vec<(String, Option<String>)> {
         let mut out = Vec::new();
         fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, Option<String>)>) {
             if depth > 6 {
@@ -948,7 +1022,7 @@ fn skip_dir(name: &str) -> bool {
 }
 
 /// Разбор одного файла; паника в разборщике не роняет загрузку остальных.
-fn extract_safe(p: &str, bytes: &[u8]) -> Result<docx::Extracted, String> {
+pub fn extract_safe(p: &str, bytes: &[u8]) -> Result<docx::Extracted, String> {
     let p2 = p.to_string();
     let b2 = bytes.to_vec();
     std::panic::catch_unwind(move || docx::extract(&p2, &b2)).map_err(|e| {
@@ -1437,6 +1511,12 @@ impl Core {
         w.transcribed = false;
     }
 
+    /// Рубрика (критерии с баллами) набора заданий этой работы: settings.rubrics[set.id].
+    pub fn rubric_for(&self, ws: &Workspace, w: &Work) -> Rubric {
+        let Some(set) = self.set_for_work(ws, w) else { return Rubric::default() };
+        Rubric::from_json(self.settings().get("rubrics").get(&set.id))
+    }
+
     /// Набор заданий, к которому относится работа.
     /// Подходит ли набор заданий группе работы: «для всех», для этой группы или её направления.
     pub fn set_fits(&self, s: &AssignmentSet, group: &str, program: &str) -> bool {
@@ -1673,6 +1753,24 @@ impl Core {
         });
         ws.plag = pairs;
         ws.team_dups = team_dups;
+        // архив прошлых лет: та же работа (шифр) у студентов прежних групп
+        let arch = self.settings().get("archive").clone();
+        ws.archive_hits = if arch.get("enabled").bool_or(true) {
+            let task_sh: HashSet<u64> = tasks.iter().flat_map(|t| detect::shingle_set(t)).collect();
+            let items: Vec<(String, String, String, HashSet<u64>)> = ws
+                .works
+                .iter()
+                .zip(texts.iter())
+                .map(|(w, t)| {
+                    let code = self.set_for_work(&ws, w).map(|s| s.code.clone()).unwrap_or_default();
+                    let sh: HashSet<u64> = detect::shingle_set(t).difference(&task_sh).copied().collect();
+                    (w.id.clone(), code, format!("{:x}", w.hash), sh)
+                })
+                .collect();
+            super::history::arc_matches(&self.data_dir, &items, threshold, arch.get("all_codes").bool_or(false))
+        } else {
+            HashMap::new()
+        };
         drop(ws);
         self.refinalize_plag();
     }
@@ -2048,6 +2146,11 @@ impl Core {
                 None => parts.push(format!("{:x}", fnv(set.variants.values().map(vtext).collect::<Vec<_>>().join("\n").as_bytes()))),
             }
             parts.push(format!("{:x}", fnv(format!("{}\n{}", set.general_key, set.example).as_bytes())));
+            // критерии рубрики (пороги оценок — нет: оценка по ним пересчитывается без новой проверки)
+            let items = self.settings().get("rubrics").get(&set.id).get("items").clone();
+            if !items.as_arr().is_empty() {
+                parts.push(items.to_string());
+            }
         }
         let st = self.settings();
         parts.push(st.get("criteria").to_string());
@@ -2133,13 +2236,34 @@ impl Core {
         w.deadline = self.deadline_of(&ws, &w);
         let scan = self.scan(&ws, &w);
         let pinfo = self.plag_info(&ws, wid);
-        let o = ws.outcomes.get_mut(wid).ok_or("работа ещё не проверена")?;
-        if o.llm.is_null() {
+        if ws.outcomes.get(wid).map(|o| o.llm.is_null()).unwrap_or(true) {
             return Err("работа ещё не проверена".into());
         }
+        let rub = {
+            let set = self.set_for_work(&ws, &w).map(|s| s.id.clone()).unwrap_or_default();
+            Rubric::from_json(self.settings().get("rubrics").get(&set))
+        };
+        let o = ws.outcomes.get_mut(wid).ok_or("работа ещё не проверена")?;
         let mut llm = o.llm.clone();
         if let Some(m) = o.llm.get("merged_grade").as_f64() {
             llm.set("grade", m);
+        }
+        // рубрика: оценка — по сумме баллов (рубрику можно поменять и пересчитать без новой проверки)
+        let half = self.settings().get("half_grades").bool_or(true);
+        if rub.apply(&mut llm, half) {
+            o.llm.set("rubric", llm.get("rubric").clone());
+            o.llm.set("rubric_total", llm.get("rubric_total").clone());
+            o.llm.set("rubric_max", llm.get("rubric_max").clone());
+            o.llm.set("rubric_grade", llm.get("rubric_grade").clone());
+        } else if !o.llm.get("rubric").is_null() {
+            // рубрику убрали — снова оценка модели
+            if let Some(mg) = o.llm.get("model_grade").as_f64() {
+                if o.llm.get("merged_grade").is_null() {
+                    llm.set("grade", mg);
+                }
+            }
+            o.llm.set("rubric", Json::Null);
+            o.llm.set("rubric_grade", Json::Null);
         }
         let v = self.finalize(&w, &scan, &llm, &pinfo, &o.ai_decision);
         o.plag = pinfo.list;
@@ -2351,6 +2475,10 @@ impl Core {
             .filter_map(|id| ws.works.iter().find(|x| &x.id == id).map(|x| x.name.clone()))
             .collect();
         o.set("team_twin", twin);
+        o.set(
+            "archive_hits",
+            Json::Arr(ws.archive_hits.get(&w.id).map(|v| v.iter().map(|(l, sc)| Json::obj().with("who", l.as_str()).with("score", *sc)).collect()).unwrap_or_default()),
+        );
         let oc = ws.outcomes.get(&w.id).cloned().unwrap_or_default();
         o.set("outcome", oc.to_json(&w.id, &w.path));
         o
@@ -2673,12 +2801,36 @@ impl Core {
         let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
         let mut entries = Vec::new();
         let mut topics: Vec<(String, String, String, String)> = Vec::new();
+        let mut cal: Vec<super::history::CalRec> = Vec::new();
+        let mut arc: Vec<super::history::ArcEntry> = Vec::new();
+        let arch_on = self.settings().get("archive").get("enabled").bool_or(true);
+        let task_sh: HashSet<u64> = ws.sets.iter().flat_map(|s| s.variants.values().map(|v| format!("{}\n{}", v.task_visible, v.key))).flat_map(|t| detect::shingle_set(&t)).collect();
         for w in &ws.works {
             let Some(o) = ws.outcomes.get(&w.id) else { continue };
             let Some(g) = o.final_grade() else { continue };
             let set = self.set_for_work(&ws, w);
             let code = set.map(|s| s.code.clone()).unwrap_or_else(|| "Работа".into());
             let title = set.map(|s| s.title.clone()).unwrap_or_default();
+            // сверка: оценка приложения против итоговой (только работы, проверенные нейросетью)
+            if let Some(auto) = o.grade {
+                if !o.llm.is_null() {
+                    cal.push(super::history::CalRec { key: format!("{:x}", w.hash), code: code.clone(), group: w.group.clone(), model: o.model.clone(), auto, final_: g, date: if o.checked_at > 0 { o.checked_at } else { now_s() } });
+                }
+            }
+            // архив: отпечатки текста для сравнения с работами следующих лет
+            if arch_on && w.visible.split_whitespace().count() > 40 {
+                let (who, _) = self.authors(&ws, w);
+                arc.push(super::history::ArcEntry {
+                    code: code.clone(),
+                    title: title.clone(),
+                    group: w.group.clone(),
+                    student: who.join(", "),
+                    date: if o.checked_at > 0 { o.checked_at } else { now_s() },
+                    hash: format!("{:x}", w.hash),
+                    shingles: detect::shingle_set(&w.visible).difference(&task_sh).copied().collect(),
+                    ..Default::default()
+                });
+            }
             let subject = set.map(|s| self.settings().get("set_subjects").get(&s.id).str_or("")).unwrap_or_default();
             topics.push((w.group.clone(), code.clone(), title, subject));
             let (students, _) = self.authors(&ws, w);
@@ -2701,6 +2853,11 @@ impl Core {
             }
         }
         drop(ws);
+        super::history::cal_add(&self.data_dir, cal);
+        let added = super::history::arc_add(&self.data_dir, arc);
+        if added > 0 {
+            self.log(&format!("Архив прошлых лет: добавлено работ {}", added));
+        }
         let n = entries.len();
         let mut j = self.journal.lock().unwrap_or_else(|e| e.into_inner());
         for e in entries {
@@ -2758,6 +2915,16 @@ impl Core {
                 t.push_str(&format!("Текст работы почти совпадает с другой работой{}. Поэтому работа оценена на «2». Если работа выполнена самостоятельно, подойдите на устную защиту.\n\n", if who.is_empty() { String::new() } else { format!(" ({})", who.join(", ")) }));
             }
             _ => {}
+        }
+        // баллы по критериям рубрики
+        let rub = o.llm.get("rubric").as_arr().to_vec();
+        if !rub.is_empty() && !o.llm.get("rubric_total").is_null() {
+            t.push_str(&format!("Баллы по критериям ({} из {}):\n", fmt_grade(o.llm.get("rubric_total").f64_or(0.0)), fmt_grade(o.llm.get("rubric_max").f64_or(0.0))));
+            for c in &rub {
+                let cm = c.get("comment").str_or("");
+                t.push_str(&format!("• {} — {} из {}{}\n", c.get("name").str_or(""), fmt_grade(c.get("points").f64_or(0.0)), fmt_grade(c.get("max").f64_or(0.0)), if cm.is_empty() { String::new() } else { format!(": {}", cm) }));
+            }
+            t.push('\n');
         }
         let tasks = o.llm.get("tasks").as_arr().to_vec();
         let good: Vec<String> = tasks.iter().filter(|x| x.get("status").str_or("") == "верно").map(|x| x.get("n").str_or("")).collect();
@@ -2877,5 +3044,154 @@ mod ymd_tests {
         assert_eq!(super::ymd(0), "1970-01-01");
         assert_eq!(super::ymd(1795424700), "2026-11-23");
         assert_eq!(super::ymd(951782400), "2000-02-29");
+    }
+}
+
+// ------------------------------------------------------------------ рубрика
+
+/// Критерий рубрики: «Оформление — до 1 балла».
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Crit {
+    pub name: String,
+    pub max: f64,
+    pub desc: String,
+}
+
+/// Рубрика набора заданий: критерии и пороги оценок в процентах от максимума.
+#[derive(Clone, Debug, Default)]
+pub struct Rubric {
+    pub items: Vec<Crit>,
+    /// пороги: «5» от p5 %, «4» от p4 %, «3» от p3 %, ниже — «2»
+    pub p5: f64,
+    pub p4: f64,
+    pub p3: f64,
+}
+
+impl Rubric {
+    pub fn from_json(j: &Json) -> Rubric {
+        let items: Vec<Crit> = j
+            .get("items")
+            .as_arr()
+            .iter()
+            .map(|c| Crit { name: c.get("name").str_or("").trim().to_string(), max: c.get("max").f64_or(0.0).max(0.0), desc: c.get("desc").str_or("").trim().to_string() })
+            .filter(|c| !c.name.is_empty() && c.max > 0.0)
+            .collect();
+        let sc = j.get("scale");
+        Rubric { items, p5: sc.get("5").f64_or(85.0), p4: sc.get("4").f64_or(70.0), p3: sc.get("3").f64_or(50.0) }
+    }
+
+    pub fn total_max(&self) -> f64 {
+        self.items.iter().map(|c| c.max).sum()
+    }
+
+    /// Оценка по проценту набранных баллов.
+    pub fn grade_of(&self, total: f64, half: bool) -> f64 {
+        let max = self.total_max();
+        if max <= 0.0 {
+            return 2.0;
+        }
+        let pct = total / max * 100.0;
+        let g = if pct >= self.p5 {
+            5.0
+        } else if pct >= self.p4 {
+            4.0
+        } else if pct >= self.p3 {
+            3.0
+        } else {
+            2.0
+        };
+        // с половинками: между порогами — «с половиной», если набрано больше середины промежутка
+        if half && g < 5.0 {
+            let (lo, hi) = match g as i64 {
+                4 => (self.p4, self.p5),
+                3 => (self.p3, self.p4),
+                _ => (0.0, self.p3),
+            };
+            if g >= 3.0 && hi > lo && pct >= lo + (hi - lo) * 0.5 {
+                return g + 0.5;
+            }
+        }
+        g
+    }
+
+    /// Текст для нейросети: критерии и формат ответа.
+    pub fn prompt(&self) -> String {
+        let mut s = format!("РУБРИКА ПРЕПОДАВАТЕЛЯ (оценивай строго по ней, максимум {} баллов):\n", fmt_grade(self.total_max()));
+        for (i, c) in self.items.iter().enumerate() {
+            s.push_str(&format!("{}) {} — до {} балл.{}\n", i + 1, c.name, fmt_grade(c.max), if c.desc.is_empty() { String::new() } else { format!(" {}", c.desc) }));
+        }
+        s.push_str("Поставь баллы по каждому критерию (можно дробные, не больше максимума критерия) и добавь в ответ поле \"rubric\": [{\"name\": \"название критерия\", \"points\": число, \"comment\": \"почему столько, коротко\"}] — по всем критериям в том же порядке. Итоговую оценку приложение посчитает по сумме баллов.");
+        s
+    }
+
+    /// Баллы модели → нормализованная рубрика в ответе (`rubric`, `rubric_total`, `rubric_max`)
+    /// и оценка по сумме (`grade`; прежняя оценка модели — в `model_grade`). Нет рубрики — false.
+    pub fn apply(&self, llm: &mut Json, half: bool) -> bool {
+        if self.items.is_empty() {
+            return false;
+        }
+        let given = llm.get("rubric").as_arr().to_vec();
+        let low = |s: &str| s.to_lowercase().replace('ё', "е");
+        let mut out: Vec<Json> = Vec::new();
+        let mut total = 0.0;
+        let mut answered = 0;
+        for (i, c) in self.items.iter().enumerate() {
+            // по названию, иначе по порядку
+            let g = given.iter().find(|x| low(&x.get("name").str_or("")) == low(&c.name)).or_else(|| given.get(i));
+            let pts = g.and_then(|x| x.get("points").as_f64().or_else(|| x.get("points").str_or("").replace(',', ".").parse::<f64>().ok()));
+            if pts.is_some() {
+                answered += 1;
+            }
+            let cm = g.map(|x| x.get("comment").str_or("")).unwrap_or_default();
+            match pts {
+                Some(v) => {
+                    let v = v.clamp(0.0, c.max);
+                    total += v;
+                    out.push(Json::obj().with("name", c.name.as_str()).with("max", c.max).with("points", (v * 100.0).round() / 100.0).with("comment", cm.as_str()));
+                }
+                // балла нет — так и храним (null), чтобы при пересчёте не принять за «0»
+                None => out.push(Json::obj().with("name", c.name.as_str()).with("max", c.max).with("points", Json::Null).with("comment", cm.as_str())),
+            }
+        }
+        if answered == 0 {
+            // модель рубрику не заполнила — оценку не трогаем, но покажем пустую рубрику
+            llm.set("rubric", Json::Arr(out));
+            llm.set("rubric_total", Json::Null);
+            llm.set("rubric_max", self.total_max());
+            llm.set("rubric_grade", Json::Null);
+            return true;
+        }
+        let grade = self.grade_of(total, half);
+        if llm.get("model_grade").is_null() {
+            let mg = llm.get("grade").clone();
+            llm.set("model_grade", mg);
+        }
+        llm.set("rubric", Json::Arr(out));
+        llm.set("rubric_total", (total * 100.0).round() / 100.0);
+        llm.set("rubric_max", self.total_max());
+        llm.set("rubric_grade", grade);
+        llm.set("grade", grade);
+        true
+    }
+}
+
+#[cfg(test)]
+mod rubric_tests {
+    use super::*;
+
+    #[test]
+    fn rubric_grade() {
+        let r = Rubric::from_json(&json::parse(r#"{"items":[{"name":"Расчёты","max":3},{"name":"Оформление","max":1},{"name":"Выводы","max":1}],"scale":{"5":85,"4":70,"3":50}}"#).unwrap());
+        assert_eq!(r.total_max(), 5.0);
+        assert_eq!(r.grade_of(5.0, true), 5.0);
+        assert_eq!(r.grade_of(3.5, false), 4.0); // 70 %
+        assert_eq!(r.grade_of(4.0, true), 4.5); // 80 % — выше середины между 70 и 85
+        assert_eq!(r.grade_of(2.0, true), 2.0);
+        let mut llm = json::parse(r#"{"grade":5,"rubric":[{"name":"Расчёты","points":2,"comment":"ошибка в маске"},{"name":"оформление","points":1},{"name":"Выводы","points":7}]}"#).unwrap();
+        assert!(r.apply(&mut llm, true));
+        assert_eq!(llm.get("rubric_total").as_f64(), Some(4.0)); // «Выводы» обрезаны до максимума 1
+        assert_eq!(llm.get("grade").as_f64(), Some(4.5));
+        assert_eq!(llm.get("model_grade").as_f64(), Some(5.0));
+        assert!(!Rubric::default().apply(&mut llm, true));
     }
 }
