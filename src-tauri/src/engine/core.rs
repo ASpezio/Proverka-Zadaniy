@@ -2839,11 +2839,13 @@ impl Core {
             let Some(g) = o.final_grade() else { continue };
             let set = self.set_for_work(&ws, w);
             let code = set.map(|s| s.code.clone()).unwrap_or_else(|| "Работа".into());
+            // работа без группы — в группу «Без группы», а не в безымянную вкладку журнала
+            let wgroup = if w.group.trim().is_empty() { "Без группы".to_string() } else { w.group.clone() };
             let title = set.map(|s| s.title.clone()).unwrap_or_default();
             // сверка: оценка приложения против итоговой (только работы, проверенные нейросетью)
             if let Some(auto) = o.grade {
                 if !o.llm.is_null() {
-                    cal.push(super::history::CalRec { key: format!("{:x}", w.hash), code: code.clone(), group: w.group.clone(), model: o.model.clone(), auto, final_: g, date: if o.checked_at > 0 { o.checked_at } else { now_s() } });
+                    cal.push(super::history::CalRec { key: format!("{:x}", w.hash), code: code.clone(), group: wgroup.clone(), model: o.model.clone(), auto, final_: g, date: if o.checked_at > 0 { o.checked_at } else { now_s() } });
                 }
             }
             // архив: отпечатки текста для сравнения с работами следующих лет
@@ -2852,7 +2854,7 @@ impl Core {
                 arc.push(super::history::ArcEntry {
                     code: code.clone(),
                     title: title.clone(),
-                    group: w.group.clone(),
+                    group: wgroup.clone(),
                     student: who.join(", "),
                     date: if o.checked_at > 0 { o.checked_at } else { now_s() },
                     hash: format!("{:x}", w.hash),
@@ -2861,13 +2863,13 @@ impl Core {
                 });
             }
             let subject = set.map(|s| self.settings().get("set_subjects").get(&s.id).str_or("")).unwrap_or_default();
-            topics.push((w.group.clone(), code.clone(), title, subject));
+            topics.push((wgroup.clone(), code.clone(), title, subject));
             let (students, _) = self.authors(&ws, w);
             let scan = self.scan(&ws, w);
             // работа в паре — оценка каждому из напарников
             for student in students {
                 entries.push(Entry {
-                    group: w.group.clone(),
+                    group: wgroup.clone(),
                     student,
                     code: code.clone(),
                     grade: Some(g),

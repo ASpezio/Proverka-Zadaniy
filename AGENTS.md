@@ -138,6 +138,12 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.3.2 (исправления)
+* `journal_roster` с пустым списком убирает студентов, варианты и пары, но не группу (`ensure_group`); `group_save` без `old_name` и с `roster` не трогает существующую группу (`Journal::has_group`), переименование в занятое имя запрещено.
+* `group_delete` с `works: true` удаляет и работы группы из текущей проверки (иначе группа возвращается в списки).
+* `journal_add_current`: работа без группы пишется в «Без группы»; `journal_view` пропускает пустые имена групп.
+* UI: копирование через `copyText` (запасной путь через `execCommand`); `($("#id") || {}).innerHTML = …` — запись в элемент, который мог исчезнуть после `await`.
+
 ### Версия 1.3.1
 * Никаких системных окон для вопросов: `askConfirm` — модальное окно в приложении. Событие ядра `notify` main.rs пересылает в окно как `notice` (`showNotice`), уведомление Windows — только если окно не перед глазами (кроме `test`).
 * Папка данных переносится: `data_dir_move` копирует данные и пишет `moved_to.txt` в стандартную папку (`core::standard_data_dir`, `moved_dir`); переносной режим важнее.

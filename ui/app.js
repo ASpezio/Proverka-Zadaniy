@@ -207,6 +207,18 @@ async function refresh() {
   updateRail();
 }
 
+/** Копирование в буфер: если WebView не дал доступ — запасной способ через выделение текста */
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); return true; } catch (_) {}
+  const ta = document.createElement("textarea");
+  ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+  document.body.appendChild(ta); ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  if (!ok) toast("Не удалось скопировать — выделите текст и нажмите Ctrl+C", "err");
+  return ok;
+}
+
 async function saveSettings(patch, quiet = true) {
   try {
     const st = await api("set_settings", { settings: patch });
@@ -862,13 +874,14 @@ function openGroups() {
       const g = gs.find((x) => x.name === name);
       const how = await askChoice(`Удалить группу «${name}»?`, [
         ["all", `Целиком: список студентов${g?.grades ? `, оценки журнала (${g.grades})` : ""}, темы и календарь`],
+        ...((S.state?.works || []).some((w) => w.group === name) ? [["works", "Целиком и вместе с её работами в текущей проверке"]] : []),
         ["reg", "Только из списка групп — оценки журнала останутся (группа будет видна, пока в журнале есть её оценки)"],
       ]);
       if (!how) return;
-      const r = await api("group_delete", { name, entries: how === "all" });
+      const r = await api("group_delete", { name, entries: how !== "reg", works: how === "works" });
       S.state = r; S.journal = r.journal; S.repGroups = null;
       SND.play("delete"); openGroups(); rerender();
-      toast(`Группа «${name}» удалена${g?.works ? `. Её работы (${g.works}) остались на шаге «Работы студентов»` : ""}`, "ok", { label: "Отменить", run: undoLast });
+      toast(`Группа «${name}» удалена${how === "works" ? " вместе с её работами" : g?.works ? `. Её работы (${g.works}) остались на шаге «Работы студентов»` : ""}`, "ok", { label: "Отменить", run: undoLast });
     };
   });
   $("#gNew").onclick = () => editGroup("");
@@ -1058,13 +1071,13 @@ async function openArchive() {
     if (!code) { toast("Укажите шифр работы, например ПР3", "err"); $("#arcCode").focus(); return; }
     const picked = await pickFiles({ directory, multiple: !directory, title: "Работы прошлых лет" });
     if (!picked.length) return;
-    $("#arcOut").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Читаю работы…</span></div>`;
+    ($("#arcOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Читаю работы…</span></div>`;
     try {
       const x = await api("archive_add_paths", { paths: picked, code, group: $("#arcGroup").value.trim(), year: +$("#arcYear").value });
       S.state = await api("state"); updateRail();
       toast(`В архив добавлено работ: ${x.added}${x.skipped.length ? `, пропущено: ${x.skipped.length}` : ""}`);
       openArchive();
-    } catch (e) { $("#arcOut").innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; }
+    } catch (e) { ($("#arcOut") || {}).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; }
   };
   $("#arcFiles").onclick = () => add(false);
   $("#arcDir").onclick = () => add(true);
@@ -1090,7 +1103,7 @@ function openRubric(setId) {
     <div id="rbOut"></div>`);
   const draw = () => {
     const total = items.reduce((a, c) => a + (+c.max || 0), 0);
-    $("#rbRows").innerHTML = `<table class="tp-table rb-table"><thead><tr><th>Критерий</th><th>Баллов</th><th>Что смотреть (для нейросети)</th><th></th></tr></thead><tbody>${items.map((c, i) => `<tr>
+    ($("#rbRows") || {}).innerHTML = `<table class="tp-table rb-table"><thead><tr><th>Критерий</th><th>Баллов</th><th>Что смотреть (для нейросети)</th><th></th></tr></thead><tbody>${items.map((c, i) => `<tr>
       <td><input class="input sm" data-rb="name" data-i="${i}" value="${esc(c.name)}" placeholder="Например: расчёты"></td>
       <td><input class="input sm" data-rb="max" data-i="${i}" type="number" min="0.5" step="0.5" value="${c.max}" style="width:72px"></td>
       <td><input class="input sm" data-rb="desc" data-i="${i}" value="${esc(c.desc || "")}" placeholder="необязательно"></td>
@@ -1108,7 +1121,7 @@ function openRubric(setId) {
       S.state = r; updateRail();
       toast(rubric.items.length ? `Рубрика сохранена${r.recalculated ? `, пересчитано работ: ${r.recalculated}` : ""}` : "Рубрика убрана");
       closeDrawer(); rerender();
-    } catch (e) { $("#rbOut").innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; }
+    } catch (e) { ($("#rbOut") || {}).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; }
   };
   $("#rbSave").onclick = () => {
     const clean = items.filter((c) => c.name.trim() && +c.max > 0).map((c) => ({ name: c.name.trim(), max: +c.max, desc: (c.desc || "").trim() }));
@@ -1152,7 +1165,7 @@ async function openSet(code) {
     <div id="varBody"></div>`);
   const show = (id) => {
     const v = vars.find((x) => x.id === id);
-    $("#varBody").innerHTML = `
+    ($("#varBody") || {}).innerHTML = `
       <h3 class="sec">Скрытые приписки <span class="count">${v.hidden.length}</span></h3>
       ${v.hidden.map((h, i) => `<div class="hidden-frag reveal" style="animation-delay:${i * 90}ms">${esc(h)}</div>`).join("") || `<p class="muted">В этом варианте скрытого текста нет.</p>`}
       ${v.markers.length ? `<h3 class="sec">Слова-маркеры</h3><div style="display:flex;gap:6px;flex-wrap:wrap">${v.markers.map((m) => `<span class="chip uv">«${esc(m)}»</span>`).join("")}</div>
@@ -1923,12 +1936,12 @@ function oralHtml(oral) {
 function bindOral(id, w) {
   const gen = $("#oralGen");
   if (gen) gen.onclick = async () => {
-    $("#oralBox").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Нейросеть читает работу и составляет вопросы…</span></div>`;
+    ($("#oralBox") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Нейросеть читает работу и составляет вопросы…</span></div>`;
     try {
       const r = await api("oral", { id, regenerate: true });
-      $("#oralBox").innerHTML = oralHtml(r);
+      ($("#oralBox") || {}).innerHTML = oralHtml(r);
     } catch (e) {
-      $("#oralBox").innerHTML = oralHtml(null);
+      ($("#oralBox") || {}).innerHTML = oralHtml(null);
       toast("Не удалось составить вопросы: " + e, "err");
     }
     bindOral(id, w);
@@ -1937,8 +1950,7 @@ function bindOral(id, w) {
   if (copy) copy.onclick = async () => {
     const r = await api("oral", { id });
     const t = r.questions.map((q, i) => `${i + 1}. ${q.q}\n   Ожидаемый ответ: ${q.expect}`).join("\n\n");
-    await navigator.clipboard.writeText(t);
-    toast("Вопросы скопированы");
+    if (await copyText(t)) toast("Вопросы скопированы");
   };
   const word = $("#oralWord");
   if (word) word.onclick = async () => {
@@ -1972,7 +1984,7 @@ async function showFeedback(id, w) {
     catch (e) { toast("Не получилось: " + e, "err"); }
     b.disabled = false; b.textContent = "Написать нейросетью";
   };
-  $("#fbCopy").onclick = async () => { await navigator.clipboard.writeText($("#fbText").value); toast("Скопировано"); };
+  $("#fbCopy").onclick = async () => { if (await copyText($("#fbText").value)) toast("Скопировано"); };
   $("#fbWord").onclick = async () => {
     await save(true);
     const path = await pickSave(`Отзыв_${(w.student || w.name).replace(/[\\/:*?"<>|]/g, "")}.docx`, "docx");
@@ -1984,7 +1996,7 @@ async function showFeedback(id, w) {
 
 function openDrawer(html) {
   if (!$("#drawer").classList.contains("on")) SND.play("drawer");
-  $("#drawerBody").innerHTML = html;
+  ($("#drawerBody") || {}).innerHTML = html;
   $("#drawerBody").scrollTop = 0;
   $("#drawer").classList.add("on");
   $("#drawerBackdrop").classList.add("on");
@@ -2288,7 +2300,7 @@ function renderCtxPrivacy() {
     if (!t) return;
     try {
       const r = await api("anon_preview", { text: t });
-      $("#anonOut").innerHTML = `<pre class="code" style="margin-top:10px;white-space:pre-wrap">${esc(r.text)}</pre><div class="small muted">Известных приложению ФИО: ${r.people}. Имена берутся из работ и списков групп — загрузите список группы, чтобы обезличивание было надёжнее.</div>`;
+      ($("#anonOut") || {}).innerHTML = `<pre class="code" style="margin-top:10px;white-space:pre-wrap">${esc(r.text)}</pre><div class="small muted">Известных приложению ФИО: ${r.people}. Имена берутся из работ и списков групп — загрузите список группы, чтобы обезличивание было надёжнее.</div>`;
     } catch (e) { toast(String(e), "err"); }
   };
 }
@@ -2355,7 +2367,7 @@ async function deleteProvider(id) {
   renderProviders();
   renderDoubleCheck();
   const act = activeProvider();
-  if (act) editProvider(act.id); else $("#provEdit").innerHTML = "";
+  if (act) editProvider(act.id); else ($("#provEdit") || {}).innerHTML = "";
   toast(`Удалено: ${p.name}`, "ok", { label: "Вернуть", run: async () => { await saveSettings({ providers: [...(settings().providers || []), p] }); go("model"); } });
 }
 
@@ -2558,7 +2570,7 @@ function editProvider(id) {
   if (!p) return;
   const local = isLocal(p);
   const models = S.models[p.id] || S.models[p.kind] || [];
-  $("#provEdit").innerHTML = `<div class="card pad" style="margin-top:14px;animation:fadeIn .4s both">
+  ($("#provEdit") || {}).innerHTML = `<div class="card pad" style="margin-top:14px;animation:fadeIn .4s both">
     <div class="grid2">
       <label class="field"><span>Название</span><input class="input" data-f="name" value="${esc(p.name)}"></label>
       <label class="field"><span>Адрес сервера</span><input class="input" data-f="base_url" value="${esc(p.base_url)}"></label>
@@ -2617,7 +2629,7 @@ function editProvider(id) {
   };
   $("#testProv").onclick = async () => {
     await upd();
-    $("#testRes").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Отправляю короткий вопрос модели…</span></div>`;
+    ($("#testRes") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Отправляю короткий вопрос модели…</span></div>`;
     const r = await api("test_provider", { provider: (settings().providers || []).find((x) => x.id === id) });
     if (r.ok && r.n_ctx) {
       const all = (settings().providers || []).map((x) => (x.id === id ? { ...x, num_ctx: r.n_ctx } : x));
@@ -2625,7 +2637,7 @@ function editProvider(id) {
       const f = $('#provEdit [data-f="num_ctx"]');
       if (f) f.value = r.n_ctx;
     }
-    $("#testRes").innerHTML = r.ok
+    ($("#testRes") || {}).innerHTML = r.ok
       ? `<div class="chip ok" style="padding:8px 12px">${ICON.check} Модель ответила за ${(r.ms / 1000).toFixed(1)} с: «${esc(r.reply)}»${r.n_ctx ? ` • контекст ${r.n_ctx} токенов` : ""}</div>`
       : `<div class="chip bad" style="padding:8px 12px;white-space:normal">${esc(r.error)}</div>`;
   };
@@ -2736,14 +2748,14 @@ function setupModeTabs(mode) {
 async function loadMcp() {
   try {
     const m = await api("mcp_info");
-    $("#mcpBox").innerHTML = `
+    ($("#mcpBox") || {}).innerHTML = `
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px"><span class="chip ok">${ICON.check} ${esc(m.server.title || m.server.name)} ${esc(m.server.version)}</span><span class="chip">протокол ${esc(m.protocol)}</span><span class="chip">${m.tools.length} инструментов</span></div>
       <p class="small" style="margin:0 0 12px;max-width:80ch">Проверка внутри приложения идёт через этот сервер: каждая работа запрашивается инструментами MCP, оценка сдаётся инструментом submit_grade. Тот же сервер можно подключить к LM Studio, Claude Desktop или Cursor — вставьте в их mcp.json:</p>
       <div style="position:relative"><pre class="code" id="mcpCfg">${esc(m.config)}</pre><button class="btn sm" id="copyCfg" style="position:absolute;right:8px;top:8px">${ICON.copy}Копировать</button></div>
       <h3 class="sec" style="font-size:16px">Инструменты</h3>
       <div class="tool-list">${m.tools.map((t) => `<div class="tool"><code>${esc(t.name)}</code> — ${esc(t.description)}</div>`).join("")}</div>`;
-    $("#copyCfg").onclick = async () => { await navigator.clipboard.writeText(m.config); toast("Скопировано"); };
-  } catch (e) { $("#mcpBox").innerHTML = `<span class="chip bad">${esc(e)}</span>`; }
+    $("#copyCfg").onclick = async () => { if (await copyText(m.config)) toast("Скопировано"); };
+  } catch (e) { ($("#mcpBox") || {}).innerHTML = `<span class="chip bad">${esc(e)}</span>`; }
 }
 
 // ---------------------------------------------------------------- 4. Проверка
@@ -3061,7 +3073,7 @@ VIEWS.mcplog = (v) => {
   $("#mlTag")?.addEventListener("change", (e) => { ML.work = e.target.value; renderConsole(); });
   $("#mlFollow").onchange = (e) => { ML.follow = e.target.checked; };
   const plain = () => mlFiltered().map((m) => m.kind === "log" ? `• ${m.line}` : `[${m.tag}] ${m.dir === "→" ? "клиент →" : "← сервер"} ${m.msg}`).join("\n");
-  $("#mlCopy").onclick = async () => { await navigator.clipboard.writeText(plain()); toast("Журнал скопирован"); };
+  $("#mlCopy").onclick = async () => { if (await copyText(plain())) toast("Журнал скопирован"); };
   $("#mlSave").onclick = async () => {
     const path = await pickSave(`Журнал_MCP_${new Date().toISOString().slice(0, 10)}.txt`, "txt");
     if (!path) return;
@@ -3148,7 +3160,7 @@ function openPickWorks() {
   const busy = (w) => w.outcome.status === "queued" || w.outcome.status === "running";
   const draw = () => {
     const list = shown();
-    $("#pkList").innerHTML = list.length ? list.map((w) => `<label class="pick-row ${busy(w) ? "busy" : ""}">
+    ($("#pkList") || {}).innerHTML = list.length ? list.map((w) => `<label class="pick-row ${busy(w) ? "busy" : ""}">
       <input type="checkbox" class="cbx" data-pk="${w.id}" ${sel.has(w.id) ? "checked" : ""} ${busy(w) ? "disabled" : ""}>
       <span class="pick-name"><b>${esc(w.student_in_roster ? w.student : w.student || w.name)}</b><small>${esc(w.group ? w.group + " • " : "")}${esc(w.name)}${w.sources?.length ? ` + ${w.sources.length}` : ""}</small></span>
       <span class="pick-st">${busy(w) ? `<span class="chip uv">${w.outcome.status === "running" ? "проверяется" : "в очереди"}</span>` : w.outcome.status === "done" ? `<span class="chip ok">«${fmtG(w.outcome.final_grade)}»</span>` : w.outcome.status === "error" ? `<span class="chip bad">ошибка</span>` : `<span class="muted small">не проверена</span>`}</span></label>`).join("") : emptyArt("Нет таких работ", "Выберите другой фильтр");
@@ -3576,7 +3588,7 @@ VIEWS.report = async (v) => {
   const rep = await api("report_preview", { group: rg });
   const s = rep.stats;
   if (!rep.rows.length) {
-    $("#repBody").innerHTML = emptyArt("Ведомость пуста", "Загрузите и проверьте работы — строки появятся здесь.");
+    ($("#repBody") || {}).innerHTML = emptyArt("Ведомость пуста", "Загрузите и проверьте работы — строки появятся здесь.");
     return;
   }
   const max = Math.max(1, s.g5, s.g4, s.g3, s.g2);
@@ -3584,7 +3596,7 @@ VIEWS.report = async (v) => {
   const byId = (id) => works().find((w) => w.id === id);
   const rows = rep.rows.filter((r) => f === "all" || (f === "viol" ? r.violation.startsWith("Да") : f === "none" ? r.grade == null : f === "look" ? byId(r.id)?.outcome.review?.length : String(Math.floor(r.grade)) === f));
   const groups = [...new Set(rep.rows.map((r) => r.group))];
-  $("#repBody").innerHTML = `
+  ($("#repBody") || {}).innerHTML = `
     <div class="stats">
       <div class="card stat"><div class="dist">${[5, 4, 3, 2].map((g) => `<div class="bar"><i data-h="${(s["g" + g] / max) * 100}" style="background:var(--g${g})"></i><span style="color:var(--g${g})">${g}</span></div>`).join("")}</div><div class="k">Распределение оценок</div></div>
       <div class="card stat"><div class="v" data-count="${s.avg}" data-dec="2">0</div><div class="k">средний балл</div></div>
@@ -3792,7 +3804,7 @@ function openMoodleImport() {
     if (!group) { toast("Укажите группу", "err"); $("#mdNew").focus(); return; }
     const picked = await pickFiles({ directory, multiple: false, title: directory ? "Папка с ответами Moodle" : "Архив Moodle (.zip)", only: [{ name: "Архив Moodle", extensions: ["zip"] }] });
     if (!picked.length) return;
-    $("#mdOut").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Распаковываю и читаю ответы…</span></div>`;
+    ($("#mdOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Распаковываю и читаю ответы…</span></div>`;
     try {
       if (sel.value === "__new" && !groupsList().some((g) => g.name === group)) await api("group_save", { name: group, program: "" });
       const dlv = $("#mdDeadline").value;
@@ -3800,10 +3812,10 @@ function openMoodleImport() {
       S.state = st; updateRail(); SND.play("add");
       extractPdfs();
       const m = st.moodle;
-      $("#mdOut").innerHTML = `<div class="ev"><span class="w ok"></span><div>${m.updated ? `Дополнено работ: <b>${m.updated}</b> — к ним присоединены недостающие файлы студентов (Excel, PowerPoint, PDF, фото); проверьте их заново. ` : ""}${m.students || !m.updated ? `Добавлено работ: <b>${m.students}</b> в группу «${esc(m.group)}».` : ""}${m.extra ? ` Ещё ${m.extra} файлов (Excel, PowerPoint, PDF, фото) присоединены к работам своих студентов и проверяются вместе с ними.` : ""}${m.skipped_count ? `<small>Пропущено файлов (не документы или без ФИО): ${m.skipped_count}${m.skipped.length ? ` — ${m.skipped.slice(0, 5).map(esc).join(", ")}${m.skipped_count > 5 ? "…" : ""}` : ""}</small>` : ""}</div></div>${st.errors?.length ? `<div class="small" style="color:var(--pen)">Не удалось прочитать: ${st.errors.slice(0, 3).map(esc).join("; ")}</div>` : ""}`;
+      ($("#mdOut") || {}).innerHTML = `<div class="ev"><span class="w ok"></span><div>${m.updated ? `Дополнено работ: <b>${m.updated}</b> — к ним присоединены недостающие файлы студентов (Excel, PowerPoint, PDF, фото); проверьте их заново. ` : ""}${m.students || !m.updated ? `Добавлено работ: <b>${m.students}</b> в группу «${esc(m.group)}».` : ""}${m.extra ? ` Ещё ${m.extra} файлов (Excel, PowerPoint, PDF, фото) присоединены к работам своих студентов и проверяются вместе с ними.` : ""}${m.skipped_count ? `<small>Пропущено файлов (не документы или без ФИО): ${m.skipped_count}${m.skipped.length ? ` — ${m.skipped.slice(0, 5).map(esc).join(", ")}${m.skipped_count > 5 ? "…" : ""}` : ""}</small>` : ""}</div></div>${st.errors?.length ? `<div class="small" style="color:var(--pen)">Не удалось прочитать: ${st.errors.slice(0, 3).map(esc).join("; ")}</div>` : ""}`;
       S.filters.wGroup = m.group;
       if (S.view === "works") { VIEWS.works($("#view")); applyLock(); }
-    } catch (e) { $("#mdOut").innerHTML = `<div class="small" style="color:var(--pen)">${esc(String(e))}</div>`; SND.play("error"); }
+    } catch (e) { ($("#mdOut") || {}).innerHTML = `<div class="small" style="color:var(--pen)">${esc(String(e))}</div>`; SND.play("error"); }
   };
   $("#mdZip").onclick = () => go2(false);
   $("#mdDir").onclick = () => go2(true);
@@ -3817,17 +3829,17 @@ function openMoodleImport() {
       if (!x.assign) { toast("Выберите задание", "err"); return; }
       const group = sel.value === "__new" ? $("#mdNew").value.trim() || x.mgroup_name || "" : sel.value;
       if (!group) { toast("Укажите группу", "err"); return; }
-      $("#mdOut").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Скачиваю ответы из Moodle…</span></div>`;
+      ($("#mdOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Скачиваю ответы из Moodle…</span></div>`;
       try {
         if (!groupsList().some((g) => g.name === group)) await api("group_save", { name: group, program: "" });
         const dlv = $("#mdDeadline").value;
         const st = await api("moodle_ws_fetch", { ...x, group, roster: $("#mdRoster").checked, deadline: dlv ? Math.floor(new Date(dlv).getTime() / 1000) : x.due || 0 });
         S.state = st; updateRail(); SND.play("add"); extractPdfs();
         const m = st.moodle, f = st.fetched || {};
-        $("#mdOut").innerHTML = `<div class="ev"><span class="w ok"></span><div>Скачано из Moodle: ответов <b>${f.students}</b>, файлов ${f.files}. ${m.updated ? `Дополнено работ: ${m.updated}. ` : ""}Добавлено работ: <b>${m.students}</b> в группу «${esc(m.group)}».${f.errors?.length ? `<small>Не скачались: ${f.errors.slice(0, 3).map(esc).join("; ")}</small>` : ""}</div></div>`;
+        ($("#mdOut") || {}).innerHTML = `<div class="ev"><span class="w ok"></span><div>Скачано из Moodle: ответов <b>${f.students}</b>, файлов ${f.files}. ${m.updated ? `Дополнено работ: ${m.updated}. ` : ""}Добавлено работ: <b>${m.students}</b> в группу «${esc(m.group)}».${f.errors?.length ? `<small>Не скачались: ${f.errors.slice(0, 3).map(esc).join("; ")}</small>` : ""}</div></div>`;
         S.filters.wGroup = m.group;
         if (S.view === "works") { VIEWS.works($("#view")); applyLock(); }
-      } catch (e) { $("#mdOut").innerHTML = `<div class="small" style="color:var(--pen)">${esc(String(e))}</div>`; SND.play("error"); }
+      } catch (e) { ($("#mdOut") || {}).innerHTML = `<div class="small" style="color:var(--pen)">${esc(String(e))}</div>`; SND.play("error"); }
     };
   }
 }
@@ -3893,13 +3905,13 @@ function bindMwsSettings() {
   if (!box) return;
   const rerender = () => { box.innerHTML = mwsSettingsHtml(); bindMwsSettings(); };
   $("#mwsGo")?.addEventListener("click", async () => {
-    $("#mwsOut").innerHTML = `<div class="thinking"><div class="spinner"></div><span>Подключаюсь…</span></div>`;
+    ($("#mwsOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Подключаюсь…</span></div>`;
     try {
       S.state = await api("moodle_ws_connect", { url: $("#mwsUrl").value, username: $("#mwsUser").value, password: $("#mwsPass").value, token: $("#mwsTok").value });
       $("#mwsPass").value = "";
       S.mwsCourses = null; S.mwsC = null;
       rerender(); toast("Moodle подключён"); SND.play("done");
-    } catch (e) { $("#mwsOut").innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; SND.play("error"); }
+    } catch (e) { ($("#mwsOut") || {}).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`; SND.play("error"); }
   });
   $("#mwsCheck")?.addEventListener("click", async () => {
     try { const n = (await mwsCourses(true)).length; toast(`Связь есть, курсов: ${n}`); } catch (e) { toast(String(e), "err"); }
@@ -4245,9 +4257,17 @@ function renderJournal() {
 async function deleteGroup(name) {
   const n = S.journal?.groups.find((g) => g.name === name)?.students.length || 0;
   const works = (S.state?.works || []).filter((w) => w.group === name).length;
-  if (!(await askConfirm(`Удалить группу «${name}»? Пропадут её список студентов${n ? ` (${n} чел.)` : ""}, оценки журнала, темы и календарь.${works ? ` Работы группы (${works}) на шаге «Работы студентов» останутся — их можно удалить там.` : ""} Отменить можно сразу после.`))) return;
+  let withWorks = false;
+  if (works) {
+    // работы группы в текущей проверке держат группу в списках — предлагаем убрать и их
+    const how = await askChoice(`Удалить группу «${name}»? Пропадут список студентов${n ? ` (${n} чел.)` : ""}, оценки журнала, темы и календарь. Отменить можно сразу после.`, [
+      ["all", `Вместе с её работами в проверке (${works})`],
+      ["journal", "Только журнал — работы останутся, и группа будет видна, пока они есть"]]);
+    if (!how) return;
+    withWorks = how === "all";
+  } else if (!(await askConfirm(`Удалить группу «${name}»? Пропадут её список студентов${n ? ` (${n} чел.)` : ""}, оценки журнала, темы и календарь. Отменить можно сразу после.`))) return;
   try {
-    const r = await api("group_delete", { name, entries: true, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
+    const r = await api("group_delete", { name, entries: true, works: withWorks, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
     S.state = r; S.journal = r.journal; S.repGroups = null;
     if (S.jGroup === name) S.jGroup = null;
     updateRail(); if (S.view === "journal") renderJournal();
@@ -4332,7 +4352,7 @@ function editTopics(group) {
     <div class="section-actions"><button class="btn sm" id="avgAdd">${ICON.plus}Добавить средний</button><button class="btn sm primary" id="avgSave">Сохранить средние</button></div>`);
   const codes = topics.filter((t) => t.kind !== "custom").map((t) => t.code);
   const drawAvg = () => {
-    $("#avgList").innerHTML = avgs.map((a, i) => `<div class="avg-def"><input class="input sm" data-an="${i}" value="${esc(a.name)}" placeholder="Название, например «Модуль 1»">
+    ($("#avgList") || {}).innerHTML = avgs.map((a, i) => `<div class="avg-def"><input class="input sm" data-an="${i}" value="${esc(a.name)}" placeholder="Название, например «Модуль 1»">
       <div class="avg-codes">${codes.map((c) => `<label class="idea"><input type="checkbox" class="cbx" data-ac="${i}" value="${esc(c)}" ${a.codes.includes(c) ? "checked" : ""}><span>${esc(c)}</span></label>`).join("")}</div>
       <button class="icon-btn" data-adel="${i}" title="Убрать">✕</button></div>`).join("") || `<p class="small muted">Своих средних нет.</p>`;
     $$("[data-an]").forEach((x) => (x.oninput = () => (avgs[+x.dataset.an].name = x.value)));
@@ -4608,10 +4628,10 @@ function editRoster(group) {
     rows = rows.filter((r) => r.name.trim());
     render();
     const withVar = list.filter((r) => r.variant).length;
-    $("#rgStatus").innerHTML = `<div class="ev"><span class="w ok"></span><div>Из ${esc(from)}: найдено ${list.length} чел.${withVar ? `, с вариантами — ${withVar}` : ""}. Добавлено ${added}${upd ? `, обновлены варианты у ${upd}` : ""}. Проверьте список и нажмите «Сохранить».</div></div>`;
+    ($("#rgStatus") || {}).innerHTML = `<div class="ev"><span class="w ok"></span><div>Из ${esc(from)}: найдено ${list.length} чел.${withVar ? `, с вариантами — ${withVar}` : ""}. Добавлено ${added}${upd ? `, обновлены варианты у ${upd}` : ""}. Проверьте список и нажмите «Сохранить».</div></div>`;
   };
-  const busy = (t) => ($("#rgStatus").innerHTML = `<div class="thinking"><div class="spinner"></div><span>${esc(t)}</span></div>`);
-  const fail = (e) => ($("#rgStatus").innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`);
+  const busy = (t) => (($("#rgStatus") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>${esc(t)}</span></div>`);
+  const fail = (e) => (($("#rgStatus") || {}).innerHTML = `<div class="ev"><span class="w bad"></span><div>${esc(String(e))}</div></div>`);
   $("#rgFile").onclick = async () => {
     const picked = await pickFiles({ multiple: false, title: "Список группы", only: [{ name: "Список: Excel, Word, фото, текст", extensions: ["xlsx", "xlsm", "xls", "docx", "doc", "odt", "rtf", "txt", "csv", "jpg", "jpeg", "png", "webp", "bmp"] }] });
     if (!picked.length) return;
@@ -4649,6 +4669,11 @@ function editRoster(group) {
   };
   const save = async (list) => {
     const name = $("#rgName").value.trim();
+    const isNewGroup = !group;
+    // новая группа с именем уже существующей затёрла бы её список
+    if (isNewGroup && (S.journal?.groups || []).some((g) => g.name.toLowerCase() === name.toLowerCase() && (g.roster || []).length)) {
+      toast(`Группа «${name}» уже есть — откройте её и нажмите «Список и варианты»`, "err"); return;
+    }
     if (!name) { toast("Укажите название группы", "err"); return; }
     const clean = list.map((r) => ({ name: r.name.trim(), variant: String(r.variant || "").trim(), team: String(r.team || "").trim() })).filter((r) => r.name);
     const variants = {}, teams = {};
@@ -4663,7 +4688,7 @@ function editRoster(group) {
     closeDrawer();
     if (S.view === "journal") renderJournal();
     await refresh();
-    toast(clean.length ? `Список сохранён: ${clean.length} чел.${Object.keys(variants).length ? `, вариантов роздано: ${Object.keys(variants).length}` : ""}` : "Список удалён");
+    toast(clean.length ? `Список сохранён: ${clean.length} чел.${Object.keys(variants).length ? `, вариантов роздано: ${Object.keys(variants).length}` : ""}` : isNewGroup ? `Группа «${name}» создана — добавьте список студентов, когда будет готов` : "Список группы очищен");
   };
   $("#rgSave").onclick = () => save(rows);
   $("#rgDel")?.addEventListener("click", () => save([]));
@@ -5682,14 +5707,14 @@ async function openSettings() {
   $("#sTg").onclick = (e) => { e.preventDefault(); $("#creditBtn").click(); };
   const bkRender = (list) => {
     const fmtDay = (n) => n.split("-").reverse().join(".");
-    $("#bkList").innerHTML = list.length ? list.map((b) => `<div class="bk-row"><b>${esc(fmtDay(b.name))}</b><span class="small muted">работ: ${b.works}, оценок в журнале: ${b.journal}</span><button class="btn sm ghost" data-bk="${esc(b.name)}">Восстановить</button></div>`).join("") : `<p class="small muted">Копий пока нет.</p>`;
+    ($("#bkList") || {}).innerHTML = list.length ? list.map((b) => `<div class="bk-row"><b>${esc(fmtDay(b.name))}</b><span class="small muted">работ: ${b.works}, оценок в журнале: ${b.journal}</span><button class="btn sm ghost" data-bk="${esc(b.name)}">Восстановить</button></div>`).join("") : `<p class="small muted">Копий пока нет.</p>`;
     $$("[data-bk]").forEach((x) => (x.onclick = async () => {
       if (!(await askConfirm(`Вернуть работы, журнал и настройки к состоянию на ${fmtDay(x.dataset.bk)}? Текущее состояние можно будет вернуть кнопкой «Отменить».`))) return;
       try { S.state = await api("backup_restore", { name: x.dataset.bk }); S.journal = null; updateRail(); closeDrawer(); go(S.view); toast(`Восстановлена копия от ${fmtDay(x.dataset.bk)}`, "ok", { label: "Отменить", run: undoLast }); } catch (e) { toast(String(e), "err"); }
     }));
   };
   let bkDir = "";
-  api("backups").then((r) => { bkDir = r.dir; bkRender(r.list); }).catch(() => ($("#bkList").innerHTML = ""));
+  api("backups").then((r) => { bkDir = r.dir; bkRender(r.list); }).catch(() => (($("#bkList") || {}).innerHTML = ""));
   $("#bkNow").onclick = async () => { try { const r = await api("backup_now"); bkRender(r.list); toast(r.external_error ? `Копия сохранена здесь, но не в вашу папку: ${r.external_error}` : r.external ? "Копия сохранена — и в вашу папку" : "Копия сохранена", r.external_error ? "err" : "ok"); } catch (e) { toast(String(e), "err"); } };
   const moveData = async (dir, reset = false, use_existing = false) => {
     try {
@@ -5710,7 +5735,7 @@ async function openSettings() {
   });
   api("portable_info").then((pi) => {
     if (!pi.standard && !pi.portable && $("#sDataStd")) {
-      $("#sDataStd").innerHTML = `<button class="btn sm ghost" id="sDataBack">Вернуть стандартную</button>`;
+      ($("#sDataStd") || {}).innerHTML = `<button class="btn sm ghost" id="sDataBack">Вернуть стандартную</button>`;
       $("#sDataBack").onclick = async () => { if (await askConfirm("Вернуть данные в стандартную папку (%APPDATA%\\proverka)? Текущие данные скопируются туда.")) moveData("", true); };
     }
     const box = $("#sPortable");
@@ -5747,7 +5772,7 @@ window.addEventListener("resize", moveRibbon);
   try {
     await refresh();
   } catch (e) {
-    $("#view").innerHTML = emptyArt("Ядро не отвечает", String(e));
+    ($("#view") || {}).innerHTML = emptyArt("Ядро не отвечает", String(e));
     return;
   }
   applyTheme(settings().theme || "paper");

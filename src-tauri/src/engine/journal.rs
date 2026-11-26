@@ -478,6 +478,11 @@ impl Journal {
         n
     }
 
+    /// Группа уже где-то есть: в реестре, со списком студентов или с оценками.
+    pub fn has_group(&self, name: &str) -> bool {
+        self.groups.iter().any(|g| g.name == name) || self.rosters.contains_key(name) || self.entries.iter().any(|e| e.group == name)
+    }
+
     /// Группа есть в реестре (её видно в «Группы и направления» на всех шагах).
     pub fn ensure_group(&mut self, name: &str) {
         let name = name.trim();

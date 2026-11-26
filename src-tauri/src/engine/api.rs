@@ -280,10 +280,14 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
                 if !old.is_empty() && old != name {
-                    if j.groups.iter().any(|g| g.name == name) {
+                    if j.has_group(&name) {
                         return Err(format!("Группа «{}» уже есть", name));
                     }
                     j.rename_group(&old, &name);
+                }
+                // «Новая группа» с названием существующей: не затираем её список студентов
+                if old.is_empty() && !p.get("roster").is_null() && (j.rosters.contains_key(&name) || j.entries.iter().any(|e| e.group == name)) {
+                    return Err(format!("Группа «{}» уже есть — откройте её из списка, чтобы изменить", name));
                 }
                 let program = p.get("program").str_or("").trim().to_string();
                 let note = p.get("note").str_or("");
@@ -345,6 +349,20 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
                 j.delete_group(&name, p.get("entries").bool_or(false));
                 j.save();
+            }
+            // работы этой группы в текущей проверке — иначе группа тут же вернётся в списки
+            if p.get("works").bool_or(false) {
+                {
+                    let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    let ids: Vec<String> = ws.works.iter().filter(|w| w.group == name).map(|w| w.id.clone()).collect();
+                    ws.works.retain(|w| w.group != name);
+                    for id in &ids {
+                        ws.outcomes.remove(id);
+                    }
+                }
+                core.compute_plagiarism();
+                core.save_session();
+                core.cleanup_moodle();
             }
             Ok(core.state_json().with("journal", journal_view(core, &p)))
         }
@@ -1633,7 +1651,8 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             for (i, id) in ids.iter().enumerate() {
                 let (title, text) = {
                     let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
-                    let w = ws.works.iter().find(|w| &w.id == id).unwrap();
+                    // работу могли удалить, пока собирались отзывы
+                    let Some(w) = ws.works.iter().find(|w| &w.id == id) else { continue };
                     let (student, _) = core.student_of(&ws, w);
                     let saved = ws.outcomes.get(id).map(|o| o.feedback.clone()).unwrap_or_default();
                     (format!("{} — {}{}", student, w.name, if w.group.is_empty() { String::new() } else { format!(", {}", w.group) }), saved)
@@ -1701,13 +1720,14 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
                 if names.is_empty() {
+                    // пустой список: убираем студентов, но не саму группу (новая группа без списка тоже остаётся)
                     j.rosters.remove(&group);
                     j.assigned.remove(&group);
                     j.teams.remove(&group);
                 } else {
                     j.rosters.insert(group.clone(), names);
-                    j.ensure_group(&group);
                 }
+                j.ensure_group(&group);
                 if let Some(v) = p.get("variant_is_number").as_bool() {
                     j.variant_is_number = v;
                 }
@@ -3142,10 +3162,11 @@ pub fn journal_view(core: &Arc<Core>, p: &Json) -> Json {
         }
     }
     for e in &j.entries {
-        if !groups.contains(&e.group) {
+        if !e.group.trim().is_empty() && !groups.contains(&e.group) {
             groups.push(e.group.clone());
         }
     }
+    groups.retain(|g| !g.trim().is_empty());
     for w in core.ws.lock().unwrap_or_else(|e| e.into_inner()).works.iter() {
         if !w.group.is_empty() && !groups.contains(&w.group) {
             groups.push(w.group.clone());
