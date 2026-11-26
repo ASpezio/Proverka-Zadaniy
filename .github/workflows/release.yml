@@ -140,7 +140,9 @@ jobs:
           $key = Get-ItemProperty "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ProverkaZadaniy" -ErrorAction SilentlyContinue
           if (-not $key -or $key.InstallLocation -ne $dir) { throw "Нет записи в «Приложениях» или неверная папка" }
           Start-Process (Join-Path $dir "Удалить.exe") -ArgumentList "/S", "_?=$dir" -Wait
-          if (Test-Path (Join-Path $dir "Проверка заданий.exe")) { throw "Программа удаления не удалила файлы" }
+          $exe = Join-Path $dir "Проверка заданий.exe"
+          for ($i = 0; $i -lt 20 -and (Test-Path $exe); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path $exe) { throw "Программа удаления не удалила файлы" }
           "Установщик: установка и удаление прошли"
 
       - uses: actions/upload-artifact@v4

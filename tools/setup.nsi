@@ -97,7 +97,16 @@ Section "Uninstall"
   Sleep 600
   Delete "$DESKTOP\${APP}.lnk"
   Delete "$SMPROGRAMS\${APP}.lnk"
+  ; файл может быть ещё занят (только что закрытая программа, антивирус) — повторяем до 10 раз
+  StrCpy $0 0
+  del_exe:
   Delete "$INSTDIR\${APP}.exe"
+  IfFileExists "$INSTDIR\${APP}.exe" 0 del_exe_ok
+  IntOp $0 $0 + 1
+  IntCmp $0 10 del_exe_ok
+  Sleep 500
+  Goto del_exe
+  del_exe_ok:
   Delete "$INSTDIR\${APP}.exe.old"
   Delete "$INSTDIR\${APP}.exe.new"
   Delete "$INSTDIR\ИНСТРУКЦИЯ.md"
