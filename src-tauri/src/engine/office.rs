@@ -408,6 +408,10 @@ pub struct XlsxFacts {
     pub totals: Vec<String>,
     /// виды диаграмм в книге
     pub charts: Vec<String>,
+    /// где стоят формулы: «Лист1!D2:D10, E2:E10» (по листам, до 12 диапазонов)
+    pub places: Vec<String>,
+    /// какие функции встречаются в формулах: SUM, СРЗНАЧ, ЕСЛИ…
+    pub funcs: Vec<String>,
 }
 
 fn col_num(c: &str) -> usize {
@@ -468,6 +472,7 @@ pub fn xlsx_facts(bytes: &[u8]) -> Option<XlsxFacts> {
         // (столбец, строка) → (формула?, число?, текст)
         let mut cells: Vec<(String, usize, bool, bool, String)> = Vec::new();
         let (mut cref, mut ctype, mut v, mut has_f, mut in_v) = (String::new(), String::new(), String::new(), false, false);
+        let (mut in_f, mut ftext) = (false, String::new());
         for tok in xml_iter(&xml) {
             match tok {
                 Tok::Tag(t) => match ln(t.name) {
@@ -487,12 +492,57 @@ pub fn xlsx_facts(bytes: &[u8]) -> Option<XlsxFacts> {
                         let text = if ctype == "s" { v.trim().parse::<usize>().ok().and_then(|i| shared.get(i).cloned()).unwrap_or_default() } else if ctype == "inlineStr" || ctype == "str" { v.clone() } else { String::new() };
                         cells.push((col, row, has_f, num, text));
                     }
-                    "f" if !t.closing => has_f = true,
+                    "f" if !t.closing => {
+                        has_f = true;
+                        in_f = !t.self_closing;
+                    }
+                    "f" => in_f = false,
                     "v" | "t" => in_v = !t.closing && !t.self_closing,
                     _ => {}
                 },
                 Tok::Text(x) if in_v => v.push_str(&decode_entities(x)),
+                Tok::Text(x) if in_f => {
+                    ftext.push_str(&decode_entities(x));
+                    ftext.push(' ');
+                }
                 _ => {}
+            }
+        }
+        // функции формул: «SUM(», «_xlfn.IFS(», «СРЗНАЧ(»
+        let chars: Vec<char> = ftext.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i].is_alphabetic() {
+                let st = i;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '.' || chars[i] == '_') {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '(' {
+                    let name: String = chars[st..i].iter().collect::<String>().to_uppercase().trim_start_matches("XLFN.").trim_start_matches("XLWS.").to_string();
+                    if !name.is_empty() && !f.funcs.contains(&name) && f.funcs.len() < 20 {
+                        f.funcs.push(name);
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        // где формулы: по столбцам, диапазонами
+        {
+            let mut fcols: Vec<String> = cells.iter().filter(|c| c.2).map(|c| c.0.clone()).collect();
+            fcols.sort_by_key(|c| col_num(c));
+            fcols.dedup();
+            let parts: Vec<String> = fcols
+                .iter()
+                .map(|col| {
+                    let mut rs: Vec<usize> = cells.iter().filter(|c| c.2 && &c.0 == col).map(|c| c.1).collect();
+                    rs.sort();
+                    ranges(col, &rs)
+                })
+                .collect();
+            if !parts.is_empty() {
+                let more = parts.len().saturating_sub(12);
+                f.places.push(format!("{}!{}{}", name, parts.into_iter().take(12).collect::<Vec<_>>().join(", "), if more > 0 { format!(" и ещё {} столбцов", more) } else { String::new() }));
             }
         }
         f.formulas += cells.iter().filter(|c| c.2).count();
@@ -1033,5 +1083,26 @@ mod facts_tests {
     fn ranges_join() {
         assert_eq!(super::ranges("D", &[5, 6, 7, 9]), "D5:D7, D9");
         assert_eq!(super::col_num("AB"), 28);
+    }
+
+    /// Формулы не в тех ячейках, что в образце: приложение перечисляет, где они.
+    #[test]
+    fn formula_places_and_funcs() {
+        let mut z = super::super::zip::ZipWriter::new();
+        z.add_str("xl/workbook.xml", r#"<workbook xmlns:r="r"><sheets><sheet name="Расчёт" sheetId="1" r:id="rId1"/></sheets></workbook>"#);
+        z.add_str("xl/_rels/workbook.xml.rels", r#"<Relationships><Relationship Id="rId1" Target="worksheets/sheet1.xml"/></Relationships>"#);
+        z.add_str(
+            "xl/worksheets/sheet1.xml",
+            r#"<worksheet><sheetData>
+<row r="2"><c r="B2"><v>5</v></c><c r="C2"><v>3</v></c><c r="F2"><f t="shared" ref="F2:F4" si="0">B2*C2</f><v>15</v></c></row>
+<row r="3"><c r="B3"><v>2</v></c><c r="C3"><v>4</v></c><c r="F3"><f t="shared" si="0"/><v>8</v></c></row>
+<row r="4"><c r="B4"><v>1</v></c><c r="C4"><v>1</v></c><c r="F4"><f t="shared" si="0"/><v>1</v></c></row>
+<row r="6"><c r="H6"><f>_xlfn.IFS(F2&gt;10,"много",TRUE,"мало")</f><v>много</v></c><c r="H7"><f>СУММ(F2:F4)</f><v>24</v></c></row>
+</sheetData></worksheet>"#,
+        );
+        let f = super::xlsx_facts(&z.finish()).unwrap();
+        assert_eq!(f.formulas, 5);
+        assert_eq!(f.places, vec!["Расчёт!F2:F4, H6:H7".to_string()]);
+        assert!(f.funcs.contains(&"IFS".to_string()) && f.funcs.contains(&"СУММ".to_string()), "{:?}", f.funcs);
     }
 }

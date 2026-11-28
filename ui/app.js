@@ -3224,14 +3224,19 @@ function perfHtml(p) {
   if (p.usual_tps) parts.push(`обычно ${fmtTps(p.usual_tps)} ток/с`);
   if (p.gpu?.total_mb) {
     const used = p.gpu.used_mb / 1024, tot = p.gpu.total_mb / 1024;
-    const full = p.gpu.used_mb / p.gpu.total_mb >= 0.95;
-    parts.push(`<span class="${full ? "bad-t" : ""}" title="${full ? "Видеопамять почти заполнена: если модель не поместится, часть уйдёт в оперативную память и скорость упадёт в разы" : ""}">видеопамять ${used.toFixed(1).replace(".", ",")} из ${tot.toFixed(1).replace(".", ",")} ГБ</span>`);
+    parts.push(`<span title="Сколько видеопамяти занято сейчас (обновляется само). Загруженная модель обычно занимает почти всю — это нормально; плохо, если при этом упала скорость">видеопамять ${used.toFixed(1).replace(".", ",")} из ${tot.toFixed(1).replace(".", ",")} ГБ</span>`);
   }
   return parts.length ? `<div class="small muted" style="margin-top:6px">${parts.join(" • ")}</div>` : "";
 }
 async function loadPerf() {
+  S.perfAt = Date.now();
   try { S.perf = await api("perf_info"); renderSpeed(); } catch (e) { /* нет данных */ }
 }
+// видеопамять меняется, когда LM Studio загружает или выгружает модель: обновляем, пока виден шаг
+setInterval(() => {
+  if (document.hidden || !["check", "mcplog"].includes(S.view)) return;
+  if (Date.now() - (S.perfAt || 0) > 10000) loadPerf();
+}, 5000);
 
 // ---------------------------------------------------------------- 7. Журнал MCP
 const ML = { filter: "all", q: "", work: "", follow: true };
@@ -5990,6 +5995,7 @@ async function openSettings() {
     </div>
     <div class="set-sec"><h3>Уведомления</h3>
       ${sw("sNtf", (st.notify || {}).enabled !== false, "Уведомления Windows", "Сообщения в углу экрана, когда приложение занято своим делом.", !desk)}
+      ${sw("sPerfWarn", st.perf?.warn !== false, "Предупреждать о падении скорости модели", "Подсказка в окне приложения, если модель вдруг стала отвечать в разы медленнее обычного (обычно — не поместилась в видеопамять или LM Studio сменил движок).", false)}
       ${sw("sNtfBg", (st.notify || {}).only_background !== false, "Только когда окно свёрнуто или в фоне", "Если вы смотрите на приложение, оно не отвлекает уведомлениями.", !desk)}
       <div class="snd-ev" id="sNtfKinds">${NOTIFY_KINDS.map(([k, t]) => `<label class="idea"><input type="checkbox" class="cbx" data-ntf="${k}" ${((st.notify || {}).kinds || {})[k] === false ? "" : "checked"} ${desk ? "" : "disabled"}><span>${t}</span></label>`).join("")}</div>
       ${desk ? `<button class="btn sm ghost" id="sNtfTest" style="justify-self:start">Показать пример</button>` : `<p class="small muted" style="margin:0">Уведомления работают в приложении для Windows.</p>`}
@@ -6053,6 +6059,7 @@ async function openSettings() {
   };
   $("#sAuto").onchange = setAuto;
   $("#sAutoMin").onchange = setAuto;
+  $("#sPerfWarn")?.addEventListener("change", (e) => saveSettings({ perf: { ...(settings().perf || {}), warn: e.target.checked } }));
   const saveNtf = () => saveSettings({ notify: { ...(settings().notify || {}), enabled: $("#sNtf").checked, only_background: $("#sNtfBg").checked, kinds: Object.fromEntries($$("[data-ntf]").map((c) => [c.dataset.ntf, c.checked])) } });
   $("#sNtf").onchange = saveNtf; $("#sNtfBg").onchange = saveNtf;
   $$("[data-ntf]").forEach((c) => (c.onchange = saveNtf));

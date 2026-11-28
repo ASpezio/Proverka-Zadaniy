@@ -4,13 +4,14 @@
 //!   медиана последних запросов (`speed.json`). Если в текущей проверке модель отвечает
 //!   в 3 раза медленнее обычного, приложение предупреждает: обычно это значит, что модель
 //!   не поместилась в видеопамять или LM Studio сменил движок (CUDA → Vulkan).
-//! * Перед проверкой локальной моделью — сколько видеопамяти занято (nvidia-smi, если есть).
+//! * Видеопамять (nvidia-smi, если есть) — для карточки скорости и для пояснения в
+//!   предупреждении о скорости. Сама по себе почти полная видеопамять — норма (модель
+//!   загружена), поэтому отдельно о ней приложение не предупреждает.
 
 use super::core::Core;
 use super::json::{self, Json};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -30,7 +31,6 @@ struct RunPerf {
 }
 
 static RUN: Mutex<Option<RunPerf>> = Mutex::new(None);
-static VRAM_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn median(v: &[f64]) -> f64 {
     if v.is_empty() {
@@ -61,6 +61,11 @@ fn history_save(dir: &Path, h: &HashMap<String, Vec<f64>>) {
     let _ = std::fs::write(dir.join("speed.json"), o.to_string());
 }
 
+/// 15974 МБ → «15,6»
+fn gb(mb: u64) -> String {
+    format!("{:.1}", mb as f64 / 1024.0).replace('.', ",")
+}
+
 fn key(model: &str, conc: usize) -> String {
     format!("{}|{}", model, conc)
 }
@@ -78,21 +83,10 @@ pub fn run_started(core: &Core) {
     if !local {
         return;
     }
+    // только в журнал: загруженная модель и должна занимать почти всю видеопамять —
+    // само по себе это не беда; о проблеме говорит падение скорости (см. sample)
     if let Some(g) = gpu() {
-        core.log(&format!("Видеопамять {}: занято {:.1} из {:.1} ГБ", g.name, g.used_mb as f64 / 1024.0, g.total_mb as f64 / 1024.0));
-        if g.total_mb > 0 && g.used_mb as f64 / g.total_mb as f64 >= 0.95 && warn_on(core) && !VRAM_WARNED.swap(true, Ordering::SeqCst) {
-            super::notify::send(
-                core,
-                "speed",
-                "Видеопамять почти заполнена",
-                &format!(
-                    "{}: занято {:.1} из {:.1} ГБ. Если модель с контекстом не поместится целиком, Windows молча перенесёт часть в оперативную память и проверка пойдёт в разы медленнее. Если скорость упадёт — уменьшите в LM Studio длину контекста или Parallel, закройте программы, которые используют видеокарту, или возьмите квантизацию полегче.",
-                    g.name,
-                    g.used_mb as f64 / 1024.0,
-                    g.total_mb as f64 / 1024.0
-                ),
-            );
-        }
+        core.log(&format!("Видеопамять {}: занято {} из {} ГБ", g.name, gb(g.used_mb), gb(g.total_mb)));
     }
 }
 
@@ -127,9 +121,10 @@ pub fn sample(core: &Core, model: &str, local: bool, tokens_out: i64, secs: f64)
     if let Some((now, usual)) = warn {
         let times = (usual / now).round().max(SLOW) as i64;
         let raz = if (2..=4).contains(&(times % 10)) && !(12..=14).contains(&(times % 100)) { "раза" } else { "раз" };
+        let vram = gpu().filter(|g| g.total_mb > 0 && g.used_mb as f64 / g.total_mb as f64 >= 0.95).map(|g| format!(" Видеопамять занята почти полностью ({} из {} ГБ) — скорее всего, модель не поместилась.", gb(g.used_mb), gb(g.total_mb))).unwrap_or_default();
         let text = format!(
-            "Модель «{}» сейчас отвечает примерно в {} {} медленнее обычного: {:.0} ток/с вместо {:.0}. Похоже, она не помещается в видеопамять (часть ушла в оперативную память) или LM Studio сменил движок — например, на Vulkan. Проверьте в LM Studio: Ctrl+Shift+R → движок CUDA; уменьшите длину контекста или Parallel; закройте программы, которые занимают видеокарту.",
-            model, times, raz, now, usual
+            "«{}»: {:.0} ток/с вместо обычных {:.0} — примерно в {} {} медленнее.{} Что проверить в LM Studio: движок CUDA (Ctrl+Shift+R), длину контекста и Parallel.",
+            model, now, usual, times, raz, vram
         );
         core.log(&text);
         super::notify::send(core, "speed", "Модель стала заметно медленнее", &text);

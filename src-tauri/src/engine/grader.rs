@@ -46,6 +46,28 @@ pub const SYSTEM_AGENT: &str = "Ты — опытный преподавател
 В конце ОБЯЗАТЕЛЬНО вызови submit_grade (grade 2–5, completeness, tasks, ai_detected, ai_confidence, ai_evidence, errors, summary на русском). Ограничения за просрочку и вариант применит приложение.";
 
 pub const STOPPED: &str = "Остановлено";
+/// Агентный режим: модель так и не сдала оценку — проверка переходит в прямой режим.
+pub const NO_SUBMIT: &str = "Модель не сдала оценку через submit_grade";
+
+/// Оценка из текста ответа модели, если инструмент она не вызвала, а написала вызов
+/// или JSON словами: {"grade":…}, {"name":"submit_grade","arguments":{…}}, <tool_call>…</tool_call>.
+fn verdict_from_text(content: &str) -> Option<Json> {
+    let t = json::strip_think(content);
+    let o = json::extract_object(&t)?;
+    if !o.get("grade").is_null() {
+        return Some(o);
+    }
+    for k in ["arguments", "parameters", "args", "input"] {
+        let a = o.get(k);
+        if !a.get("grade").is_null() {
+            return Some(a.clone());
+        }
+        if let Some(x) = a.as_str().and_then(json::extract_object).filter(|x| !x.get("grade").is_null()) {
+            return Some(x);
+        }
+    }
+    None
+}
 
 pub fn emit_progress(core: &Core, wid: &str, status: &str, phase: &str, msg: &str) {
     {
@@ -994,6 +1016,14 @@ fn check_one(core: &Arc<Core>, p: &Provider, wid: &str, tag: &str) -> Result<Opt
             Err(LlmError::Context { .. }) => {
                 emit_progress(core, wid, "running", "fallback", "Диалог с инструментами не поместился в контекст модели — перехожу в прямой режим");
             }
+            // модель работала с инструментами, но так и не сдала оценку — проверяем прямым режимом
+            Err(LlmError::Other(e)) if e.starts_with(NO_SUBMIT) => {
+                emit_progress(core, wid, "running", "fallback", &format!("{} — проверяю эту работу в прямом режиме", e));
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(o) = ws.outcomes.get_mut(wid) {
+                    o.log.push("Агентный режим: модель не вызвала submit_grade, оценка поставлена в прямом режиме".into());
+                }
+            }
             Err(LlmError::Other(e)) => return Err(e),
         }
     }
@@ -1173,8 +1203,12 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
     for x in scan.get("excel_findings").str_list() {
         tail.push_str(&format!("- EXCEL (проверено по файлу): {} — задание, где это требовалось, выполнено не полностью.\n", x));
     }
-    for x in scan.get("excel_ok").str_list() {
+    let xl_ok = scan.get("excel_ok").str_list();
+    for x in &xl_ok {
         tail.push_str(&format!("- EXCEL (проверено по файлу): {}.\n", x));
+    }
+    if !xl_ok.is_empty() || !scan.get("excel_findings").str_list().is_empty() {
+        tail.push_str("- EXCEL: формулы у студента могут стоять в других ячейках и на других листах, чем в образце или эталоне, — это не ошибка. Не пиши, что формул нет, если они перечислены выше: проверяй, что и как посчитано и верен ли результат. В тексте работы формула показана как «D: =B2*C2 → 150», копия формулы — «[формула, скопированная из ячейки выше/левее]».\n");
     }
     let ev = scan.get("evidence").as_arr();
     if ev.is_empty() {
@@ -1517,7 +1551,7 @@ fn agent(core: &Arc<Core>, client: &McpClient, p: &Provider, wid: &str) -> Resul
         Msg::System(SYSTEM_AGENT.to_string()),
         Msg::User(format!("Проверь работу work_id=\"{}\" (файл «{}»). Получи данные инструментами и в конце вызови submit_grade.", wid, file)),
     ];
-    let mut nudged = false;
+    let mut nudged = 0;
     for _step in 0..14 {
         if core.cancel.load(Ordering::SeqCst) {
             return Err(LlmError::Other(STOPPED.into()));
@@ -1526,17 +1560,21 @@ fn agent(core: &Arc<Core>, client: &McpClient, p: &Provider, wid: &str) -> Resul
         let r = chat_cancellable(core, &p2, &msgs, &tools, None)?;
         store_tokens(core, wid, r.tokens_in, r.tokens_out);
         if r.tool_calls.is_empty() {
-            if let Some(mut j) = json::extract_object(&r.content).filter(|j| !j.get("grade").is_null()) {
+            if let Some(mut j) = verdict_from_text(&r.content) {
                 j.set("work_id", wid);
                 client.call("submit_grade", j).map_err(LlmError::Other)?;
                 return Ok(());
             }
-            if nudged {
-                return Err(LlmError::Other("Модель не вызвала submit_grade".into()));
+            if nudged >= 2 {
+                return Err(LlmError::Other(format!("{} — после двух напоминаний ответила текстом", NO_SUBMIT)));
             }
-            nudged = true;
+            nudged += 1;
             msgs.push(Msg::Assistant { content: r.content.clone(), tool_calls: vec![] });
-            msgs.push(Msg::User("Теперь вызови инструмент submit_grade с итоговой оценкой.".into()));
+            msgs.push(Msg::User(if nudged == 1 {
+                "Теперь вызови инструмент submit_grade с итоговой оценкой: grade (2–5), completeness, tasks, ai_detected, ai_confidence, ai_evidence, errors, summary.".into()
+            } else {
+                "Ты не вызвал submit_grade. Если не можешь вызвать инструмент, ответь ТОЛЬКО JSON-объектом: {\"grade\": 2-5, \"completeness\": 0-100, \"tasks\": [], \"ai_detected\": false, \"ai_confidence\": 0, \"ai_evidence\": [], \"errors\": [], \"summary\": \"…\"}".into()
+            }));
             continue;
         }
         msgs.push(Msg::Assistant { content: r.content.clone(), tool_calls: r.tool_calls.clone() });
@@ -1571,7 +1609,7 @@ fn agent(core: &Arc<Core>, client: &McpClient, p: &Provider, wid: &str) -> Resul
             return Ok(());
         }
     }
-    Err(LlmError::Other("Модель не завершила проверку за 14 шагов".into()))
+    Err(LlmError::Other(format!("{} — не закончила за 14 шагов", NO_SUBMIT)))
 }
 
 // ------------------------------------------------------------------ двойная проверка
@@ -1873,6 +1911,16 @@ pub fn stamp() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agent_verdict_from_text() {
+        assert_eq!(verdict_from_text(r#"Итог: {"grade": 4, "summary": "ок"}"#).unwrap().get("grade").f64_or(0.0), 4.0);
+        let tc = r#"<think>думаю</think><tool_call>{"name": "submit_grade", "arguments": {"grade": 3, "errors": []}}</tool_call>"#;
+        assert_eq!(verdict_from_text(tc).unwrap().get("grade").f64_or(0.0), 3.0);
+        let st = r#"{"name":"submit_grade","arguments":"{\"grade\": 5}"}"#;
+        assert_eq!(verdict_from_text(st).unwrap().get("grade").f64_or(0.0), 5.0);
+        assert!(verdict_from_text("Работа хорошая, ставлю пять").is_none());
+    }
+
     use super::*;
     #[test]
     fn alloc() {

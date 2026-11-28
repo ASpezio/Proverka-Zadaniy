@@ -138,6 +138,11 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.4.3
+* `perf::run_started` больше не предупреждает о видеопамяти (только журнал); `sample` добавляет к предупреждению о скорости строку о видеопамяти, если она ≥ 95 %. UI: `perfHtml` без красного; `loadPerf` каждые 10 с на шагах «Проверка» и «Журнал MCP»; переключатель `#sPerfWarn` в настройках («Уведомления»).
+* Агентный режим: `grader::verdict_from_text` (JSON, `{"name":"submit_grade","arguments":…}`, `<tool_call>…`), два напоминания; ошибка с префиксом `NO_SUBMIT` → `check_one` переходит в прямой режим. Мок: `MOCK_MODE=agent_text|agent_texttool`.
+* Excel: `XlsxFacts.places` (лист!диапазоны формул по столбцам) и `funcs`; `excel_checks` всегда кладёт в `excel_ok` «формул в книге: N; где: …; функции: …» (или «нет ни одной формулы»), в запросе — пояснение, что формулы могут стоять не там, где в образце.
+
 ### Версия 1.4.2 (варианты в журнале)
 * API `journal_variants {group, variants: {ФИО: вариант|""}, merge}` — варианты без изменения списка (только студенты из списка; `merge: false` заменяет все; массовая раздача отменяется через «Отменить»). `journal_variants_export {path (.docx/.xlsx/.csv), group, order: list|az|variant, title?}`. `journal::ru_cmp` — алфавит с «ё».
 * UI: столбец `td.jvar[data-var]` → `openVariantOne`; кнопка `#jVariants` → `openVariants` (предпросмотр, `dealVariants` + режимы `random_rep`, `same`; `orderNames`: list/az/za/shuffle); `exportVariants`.

@@ -1704,6 +1704,22 @@ impl Core {
     /// и диаграмма нужного вида.
     fn excel_checks(&self, w: &Work, task: &str, sc: &mut Scan) {
         let has_xlsx = !w.xlsx.is_empty();
+        // где у студента формулы — всегда, как факт: они могут стоять не в тех ячейках,
+        // что в образце, и модель не должна делать вывод «формул нет»
+        for (file, f) in &w.xlsx {
+            let pre = if w.xlsx.len() > 1 { format!("{}: ", file) } else { String::new() };
+            if f.formulas > 0 {
+                sc.excel_ok.push(format!(
+                    "{}формул в книге: {}; где: {}{}",
+                    pre,
+                    f.formulas,
+                    f.places.join("; "),
+                    if f.funcs.is_empty() { String::new() } else { format!("; функции: {}", f.funcs.join(", ")) }
+                ));
+            } else if f.constants > 0 {
+                sc.excel_ok.push(format!("{}в книге нет ни одной формулы — все значения вписаны вручную", pre));
+            }
+        }
         if detect::task_needs_formulas(task) && has_xlsx {
             for (file, f) in &w.xlsx {
                 let pre = if w.xlsx.len() > 1 { format!("{}: ", file) } else { String::new() };
@@ -1718,7 +1734,7 @@ impl Core {
                     sc.excel_findings.push(format!("{}итог без формулы: {}", pre, t));
                 }
                 if f.formulas > 0 && f.mixed.is_empty() && f.totals.is_empty() {
-                    sc.excel_ok.push(format!("{}расчёты сделаны формулами (формул: {})", pre, f.formulas));
+                    sc.excel_ok.push(format!("{}расчёты сделаны формулами", pre));
                 }
             }
         }

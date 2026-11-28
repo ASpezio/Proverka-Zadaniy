@@ -116,6 +116,14 @@ class H(BaseHTTPRequestHandler):
             return self.send({"choices": [{"message": {"role": "assistant", "content": json.dumps(q, ensure_ascii=False)}}], "usage": {"prompt_tokens": int(total_chars/2.6), "completion_tokens": 100}})
         if "отзыв" in (sysmsg or ""):
             return self.send({"choices": [{"message": {"role": "assistant", "content": "Здравствуйте! Работа проверена. Хорошо выполнены задания 1–3. Обратите внимание на задание 5. Удачи!"}}], "usage": {"prompt_tokens": 500, "completion_tokens": 60}})
+        if tools and MODE == "agent_text":
+            # модель «забывает» вызвать submit_grade и отвечает словами
+            return self.send({"choices": [{"message": {"role": "assistant", "content": "Работа в целом выполнена, ставлю хорошую оценку."}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 900, "completion_tokens": 120}})
+        if tools and MODE == "agent_texttool":
+            # вызов инструмента написан текстом (LM Studio не распознал формат)
+            v = verdict(""); v["work_id"] = "?"
+            content = "<tool_call>" + json.dumps({"name": "submit_grade", "arguments": v}, ensure_ascii=False) + "</tool_call>"
+            return self.send({"choices": [{"message": {"role": "assistant", "content": content}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 900, "completion_tokens": 120}})
         if tools:
             # агентный режим: последовательно вызываем инструменты, потом submit_grade
             called = [m for m in msgs if m.get("role") == "tool"]
