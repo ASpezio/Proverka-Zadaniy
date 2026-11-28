@@ -138,6 +138,12 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.5.2
+* Шаг «Проверка»: `S.checkGroup` + `S.checkSet` (id набора или `"__none"`, см. `setKey(w)`, `setShort`) — общие для кнопок запуска (`#runGroup`, `#runSet`), фильтров очереди (`#qfSet`, `#qfGroup`; `qfMatch` → `inCheckScope`), счётчиков (`renderCheckProgress`). Смена — через `syncCheckScope()` (заодно ставит `S.filters.rSet` для ведомости).
+* Ведомость: `report::rows/docx/xlsx/csv(core, group, set)`, `report::set_matches`; API `report_preview` и `export` принимают `set`. UI `#rSet`; отзывы (`export_feedback`) — по `ids` выбранных работ.
+* Группа новых работ: `S.addGroup = null` (не выбрана) | `"__folder"` (по папке, в API уходит `""`) | имя. `addGroupOptions`, `bindAddGroup`, `createGroupAsk` (`group_save` только для новой), `ensureAddGroup()` — окно выбора перед `addPaths` для works (и перед диалогом файлов в `bindPick`). Импорт из Moodle: «Выберите группу…» (`value=""`), без выбора не идёт. Класс `.select.need` — подсветка невыбранной группы.
+* Журнал: `journal::mentions_copy` → флаг `copy_text` (ячейка `.gm.cp`, оранжевое кольцо); `journal_view` сливает флаги с `comment_flags(comment)` — старые оценки тоже помечаются. Импорт оценок Moodle возвращает `copied`. `journal_export` принимает `marks {violation, ai_text, copy_text, no_variant}` (UI `JEXP_MARKS`, `localStorage.jexpMarks`), легенда — только по выбранным.
+
 ### Версия 1.5.1
 * `customStyleCss`: правила окна — `:root[data-cstyle] X:not(.pv X)`, превью своего стиля — `.pv[data-cstyle] X`. В `styles.css` у `.pv` свои `--r-s/--r-m/--r-l` и `--card-shadow: var(--theme-shadow)` (тема задаёт `--theme-shadow`, в том числе своя схема) — превью не наследуют переменные стиля окна.
 * `.st-card .th-tools` видны всегда (кнопки своего стиля).

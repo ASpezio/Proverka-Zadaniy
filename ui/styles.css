@@ -1347,6 +1347,8 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .jt td.custom .cv { font: 600 14px var(--font-ui); font-variant-numeric: tabular-nums; }
 .jt .miss.due { color: var(--pen); opacity: .55; }
 .jt .gm.f { box-shadow: 0 0 0 3px color-mix(in srgb, var(--uv) 45%, transparent); }
+.jt .gm.cp, .j-legend .gm.cp { box-shadow: 0 0 0 3px color-mix(in srgb, #f08c00 60%, transparent); }
+.jt .gm.f.cp { box-shadow: 0 0 0 3px color-mix(in srgb, var(--uv) 45%, transparent), 0 0 0 6px color-mix(in srgb, #f08c00 55%, transparent); }
 .gm.mini { width: 20px !important; height: 20px !important; font-size: 11px !important; display: inline-grid; place-items: center; border-radius: 50%; border: 1.5px solid currentColor; vertical-align: middle; }
 .j-legend .gm.g2 { color: var(--g2); } .j-legend .gm.g4 { color: var(--g4); }
 .j-legend .gm.v { background: var(--pen); color: #fff; border-color: var(--pen); }
@@ -1459,3 +1461,6 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 
 /* пример файла оформления */
 .json-sample { flex-shrink: 0; min-height: 240px; max-height: 340px; overflow: auto; padding: 12px 14px; border-radius: 10px; background: color-mix(in srgb, currentColor 6%, transparent); font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre; }
+
+/* выбор группы для новых работ: пока не выбрана — заметная рамка */
+.select.need { border-color: color-mix(in srgb, var(--pen, #d6336c) 70%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--pen, #d6336c) 16%, transparent); color: var(--muted, inherit); }

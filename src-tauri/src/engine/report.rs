@@ -112,8 +112,19 @@ pub fn comment_of(o: &Outcome) -> String {
     parts.join(" ")
 }
 
-/// Строки ведомости. `only` — группа или направление («» — все работы).
-pub fn rows(core: &Core, only: &str) -> (Vec<Row>, Json) {
+/// Работа относится к заданию `set` (id набора; «__none» — без задания; «» — любое).
+pub fn set_matches(core: &Core, ws: &super::core::Workspace, w: &super::core::Work, set: &str) -> bool {
+    if set.is_empty() {
+        return true;
+    }
+    match core.set_for_work(ws, w) {
+        Some(s) => s.id == set,
+        None => set == "__none",
+    }
+}
+
+/// Строки ведомости. `only` — группа или направление («» — все работы), `set` — задание.
+pub fn rows(core: &Core, only: &str, set: &str) -> (Vec<Row>, Json) {
     let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
     let mut rows = Vec::new();
     let (mut cnt, mut sum, mut ai, mut plag) = (0usize, 0f64, 0usize, 0usize);
@@ -121,6 +132,9 @@ pub fn rows(core: &Core, only: &str) -> (Vec<Row>, Json) {
     let mut total = 0usize;
     for w in ws.works.iter() {
         if !only.is_empty() && w.group != only && core.program_of(&w.group) != only {
+            continue;
+        }
+        if !set_matches(core, &ws, w, set) {
             continue;
         }
         total += 1;
@@ -238,10 +252,11 @@ fn principles(core: &Core) -> Vec<String> {
     p
 }
 
-fn title_of(core: &Core, only: &str) -> (String, String) {
+fn title_of(core: &Core, only: &str, set: &str) -> (String, String) {
     let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
-    let codes: Vec<String> = ws.sets.iter().map(|s| s.code.clone()).collect();
-    let titles: Vec<String> = ws.sets.iter().map(|s| s.title.clone()).collect();
+    let picked = |x: &&super::assign::AssignmentSet| set.is_empty() || x.id == set;
+    let codes: Vec<String> = ws.sets.iter().filter(picked).map(|s| s.code.clone()).collect();
+    let titles: Vec<String> = ws.sets.iter().filter(picked).map(|s| s.title.clone()).collect();
     drop(ws);
     let st = core.settings();
     let title = if codes.is_empty() { "Итоговая ведомость проверки практических работ".to_string() } else { format!("Итоговая ведомость проверки: {}", codes.join(", ")) };
@@ -300,9 +315,9 @@ fn grade_fill(g: Option<f64>) -> &'static str {
     }
 }
 
-pub fn docx(core: &Core, only: &str) -> Vec<u8> {
-    let (rows, stats) = rows(core, only);
-    let (title, sub) = title_of(core, only);
+pub fn docx(core: &Core, only: &str, set: &str) -> Vec<u8> {
+    let (rows, stats) = rows(core, only, set);
+    let (title, sub) = title_of(core, only, set);
     let mut body = String::new();
     body.push_str(&p(&title, true, 28, "center", ""));
     if !sub.is_empty() {
@@ -380,9 +395,9 @@ fn col(i: usize) -> String {
     s
 }
 
-pub fn xlsx(core: &Core, only: &str) -> Vec<u8> {
-    let (rows, stats) = rows(core, only);
-    let (title, sub) = title_of(core, only);
+pub fn xlsx(core: &Core, only: &str, set: &str) -> Vec<u8> {
+    let (rows, stats) = rows(core, only, set);
+    let (title, sub) = title_of(core, only, set);
     let heads = ["№", "Студент / файл", "Группа", "Вариант", "ИИ / списывание", "Оценка", "Обоснование и замечания"];
     let mut sheet = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetViews><sheetView workbookViewId=\"0\"><pane ySplit=\"4\" topLeftCell=\"A5\" activePane=\"bottomLeft\" state=\"frozen\"/></sheetView></sheetViews><cols><col min=\"1\" max=\"1\" width=\"5\" customWidth=\"1\"/><col min=\"2\" max=\"2\" width=\"38\" customWidth=\"1\"/><col min=\"3\" max=\"4\" width=\"10\" customWidth=\"1\"/><col min=\"5\" max=\"5\" width=\"17\" customWidth=\"1\"/><col min=\"6\" max=\"6\" width=\"9\" customWidth=\"1\"/><col min=\"7\" max=\"7\" width=\"110\" customWidth=\"1\"/></cols><sheetData>");
     let s = |r: usize, c: usize, v: &str, style: u32| format!("<c r=\"{}{}\" t=\"inlineStr\" s=\"{}\"><is><t xml:space=\"preserve\">{}</t></is></c>", col(c), r, style, xml_esc(v));
@@ -446,8 +461,8 @@ pub fn xlsx(core: &Core, only: &str) -> Vec<u8> {
 
 // ------------------------------------------------------------------ CSV
 
-pub fn csv(core: &Core, only: &str) -> Vec<u8> {
-    let (rows, _) = rows(core, only);
+pub fn csv(core: &Core, only: &str, set: &str) -> Vec<u8> {
+    let (rows, _) = rows(core, only, set);
     let st = core.settings();
     let sep = st.get("csv_sep").str_or(";").chars().next().unwrap_or(';');
     let mut t: Vec<Vec<String>> = vec![["№", "Студент / файл", "Группа", "Вариант", "ИИ / списывание", "Оценка", "Обоснование"].iter().map(|s| s.to_string()).collect()];

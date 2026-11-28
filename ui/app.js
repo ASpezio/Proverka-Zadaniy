@@ -748,9 +748,11 @@ async function addPaths(kind, paths) {
   const before = kind === "tasks" ? S.state.tasks.length : S.state.works.length;
   try {
     if (isLocked()) { toast("Нейросеть сейчас проверяет работы — добавлять файлы можно после окончания", "err"); return; }
+    if (kind === "works" && !(await ensureAddGroup())) { toast("Работы не добавлены: не выбрана группа", "err"); return; }
     const slow = setTimeout(() => toast("Читаю файлы… В большой папке это может занять до минуты"), 700);
     let st;
-    try { st = await api("add_paths", { kind, paths, scope: S.addScope || "", group: S.addGroup || "" }); } finally { clearTimeout(slow); }
+    const group = kind === "works" && S.addGroup !== "__folder" ? S.addGroup : "";
+    try { st = await api("add_paths", { kind, paths, scope: S.addScope || "", group }); } finally { clearTimeout(slow); }
     S.state = st;
     updateRail();
     const after = kind === "tasks" ? st.tasks.length : st.works.length;
@@ -900,7 +902,7 @@ async function prepareFiles() {
 function dropzone(kind, title, hint) {
   const target = kind === "tasks"
     ? `<select class="select input" id="addScope" title="Для кого эти задания" style="width:auto">${scopeOptions(S.addScope, { allLabel: "Для всех групп" })}</select>`
-    : `<select class="select input" id="addGroup" title="В какую группу добавить" style="width:auto"><option value="">Группа = папка</option>${groupsList().map((g) => `<option value="${esc(g.name)}" ${S.addGroup === g.name ? "selected" : ""}>${esc(g.name)}${g.program ? ` (${esc(g.program)})` : ""}</option>`).join("")}</select>`;
+    : `<select class="select input ${S.addGroup == null ? "need" : ""}" id="addGroup" title="В какую группу добавить работы" style="width:auto">${addGroupOptions(S.addGroup)}</select>`;
   return `<div class="dropzone" data-kind="${kind}">
     <div class="dz-icon"><i></i><i></i><i></i></div>
     <div class="dz-text"><b>${esc(title)}</b><span>${esc(hint)}</span></div>
@@ -910,9 +912,58 @@ function dropzone(kind, title, hint) {
     </div></div>`;
 }
 function bindPick(root) {
-  $$("[data-pick]", root).forEach((b) => (b.onclick = async () => addPaths(b.dataset.pick, await pickFiles({ directory: b.dataset.dir === "1" }))));
+  $$("[data-pick]", root).forEach((b) => (b.onclick = async () => {
+    if (b.dataset.pick === "works" && !(await ensureAddGroup())) return;
+    addPaths(b.dataset.pick, await pickFiles({ directory: b.dataset.dir === "1" }));
+  }));
   const sc = $("#addScope", root); if (sc) sc.onchange = (e) => (S.addScope = e.target.value);
-  const gr = $("#addGroup", root); if (gr) gr.onchange = (e) => (S.addGroup = e.target.value);
+  const gr = $("#addGroup", root); if (gr) bindAddGroup(gr);
+}
+
+/** Группа для новых работ. null — ещё не выбрана (дальше не пускаем), "__folder" — по имени папки. */
+function addGroupOptions(cur) {
+  return `<option value="" disabled ${cur == null ? "selected" : ""}>Выберите группу…</option>
+    ${groupsList().map((g) => `<option value="${esc(g.name)}" ${cur === g.name ? "selected" : ""}>${esc(g.name)}${g.program ? ` (${esc(g.program)})` : ""}</option>`).join("")}
+    <option value="__folder" ${cur === "__folder" ? "selected" : ""}>Группа = папка с работами</option>
+    <option value="__new">+ новая группа…</option>`;
+}
+/** Новая группа по названию; существующая просто выбирается. Возвращает название или null. */
+async function createGroupAsk() {
+  const name = ((await askText("Новая группа", "", "Например, ИТ-21")) || "").trim();
+  if (!name) return null;
+  if (!groupsList().some((g) => g.name === name)) {
+    try { S.state = await api("group_save", { name, program: "" }); updateRail(); toast(`Группа «${name}» создана`, "ok"); }
+    catch (e) { toast(String(e), "err"); return null; }
+  }
+  return name;
+}
+function bindAddGroup(sel, onPick) {
+  sel.onchange = async () => {
+    let v = sel.value;
+    if (v === "__new") v = await createGroupAsk();
+    if (v) S.addGroup = v;
+    $$("#addGroup").forEach((x) => { x.innerHTML = addGroupOptions(S.addGroup); x.classList.toggle("need", S.addGroup == null); });
+    sel.innerHTML = addGroupOptions(S.addGroup); sel.classList.toggle("need", S.addGroup == null);
+    if (v) onPick?.(v);
+  };
+}
+/** Перед добавлением работ: группа должна быть выбрана явно. Если не выбрана — спросить. */
+function ensureAddGroup() {
+  if (S.addGroup != null && (S.addGroup === "__folder" || groupsList().some((g) => g.name === S.addGroup))) return Promise.resolve(true);
+  S.addGroup = null;
+  return new Promise((resolve) => {
+    let ok = false;
+    const md = simpleModal("В какую группу добавить работы?", `<p class="small muted" style="margin-top:0">Выберите группу — работы попадут в неё, а оценки потом — в её журнал. Нужной группы нет — выберите «+ новая группа…».</p>
+      <select class="select input need" id="agPick">${addGroupOptions(null)}</select>`, { width: 460, foot: `<span style="flex:1"></span><button class="btn ghost" data-close2>Отмена</button><button class="btn primary" id="agOk" disabled>Добавить</button>` });
+    const sel = $("#agPick", md.el), okb = $("#agOk", md.el);
+    bindAddGroup(sel, () => (okb.disabled = false));
+    const finish = (v) => { ok = v; md.close(); };
+    okb.onclick = () => finish(S.addGroup != null);
+    $("[data-close2]", md.el).onclick = () => finish(false);
+    // закрыли крестиком, Esc или щелчком мимо окна
+    new MutationObserver((_, ob) => { if (!md.el.isConnected) { ob.disconnect(); resolve(ok); } }).observe(document.body, { childList: true });
+    sel.focus();
+  });
 }
 
 // перетаскивание файлов в окно (Tauri отдаёт реальные пути)
@@ -943,7 +994,7 @@ const groupsList = () => S.state?.groups || [];
 const programs = () => settings().programs || ["СПО-9", "СПО-11", "Специалитет", "Бакалавриат", "Магистратура"];
 S.filters = { tasks: "all", wGroup: "all", wStatus: "all", wQuery: "", rGroup: "all" };
 S.addScope = "";
-S.addGroup = "";
+S.addGroup = null; // группа для новых работ: пока не выбрана
 S.sel = new Set();
 
 /** <option> для выбора «для кого»: все / направления / группы */
@@ -1323,7 +1374,7 @@ VIEWS.works = (v, opts = {}) => {
       <h1 class="page-title">Работы студентов</h1>
       <p class="page-lead">Добавьте файлы по одному или целой папкой. Подпапки становятся группами, а группу можно выбрать и вручную. Задание для каждой работы подбирается по её группе и направлению.</p>
     </div><div class="head-actions"><button class="btn" id="photoBtn" title="Фото страниц тетради одного студента — одна работа">Работа по фото…</button><button class="btn" id="moodleBtn">${ICON.down}Импорт из Moodle</button><button class="btn" id="grpBtn">Группы и направления</button><button class="btn" id="arcBtn" title="Отпечатки работ прошлых лет: списывание у прошлогодних студентов">Архив прошлых лет</button>${st.works.length ? `<button class="btn ghost danger" id="clearWorks">${ICON.trash}Очистить</button>` : ""}</div></div>
-    ${dropzone("works", "Перетащите сюда работы или папку с работами", "Word, PDF, Excel, PowerPoint, фото и скриншоты. Фото страниц одного студента («Лесовиков_1.jpg», «Лесовиков_2.jpg» или его папка) станут одной работой. Группой по умолчанию становится папка, в которой лежат работы: «…\\Работы\\ИС-21\\Лесовиков.docx» → группа «ИС-21».")}
+    ${dropzone("works", "Перетащите сюда работы или папку с работами", "Word, PDF, Excel, PowerPoint, фото и скриншоты. Фото страниц одного студента («Лесовиков_1.jpg», «Лесовиков_2.jpg» или его папка) станут одной работой. Слева от кнопок выберите группу (или «Группа = папка»: «…\\Работы\\ИС-21\\Лесовиков.docx» → группа «ИС-21»).")}
     ${!st.works.length ? `<div style="margin-top:30px">${emptyArt("Работ пока нет", "Добавьте файл или папку с работами студентов")}</div>` : `
     <div class="toolbar" style="margin-top:18px">
       <input class="input search" id="wq" placeholder="Поиск: фамилия, файл, группа" value="${esc(F.wQuery)}">
@@ -3154,14 +3205,19 @@ function renderRunBtn() {
       try { await api("cancel_check"); } catch (e) { toast(String(e), "err"); }
     };
   } else {
-    // какую группу проверять
+    // какую группу и какое задание проверять (тот же выбор — в фильтрах очереди)
     const groups = [...new Set(works().map((x) => x.group).filter(Boolean))];
     if (S.checkGroup && !groups.includes(S.checkGroup)) S.checkGroup = "";
     const g = S.checkGroup || "";
-    const ws = works().filter((x) => !g || x.group === g);
+    const inG = works().filter((x) => !g || x.group === g);
+    const setsHere = [...new Set(inG.map(setKey))];
+    if (S.checkSet && !setsHere.includes(S.checkSet)) S.checkSet = "";
+    const k = S.checkSet || "";
+    const ws = inG.filter((x) => !k || setKey(x) === k);
+    const scoped = !!(g || k);
     const leftIds = ws.filter((x) => x.outcome.status !== "done").map((x) => x.id);
     const left = leftIds.length;
-    const what = g ? `группу «${esc(g)}»` : "все работы";
+    const what = g && k ? `«${esc(setShort(k))}» у ${esc(g)}` : k ? `«${esc(setShort(k))}»` : g ? `группу «${esc(g)}»` : "все работы";
     // проверка на паузе — сначала предлагаем продолжить
     const paused = (S.state?.paused || []).filter((id) => works().some((x) => x.id === id));
     if (paused.length) {
@@ -3177,14 +3233,16 @@ function renderRunBtn() {
     }
     w.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       ${groups.length > 1 ? `<label class="run-group"><span class="small muted">Группа</span><select class="select input" id="runGroup"><option value="">все группы (${works().length})</option>${groups.map((x) => `<option value="${esc(x)}" ${x === g ? "selected" : ""}>${esc(x)} (${works().filter((y) => y.group === x).length})</option>`).join("")}</select></label>` : ""}
+      ${setsHere.length > 1 || k ? `<label class="run-group"><span class="small muted">Задание</span><select class="select input" id="runSet" title="Проверять и показывать в очереди только работы по этому заданию"><option value="">все задания (${inG.length})</option>${setsHere.map((x) => `<option value="${esc(x)}" ${x === k ? "selected" : ""}>${esc(setShort(x))} (${inG.filter((y) => setKey(y) === x).length})</option>`).join("")}</select></label>` : ""}
       <button class="run-btn" id="runBtn" ${ws.length ? "" : "disabled"}><span class="pen">${ICON.pen}</span>${left && left < ws.length ? `Проверить оставшиеся (${left})` : `Проверить ${what}`}</button>
       ${left && left < ws.length ? `<button class="btn" id="runAll">Перепроверить ${what}</button>` : ""}
       <button class="btn" id="runPick" ${ws.length ? "" : "disabled"}>Выбрать работы…</button>
       ${settings().cache_results !== false && ws.some((x) => x.outcome.status === "done") ? `<button class="btn ghost sm" id="runFresh" title="Работы без изменений обычно не проверяются заново — берётся прошлый результат. Эта кнопка заставит нейросеть проверить всё ещё раз">Проверить заново без кэша</button>` : ""}</div>`;
-    $("#runGroup")?.addEventListener("change", (e) => { S.checkGroup = e.target.value; renderRunBtn(); });
-    $("#runBtn").onclick = () => (left && left < ws.length ? startCheck(leftIds, false) : g ? startCheck(ws.map((x) => x.id), false) : startCheck(null, false));
-    $("#runAll")?.addEventListener("click", () => startCheck(g ? ws.map((x) => x.id) : null, false));
-    $("#runFresh")?.addEventListener("click", async () => { if (await askConfirm(`Проверить ${what} нейросетью заново, не беря сохранённые результаты? Это займёт время и токены.`)) startCheck(g ? ws.map((x) => x.id) : null, false, true); });
+    $("#runGroup")?.addEventListener("change", (e) => { S.checkGroup = e.target.value; syncCheckScope(); });
+    $("#runSet")?.addEventListener("change", (e) => { S.checkSet = e.target.value; syncCheckScope(); });
+    $("#runBtn").onclick = () => (left && left < ws.length ? startCheck(leftIds, false) : scoped ? startCheck(ws.map((x) => x.id), false) : startCheck(null, false));
+    $("#runAll")?.addEventListener("click", () => startCheck(scoped ? ws.map((x) => x.id) : null, false));
+    $("#runFresh")?.addEventListener("click", async () => { if (await askConfirm(`Проверить ${what} нейросетью заново, не беря сохранённые результаты? Это займёт время и токены.`)) startCheck(scoped ? ws.map((x) => x.id) : null, false, true); });
     $("#runPick").onclick = () => openPickWorks();
   }
 }
@@ -3425,20 +3483,45 @@ function renderQueueFilters() {
   const box = $("#qFilters");
   if (!box) return;
   S.qf = S.qf || { st: "all", set: "", group: "", q: "" };
+  S.qf.set = S.checkSet || ""; S.qf.group = S.checkGroup || "";
   const ws = works();
-  const setsIn = [...new Set(ws.map((w) => w.assignment_id || ""))];
+  const setsIn = [...new Set(ws.filter((w) => !S.qf.group || w.group === S.qf.group).map(setKey))];
   const groupsIn = [...new Set(ws.map((w) => w.group).filter(Boolean))];
   if (!ws.length) { box.innerHTML = ""; return; }
   box.innerHTML = `<div class="group-tabs" role="tablist">${QF_ST.map(([k, t]) => `<button data-qst="${k}" class="${S.qf.st === k ? "on" : ""}">${t}</button>`).join("")}</div>
     <div class="q-f-row">
-      ${setsIn.length > 1 ? `<select class="select input" id="qfSet" aria-label="Работа"><option value="">все работы</option>${setsIn.map((c) => `<option value="${esc(c)}" ${S.qf.set === c ? "selected" : ""}>${esc(c ? setTitle(c) : "без задания")}</option>`).join("")}</select>` : ""}
+      ${setsIn.length > 1 ? `<select class="select input" id="qfSet" aria-label="Работа"><option value="">все работы</option>${setsIn.map((c) => `<option value="${esc(c)}" ${S.qf.set === c ? "selected" : ""}>${esc(c === "__none" ? "без задания" : setTitle(c))}</option>`).join("")}</select>` : ""}
       ${groupsIn.length > 1 ? `<select class="select input" id="qfGroup" aria-label="Группа"><option value="">все группы</option>${groupsIn.map((g) => `<option ${S.qf.group === g ? "selected" : ""}>${esc(g)}</option>`).join("")}</select>` : ""}
       <input class="input" id="qfQ" placeholder="Поиск: фамилия или файл" value="${esc(S.qf.q)}">
     </div>`;
   $$("[data-qst]", box).forEach((b) => (b.onclick = () => { S.qf.st = b.dataset.qst; renderQueueFilters(); renderQueue(); }));
-  $("#qfSet")?.addEventListener("change", (e) => { S.qf.set = e.target.value; renderQueue(); });
-  $("#qfGroup")?.addEventListener("change", (e) => { S.qf.group = e.target.value; renderQueue(); });
+  $("#qfSet")?.addEventListener("change", (e) => { S.checkSet = e.target.value; syncCheckScope(); });
+  $("#qfGroup")?.addEventListener("change", (e) => { S.checkGroup = e.target.value; syncCheckScope(); });
   $("#qfQ").oninput = (e) => { S.qf.q = e.target.value; renderQueue(); };
+}
+/** Задание работы для фильтров: id набора или «__none». */
+const setKey = (w) => w.assignment_id || "__none";
+/** Короткое название задания: «ПР1» (или «без задания»). */
+function setShort(k) {
+  if (k === "__none") return "без задания";
+  const st = sets().find((x) => x.id === k);
+  return st ? `${st.code}${st.scope ? ` (${st.scope})` : ""}` : "задание";
+}
+/** Выбор группы/задания на шаге «Проверка»: кнопки запуска и очередь — согласно. */
+function syncCheckScope() {
+  S.filters.rSet = S.checkSet || ""; // ведомость покажет то же задание
+  renderRunBtn();
+  renderQueueFilters();
+  renderQueue();
+  updateProgress();
+}
+const inCheckScope = (w) => (!S.checkGroup || w.group === S.checkGroup) && (!S.checkSet || setKey(w) === S.checkSet);
+function renderCheckProgress() {
+  const el = $("#progText");
+  if (!el || S.run.running) return;
+  const ws = works().filter(inCheckScope);
+  const all = works().length;
+  el.textContent = all ? `Работ: ${ws.length}${ws.length < all ? ` из ${all}` : ""}, проверено: ${ws.filter((w) => w.outcome.status === "done").length}` : "Сначала загрузите работы";
 }
 function setTitle(id) {
   const st = sets().find((x) => x.id === id);
@@ -3446,8 +3529,7 @@ function setTitle(id) {
 }
 function qfMatch(w) {
   const f = S.qf || { st: "all" }, o = w.outcome, s = o.status;
-  if (f.set && (w.assignment_id || "") !== f.set) return false;
-  if (f.group && w.group !== f.group) return false;
+  if (!inCheckScope(w)) return false;
   if (f.q) {
     const q = f.q.toLowerCase();
     if (![w.name, w.student, w.group, ...(w.sources || [])].some((x) => (x || "").toLowerCase().includes(q))) return false;
@@ -3468,29 +3550,30 @@ function renderQueue() {
   if ($("#qFilters") && !$("#qFilters").children.length && ws.length) renderQueueFilters();
   const order = { running: 0, queued: 1, error: 2, done: 3, pending: 4 };
   const list = [...ws].filter(qfMatch).sort((a, b) => (order[a.outcome.status] ?? 5) - (order[b.outcome.status] ?? 5));
-  $("#qCount").textContent = ws.length ? `${ws.filter((w) => w.outcome.status === "done").length} из ${ws.length}` : "";
+  const sc = ws.filter(inCheckScope);
+  $("#qCount").textContent = sc.length ? `${sc.filter((w) => w.outcome.status === "done").length} из ${sc.length}` : "";
   // разделы: работа (задание) и группа — чтобы было видно, что к чему относится
   const multiGroup = new Set(ws.map((w) => w.group)).size > 1;
   const sections = new Map();
   for (const w of list) {
-    const key = `${w.assignment_id || ""}|${multiGroup ? w.group : ""}`;
+    const key = `${setKey(w)}|${multiGroup ? w.group : ""}`;
     if (!sections.has(key)) sections.set(key, []);
     sections.get(key).push(w);
   }
   S.qOpen = S.qOpen || {};
   S.qMore = S.qMore || {};
-  const one = sections.size === 1 && !multiGroup && new Set(ws.map((w) => w.assignment_id || "")).size <= 1;
+  const one = sections.size === 1 && !multiGroup && new Set(ws.map(setKey)).size <= 1;
   q.innerHTML = !ws.length ? emptyArt("Очередь пуста", "Загрузите работы на шаге 2")
     : !list.length ? emptyArt("Ничего не найдено", "Поменяйте фильтр")
     : [...sections.entries()].map(([key, items]) => {
       const [code, grp] = key.split("|");
-      const all = ws.filter((w) => (w.assignment_id || "") === code && (!multiGroup || w.group === grp));
+      const all = ws.filter((w) => setKey(w) === code && (!multiGroup || w.group === grp));
       const done = all.filter((w) => w.outcome.status === "done").length;
       const active = all.filter((w) => ["running", "queued"].includes(w.outcome.status)).length;
       const closed = S.qOpen[key] === false;
       const lim = S.qMore[key] ? 400 : 40;
       const head = one ? "" : `<button class="q-sec" data-qsec="${esc(key)}" aria-expanded="${!closed}">
-          <span class="q-sec-t">${esc(code ? setTitle(code) : "Без задания")}${grp ? ` <span class="q-sec-g">${esc(grp)}</span>` : ""}</span>
+          <span class="q-sec-t">${esc(code !== "__none" ? setTitle(code) : "Без задания")}${grp ? ` <span class="q-sec-g">${esc(grp)}</span>` : ""}</span>
           <span class="q-sec-n">${active ? `проверяется ${active} • ` : ""}готово ${done} из ${all.length}</span><span class="q-sec-arrow">${closed ? "▸" : "▾"}</span></button>`;
       const body = closed ? "" : items.slice(0, lim).map((w) => queueItem(w)).join("") + (items.length > lim ? `<button class="btn sm ghost q-more" data-qmore="${esc(key)}">Показать ещё ${items.length - lim}</button>` : "");
       return `<div class="q-group">${head}${body}</div>`;
@@ -3533,9 +3616,10 @@ function updateProgress() {
       $("#progEta").textContent = left > 0 ? `осталось ≈ ${left > 90 ? Math.round(left / 60) + " мин" : left + " с"}` : "";
     } else $("#progEta").textContent = "первая работа самая долгая — модель загружается";
   } else {
-    const done = ws.filter((w) => w.outcome.status === "done").length;
-    line.style.width = ws.length ? (done / ws.length) * 100 + "%" : "0";
-    $("#progText").textContent = ws.length ? `Работ: ${ws.length}, проверено: ${done}` : "Сначала загрузите работы";
+    const sc = ws.filter(inCheckScope);
+    const done = sc.filter((w) => w.outcome.status === "done").length;
+    line.style.width = sc.length ? (done / sc.length) * 100 + "%" : "0";
+    renderCheckProgress();
     $("#progEta").textContent = "";
   }
 }
@@ -3762,7 +3846,19 @@ VIEWS.report = async (v) => {
       <button class="btn" id="defBtn" title="Кого вызвать на устную защиту: признаки ИИ, списывание, совпадения с архивом — с вопросами">План защиты</button>
     </div></div>
     ${pendingAi().length ? `<div class="ai-ask" style="margin-bottom:16px"><b>Признаки ИИ ждут вашего решения: ${pendingAi().length}.</b> Пока у этих работ стоит оценка по содержанию. <button class="btn sm primary" id="aiOpenRep" style="margin-left:10px">Решить</button></div>` : ""}
-    ${groupsInWorks().length > 1 ? `<div class="toolbar" style="margin-bottom:14px"><span class="small muted">Ведомость для:</span><select class="select input" id="rGroup" style="width:auto">${reportScopeOptions()}</select><span class="small muted">В строки ведомости и в выгрузку попадают только работы этой группы.</span></div>` : ""}
+    ${(() => {
+      const multiG = groupsInWorks().length > 1;
+      const rg0 = S.filters.rGroup === "all" ? "" : S.filters.rGroup;
+      const inG = works().filter((w) => !rg0 || w.group === rg0 || w.program === rg0);
+      const ks = [...new Set(inG.map(setKey))];
+      if (S.filters.rSet && !ks.includes(S.filters.rSet)) S.filters.rSet = "";
+      const multiS = ks.length > 1 || S.filters.rSet;
+      if (!multiG && !multiS) return "";
+      return `<div class="toolbar" style="margin-bottom:14px"><span class="small muted">Ведомость для:</span>
+        ${multiG ? `<select class="select input" id="rGroup" style="width:auto">${reportScopeOptions()}</select>` : ""}
+        ${multiS ? `<select class="select input" id="rSet" style="width:auto" title="Только работы по этому заданию"><option value="">все задания (${inG.length})</option>${ks.map((k) => `<option value="${esc(k)}" ${S.filters.rSet === k ? "selected" : ""}>${esc(setShort(k))} (${inG.filter((w) => setKey(w) === k).length})</option>`).join("")}</select>` : ""}
+        <span class="small muted">В строки ведомости и в выгрузку попадают только выбранные работы.</span></div>`;
+    })()}
     <div class="grid3" style="margin-bottom:20px">
       <label class="field"><span>Дисциплина</span><input class="input" data-s="discipline" value="${esc(st.discipline || "")}"></label>
       <label class="field"><span>Группа в шапке ведомости</span><select class="select input" id="rHeadGroup">${(() => {
@@ -3781,6 +3877,7 @@ VIEWS.report = async (v) => {
     if (e.target.value !== "all" && groupsInWorks().includes(e.target.value)) await saveSettings({ group_name: e.target.value });
     VIEWS.report(v);
   });
+  $("#rSet")?.addEventListener("change", (e) => { S.filters.rSet = e.target.value; VIEWS.report(v); });
   $("#rHeadGroup").onchange = async (e) => {
     let g = e.target.value;
     if (g === "__other") {
@@ -3795,7 +3892,10 @@ VIEWS.report = async (v) => {
   $("#fbAll").onclick = async () => {
     const path = await pickSave(`Отзывы_${sets().map((s) => s.code).join("_") || "работы"}.docx`, "docx");
     if (!path) return;
-    try { const r = await api("export_feedback", { path }); toast(`Отзывы сохранены: ${r.count}`, "ok", { label: "Открыть", run: () => api("open_path", { path }) }); }
+    const rg1 = S.filters.rGroup === "all" ? "" : S.filters.rGroup;
+    const ids = rg1 || S.filters.rSet ? works().filter((w) => (!rg1 || w.group === rg1 || w.program === rg1) && (!S.filters.rSet || setKey(w) === S.filters.rSet)).map((w) => w.id) : [];
+    if ((rg1 || S.filters.rSet) && !ids.length) { toast("Нет работ для отзывов", "err"); return; }
+    try { const r = await api("export_feedback", { path, ids }); toast(`Отзывы сохранены: ${r.count}`, "ok", { label: "Открыть", run: () => api("open_path", { path }) }); }
     catch (e) { toast(String(e), "err"); }
   };
   $("#aiOpenRep")?.addEventListener("click", () => openAiDecide());
@@ -3807,7 +3907,7 @@ VIEWS.report = async (v) => {
     toast(`Записано в журнал: ${r.added}`, "ok", { label: "Открыть журнал", run: () => go("journal") });
   };
   const rg = S.filters.rGroup === "all" ? "" : S.filters.rGroup;
-  const rep = await api("report_preview", { group: rg });
+  const rep = await api("report_preview", { group: rg, set: S.filters.rSet || "" });
   const s = rep.stats;
   if (!rep.rows.length) {
     ($("#repBody") || {}).innerHTML = emptyArt("Ведомость пуста", "Загрузите и проверьте работы — строки появятся здесь.");
@@ -3852,13 +3952,13 @@ VIEWS.report = async (v) => {
 };
 
 async function exportReport(fmt) {
-  const codes = sets().map((s) => s.code).join("_") || "ПР";
+  const codes = (S.filters.rSet && S.filters.rSet !== "__none" ? sets().filter((s) => s.id === S.filters.rSet) : sets()).map((s) => s.code).join("_") || "ПР";
   const g = ((S.filters.rGroup !== "all" && S.filters.rGroup) || settings().group_name || "").replace(/[\\/:*?"<>|]/g, "");
   const name = `Ведомость_${codes}${g ? "_" + g : ""}_${new Date().toLocaleDateString("ru-RU").replace(/\./g, "-")}.${fmt}`;
   const path = await pickSave(name, fmt);
   if (!path) return;
   try {
-    await api("export", { format: fmt, path, group: S.filters.rGroup === "all" ? "" : S.filters.rGroup });
+    await api("export", { format: fmt, path, group: S.filters.rGroup === "all" ? "" : S.filters.rGroup, set: S.filters.rSet || "" });
     toast("Ведомость сохранена", "ok", { label: "Открыть", run: () => api("open_path", { path }) });
   } catch (e) { toast(String(e), "err"); }
 }
@@ -4001,7 +4101,8 @@ function openMoodleImport() {
     <h2>Импорт из Moodle</h2>
     <p class="small muted">В задании Moodle откройте «Просмотр всех ответов» → «Действия с ответами» → <b>«Скачать все ответы»</b>. Получится .zip-архив, его и выберите здесь — распаковывать не нужно. Приложение само возьмёт ФИО из имён файлов («Лесовиков Иван_123456_assignsubmission_file_…»), выберет главный файл каждого студента и добавит работы в группу.</p>
     <label class="field" style="margin-top:14px"><span>Группа</span>
-      <select class="select input" id="mdGroup">
+      <select class="select input ${groups.length ? "need" : ""}" id="mdGroup">
+        ${groups.length ? `<option value="" disabled selected>Выберите группу…</option>` : ""}
         ${groups.map((g) => `<option value="${esc(g.name)}">${esc(g.name)}${g.program ? ` • ${esc(g.program)}` : ""}</option>`).join("")}
         <option value="__new">+ новая группа…</option>
       </select></label>
@@ -4020,10 +4121,11 @@ function openMoodleImport() {
     <div id="mdOut" style="margin-top:14px"></div>`);
   const sel = $("#mdGroup");
   if (!groups.length) sel.value = "__new";
-  sel.onchange = () => ($("#mdNew").style.display = sel.value === "__new" ? "" : "none");
+  sel.onchange = () => { $("#mdNew").style.display = sel.value === "__new" ? "" : "none"; sel.classList.toggle("need", !sel.value); if (sel.value === "__new") $("#mdNew").focus(); };
   const go2 = async (directory) => {
+    if (!sel.value) { toast("Выберите группу, в которую добавить работы", "err"); sel.focus(); return; }
     const group = sel.value === "__new" ? $("#mdNew").value.trim() : sel.value;
-    if (!group) { toast("Укажите группу", "err"); $("#mdNew").focus(); return; }
+    if (!group) { toast("Впишите название новой группы", "err"); $("#mdNew").focus(); return; }
     const picked = await pickFiles({ directory, multiple: false, title: directory ? "Папка с ответами Moodle" : "Архив Moodle (.zip)", only: [{ name: "Архив Moodle", extensions: ["zip"] }] });
     if (!picked.length) return;
     ($("#mdOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Распаковываю и читаю ответы…</span></div>`;
@@ -4044,13 +4146,14 @@ function openMoodleImport() {
   $("#mdWsSet")?.addEventListener("click", () => { closeDrawer(); openSettings().then(() => $("#sMws")?.scrollIntoView({ block: "start" })); });
   if (mwsOn()) {
     let pick = null;
-    mwsPicker($("#mdWs"), { assign: true, onGroup: (name) => { if ([...sel.options].some((o) => o.value === name)) { sel.value = name; $("#mdNew").style.display = "none"; } } }).then((f) => (pick = f));
+    mwsPicker($("#mdWs"), { assign: true, onGroup: (name) => { if ([...sel.options].some((o) => o.value === name)) { sel.value = name; sel.classList.remove("need"); $("#mdNew").style.display = "none"; } } }).then((f) => (pick = f));
     $("#mdWsGo").onclick = async () => {
       if (!pick) return;
       const x = pick();
       if (!x.assign) { toast("Выберите задание", "err"); return; }
+      if (!sel.value) { toast("Выберите группу, в которую добавить работы", "err"); sel.focus(); return; }
       const group = sel.value === "__new" ? $("#mdNew").value.trim() || x.mgroup_name || "" : sel.value;
-      if (!group) { toast("Укажите группу", "err"); return; }
+      if (!group) { toast("Впишите название новой группы", "err"); $("#mdNew").focus(); return; }
       ($("#mdOut") || {}).innerHTML = `<div class="thinking"><div class="spinner"></div><span>Скачиваю ответы из Moodle…</span></div>`;
       try {
         if (!groupsList().some((g) => g.name === group)) await api("group_save", { name: group, program: "" });
@@ -4069,7 +4172,7 @@ function openMoodleImport() {
 /** Итог загрузки оценок из Moodle (из файла или напрямую). */
 function importedHtml(x) {
   const works = x.codes.filter((c) => !x.tests.includes(c));
-  return `<div class="ev"><span class="w ok"></span><div>${works.length ? `Работы: ${works.map(esc).join(", ")}. ` : ""}${x.tests.length ? `Тесты: ${x.tests.map(esc).join(", ")}. ` : ""}Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.${x.comments ? ` Отзывов перенесено в комментарии: ${x.comments}.` : ""}${x.flagged ? `<br><b>В отзывах упоминается ИИ: ${x.flagged}</b> — такие оценки помечены в журнале.` : ""}${x.no_variant ? `<br><b>Не указан вариант: ${x.no_variant}</b> (в отзыве «Вариант?») — у таких оценок значок «в?».` : ""}</div></div>${x.dup_rows ? `<div class="ev"><span class="w bad"></span><div>В файле повторяются одни и те же ФИО (${x.dup_names} чел., лишних строк: ${x.dup_rows}) — оценки этих строк слились в одну. Если ФИО в файле заменены для обезличивания, загрузите файл с настоящими ФИО.</div></div>` : ""}${!x.added && !x.updated && !x.comments ? `<div class="ev"><span class="w bad"></span><div>Ни одной оценки не загружено. ${x.skipped ? "Все оценки уже есть в журнале — включите «Заменять оценки», чтобы обновить их." : "В файле не нашлось оценок: проверьте, что это экспорт журнала оценок (Оценки → Экспорт) или таблица оценок задания."}</div></div>` : ""}`;
+  return `<div class="ev"><span class="w ok"></span><div>${works.length ? `Работы: ${works.map(esc).join(", ")}. ` : ""}${x.tests.length ? `Тесты: ${x.tests.map(esc).join(", ")}. ` : ""}Добавлено оценок: <b>${x.added}</b>${x.updated ? `, заменено: ${x.updated}` : ""}${x.skipped ? `, пропущено (уже были в журнале): ${x.skipped}` : ""}${x.students ? `. Новых студентов в списке: ${x.students}` : ""}.${x.comments ? ` Отзывов перенесено в комментарии: ${x.comments}.` : ""}${x.flagged ? `<br><b>В отзывах упоминается ИИ: ${x.flagged}</b> — такие оценки помечены в журнале.` : ""}${x.copied ? `<br><b>В отзывах говорится о списывании: ${x.copied}</b> («списано», «чужая работа»…) — такие оценки обведены оранжевым.` : ""}${x.no_variant ? `<br><b>Не указан вариант: ${x.no_variant}</b> (в отзыве «Вариант?») — у таких оценок значок «в?».` : ""}</div></div>${x.dup_rows ? `<div class="ev"><span class="w bad"></span><div>В файле повторяются одни и те же ФИО (${x.dup_names} чел., лишних строк: ${x.dup_rows}) — оценки этих строк слились в одну. Если ФИО в файле заменены для обезличивания, загрузите файл с настоящими ФИО.</div></div>` : ""}${!x.added && !x.updated && !x.comments ? `<div class="ev"><span class="w bad"></span><div>Ни одной оценки не загружено. ${x.skipped ? "Все оценки уже есть в журнале — включите «Заменять оценки», чтобы обновить их." : "В файле не нашлось оценок: проверьте, что это экспорт журнала оценок (Оценки → Экспорт) или таблица оценок задания."}</div></div>` : ""}`;
 }
 
 // ---------------------------------------------------------------- Moodle напрямую (веб-службы)
@@ -4408,10 +4511,10 @@ function renderJournal() {
   };
   const cell = (s, t) => {
     const x = s.cells[t.code];
-    const tip = x ? [x.file, x.raw != null && x.raw !== x.grade ? `в Moodle ${fmtG(x.raw)}` : "", x.comment, hasFlag(x, "ai_text") ? "в отзыве упоминается ИИ" : "", hasFlag(x, "no_variant") ? "в работе не указан вариант" : ""].filter(Boolean).join(" — ") : t.kind === "custom" ? "пусто — щёлкните, чтобы вписать" : t.due ? "нет оценки — долг" : "нет оценки";
+    const tip = x ? [x.file, x.raw != null && x.raw !== x.grade ? `в Moodle ${fmtG(x.raw)}` : "", x.comment, hasFlag(x, "ai_text") ? "в отзыве упоминается ИИ" : "", hasFlag(x, "copy_text") ? "в отзыве говорится о списывании" : "", hasFlag(x, "no_variant") ? "в работе не указан вариант" : ""].filter(Boolean).join(" — ") : t.kind === "custom" ? "пусто — щёлкните, чтобы вписать" : t.due ? "нет оценки — долг" : "нет оценки";
     if (t.kind === "custom") return `<td class="cell custom" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${x && x.grade != null ? `<span class="cv">${fmtNum(x.grade)}</span>` : `<span class="miss">·</span>`}</td>`;
     const gr = x?.grade;
-    return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${gr != null ? `<span class="gm g${gradeTone(gr)} ${fmtG(gr).length > 3 ? "long" : ""} ${x.violation ? "v" : ""} ${hasFlag(x, "ai_text") ? "f" : ""}">${fmtG(gr)}</span>${hasFlag(x, "no_variant") ? `<sup class="nv" title="в работе не указан вариант">в?</sup>` : ""}${x.comment ? `<i class="cm" aria-label="есть комментарий"></i>` : ""}` : `<span class="miss ${t.due ? "due" : ""}">—</span>`}</td>`;
+    return `<td class="cell" data-s="${esc(s.name)}" data-c="${esc(t.code)}" title="${esc(tip)}">${gr != null ? `<span class="gm g${gradeTone(gr)} ${fmtG(gr).length > 3 ? "long" : ""} ${x.violation ? "v" : ""} ${hasFlag(x, "ai_text") ? "f" : ""} ${hasFlag(x, "copy_text") ? "cp" : ""}">${fmtG(gr)}</span>${hasFlag(x, "no_variant") ? `<sup class="nv" title="в работе не указан вариант">в?</sup>` : ""}${x.comment ? `<i class="cm" aria-label="есть комментарий"></i>` : ""}` : `<span class="miss ${t.due ? "due" : ""}">—</span>`}</td>`;
   };
   body.innerHTML = `${filterBar}
     <div class="group-tabs">${j.groups.map((x) => `<button data-g="${esc(x.name)}" class="${x.name === S.jGroup ? "on" : ""}">${esc(x.name || "без группы")}${x.program ? ` <span class="tab-prog">${esc(x.program)}</span>` : ""} <span class="muted small">${x.students.length}</span></button>`).join("")}
@@ -4441,7 +4544,7 @@ function renderJournal() {
         <td>${s.violations ? `<span class="chip solid-bad">${s.violations}</span>` : `<span class="muted">0</span>`}</td>
         <td>${s.missing ? `<span class="chip warn">${s.missing}</span>` : `<span class="muted">0</span>`}</td>
       </tr>`).join("")}</tbody></table></div>
-      <p class="small muted j-legend"><span class="gm g2 v mini">2</span> «2» за ИИ или списывание · <span class="gm g4 f mini">4</span> в отзыве (например, из Moodle) упоминается ИИ · «2» без заливки — работа оценена на «2» или не сдана · <span class="nv-l">в?</span> по отзыву не указан вариант · <i class="cm-l"></i> есть комментарий (наведите на оценку) · <span class="miss due">—</span> долг: работа уже оценивалась у других или срок прошёл${j.opts?.tests_min2 ? " · тесты на 0–1,9 показаны как «2»" : ""}. Щёлкните по заголовку темы, чтобы задать даты, вид, удалить её или поставить «2» несдавшим.</p>`
+      <p class="small muted j-legend"><span class="gm g2 v mini">2</span> «2» за ИИ или списывание · <span class="gm g4 f mini">4</span> в отзыве (например, из Moodle) упоминается ИИ · <span class="gm g4 cp mini">4</span> в отзыве говорится о списывании или чужой работе · «2» без заливки — работа оценена на «2» или не сдана · <span class="nv-l">в?</span> по отзыву не указан вариант · <i class="cm-l"></i> есть комментарий (наведите на оценку) · <span class="miss due">—</span> долг: работа уже оценивалась у других или срок прошёл${j.opts?.tests_min2 ? " · тесты на 0–1,9 показаны как «2»" : ""}. Щёлкните по заголовку темы, чтобы задать даты, вид, удалить её или поставить «2» несдавшим.</p>`
       : emptyArt("В группе пока никого", "Добавьте список группы, запишите проверку или загрузите оценки из Moodle.")}`;
   const refilter = async () => {
     S.jFilter = { semester: $("#jfSem").value, subject: $("#jfSub").value };
@@ -4719,7 +4822,7 @@ function openJournalAnalytics() {
       vals.forEach((v) => { d[gradeTone(v)]++; });
       const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
       const viol = g.students.filter((s) => s.cells[t.code]?.violation).length;
-      const flags = g.students.filter((s) => hasFlag(s.cells[t.code], "ai_text")).length;
+      const flags = g.students.filter((s) => hasFlag(s.cells[t.code], "ai_text") || hasFlag(s.cells[t.code], "copy_text")).length;
       return { t, vals, d, avg, viol, flags };
     });
     const all = rows.flatMap((r) => r.vals);
@@ -4736,7 +4839,7 @@ function openJournalAnalytics() {
       </div>
       <h3 class="sec">По ${kind === "test" ? "тестам" : "работам"}</h3>
       <table class="hist-table an-table"><thead><tr><th>${kind === "test" ? "Тест" : "Работа"}</th><th>Средний</th><th style="width:40%">Оценки: 5 · 4 · 3 · 2 · нет</th><th>Сдали</th>${kind === "work" ? "<th>ИИ / списывание</th>" : ""}</tr></thead><tbody>
-      ${rows.map((r) => `<tr><td><b>${esc(r.t.code)}</b>${r.t.title ? `<div class="small muted">${esc(r.t.title)}</div>` : ""}</td><td><b>${fmtNum(r.avg)}</b></td><td>${bar(r.d, n)}</td><td class="nowrap">${r.vals.length} из ${n}</td>${kind === "work" ? `<td>${r.viol || r.flags ? `${r.viol ? `<span class="chip solid-bad">${r.viol}</span>` : ""}${r.flags ? ` <span class="chip" title="в отзыве упоминается ИИ">отзыв: ${r.flags}</span>` : ""}` : `<span class="muted">0</span>`}</td>` : ""}</tr>`).join("")}
+      ${rows.map((r) => `<tr><td><b>${esc(r.t.code)}</b>${r.t.title ? `<div class="small muted">${esc(r.t.title)}</div>` : ""}</td><td><b>${fmtNum(r.avg)}</b></td><td>${bar(r.d, n)}</td><td class="nowrap">${r.vals.length} из ${n}</td>${kind === "work" ? `<td>${r.viol || r.flags ? `${r.viol ? `<span class="chip solid-bad">${r.viol}</span>` : ""}${r.flags ? ` <span class="chip" title="в отзыве упоминается ИИ или списывание">отзыв: ${r.flags}</span>` : ""}` : `<span class="muted">0</span>`}</td>` : ""}</tr>`).join("")}
       </tbody></table>
       ${hard ? `<p class="small">Сложнее всего далась <b>${esc(hard.t.code)}</b>: средний ${fmtNum(hard.avg)}.</p>` : ""}
       <div class="an-cols"><div><h3 class="sec">Лучше всех</h3>${best.slice(0, 5).map((s) => `<div class="an-li"><span>${esc(s.name)}</span><b>${fmtNum(s[avgKey])}</b></div>`).join("") || `<p class="small muted">—</p>`}</div>
@@ -4749,7 +4852,7 @@ function openJournalAnalytics() {
 
 /** Варианты для n студентов (или пар) по порядку списка: cycle — с from по to и снова,
  *  order — from, from+1… без повторов, random — случайно, но поровну, clear — пусто. */
-/** Пометка оценки журнала из отзыва: "ai_text" — упоминается ИИ, "no_variant" — не указан вариант. */
+/** Пометка оценки журнала из отзыва: "ai_text" — упоминается ИИ, "copy_text" — списывание, "no_variant" — не указан вариант. */
 function hasFlag(x, f) { return !!x?.flag && String(x.flag).split(",").includes(f); }
 
 /** Сколько вариантов в задании группы — по умолчанию для раздачи. */
@@ -5158,6 +5261,7 @@ function editCell(group, student, code) {
   openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)}${t.title ? ` — ${esc(t.title)}` : ""} • ${esc(group)}</p>
     ${x ? `<p class="small">Сейчас: «${fmtG(x.grade)}»${x.raw != null && x.raw !== x.grade ? ` (в Moodle ${fmtG(x.raw)})` : ""}${x.violation ? ` (${x.violation === "ai" ? "ИИ" : "списывание"})` : ""}, ${esc(x.file)}, ${new Date(x.date * 1000).toLocaleDateString("ru-RU")}</p>` : `<p class="small muted">Оценки нет.</p>`}
     ${hasFlag(x, "ai_text") ? `<div class="ev"><span class="w medium"></span><div>В отзыве упоминается ИИ или нейросеть. Проверьте, нужно ли считать это нарушением.</div></div>` : ""}
+    ${hasFlag(x, "copy_text") ? `<div class="ev"><span class="w medium"></span><div>В отзыве говорится о списывании или чужой работе. Проверьте, нужно ли считать это нарушением.</div></div>` : ""}
     ${hasFlag(x, "no_variant") ? `<div class="ev"><span class="w medium"></span><div>По отзыву — в работе не указан вариант.</div></div>` : ""}
     <div class="override" id="jc">${gradeScale().map((gr) => `<button class="g${Math.floor(gr)} ${x?.grade === gr ? "on" : ""}" data-g="${gr}">${fmtG(gr)}</button>`).join("")}</div>
     <label class="field jc-any"><span>или точная оценка (например, 2,6 за тест)</span><input class="input" id="jcAny" inputmode="decimal" placeholder="от 0 до 5" value="${x?.grade != null && !gradeScale().includes(x.grade) ? fmtG(x.grade) : ""}"></label>
@@ -5183,9 +5287,15 @@ const JEXP_COLS = [
   ["num", "№ по порядку"], ["avg", "Средний"], ["avg_works", "Средний по работам"], ["avg_tests", "Средний по тестам"],
   ["avg_own", "Свои средние"], ["custom", "Свои столбцы (пропуски, посещения)"], ["violations", "Нарушения"], ["missing", "Долги"],
 ];
+const JEXP_MARKS = [
+  ["violation", "«*» — «2» за нарушение (ИИ или списывание)", true],
+  ["ai_text", "«•» — в отзыве упоминается ИИ", true],
+  ["copy_text", "«•» — в отзыве говорится о списывании", true],
+  ["no_variant", "«•» — в работе не указан вариант («Вариант?»)", false],
+];
 async function exportJournal(fmt) {
-  let cols = {};
-  try { cols = JSON.parse(localStorage.getItem("jexpCols") || "{}"); } catch (e) { /* нет хранилища */ }
+  let cols = {}, marks = {};
+  try { cols = JSON.parse(localStorage.getItem("jexpCols") || "{}"); marks = JSON.parse(localStorage.getItem("jexpMarks") || "{}"); } catch (e) { /* нет хранилища */ }
   const groups = S.journal?.groups || [];
   const m = document.createElement("div");
   m.className = "modal-veil";
@@ -5193,6 +5303,8 @@ async function exportJournal(fmt) {
     <div class="modal-body" style="display:grid;gap:10px">
       <label class="field"><span>Группа</span><select class="select input" id="jeGroup">${groups.map((g) => `<option ${g.name === S.jGroup ? "selected" : ""}>${esc(g.name)}</option>`).join("")}<option value="">все группы в одной таблице</option></select></label>
       <div class="field"><span>Столбцы</span><div class="snd-ev">${JEXP_COLS.map(([k, t]) => `<label class="idea"><input type="checkbox" class="cbx" data-jc="${k}" ${cols[k] === false ? "" : "checked"}><span>${t}</span></label>`).join("")}</div></div>
+      <div class="field"><span>Пометки у оценок</span><div class="snd-ev">${JEXP_MARKS.map(([k, t, d]) => `<label class="idea"><input type="checkbox" class="cbx" data-jm="${k}" ${(marks[k] ?? d) ? "checked" : ""}><span>${t}</span></label>`).join("")}</div>
+        <small class="muted">Если в отзыве просто комментарий к работе, без ИИ и списывания, — оценка выгружается без пометки.</small></div>
       <p class="small muted" style="margin:0">Темы — по фильтру журнала${S.jFilter.semester || S.jFilter.subject ? ` (${esc([S.jFilter.subject, S.jFilter.semester].filter(Boolean).join(", "))})` : " (все семестры и предметы)"}. Цветом выделяются только оценки, дробные — по ближайшей целой.</p>
     </div>
     <div class="modal-foot"><span style="flex:1"></span><button class="btn ghost" id="jeNo">Отмена</button><button class="btn primary" id="jeOk">${ICON.down}Сохранить…</button></div></div>`;
@@ -5202,13 +5314,14 @@ async function exportJournal(fmt) {
   $("#jeNo", m).onclick = close;
   $("#jeOk", m).onclick = async () => {
     cols = Object.fromEntries($$("[data-jc]", m).map((c) => [c.dataset.jc, c.checked]));
-    try { localStorage.setItem("jexpCols", JSON.stringify(cols)); } catch (e) { /* нет хранилища */ }
+    marks = Object.fromEntries($$("[data-jm]", m).map((c) => [c.dataset.jm, c.checked]));
+    try { localStorage.setItem("jexpCols", JSON.stringify(cols)); localStorage.setItem("jexpMarks", JSON.stringify(marks)); } catch (e) { /* нет хранилища */ }
     const grp = $("#jeGroup", m).value;
     const name = `Журнал_${(grp || "все_группы").replace(/[\\/:*?"<>|]/g, "")}_${new Date().toLocaleDateString("ru-RU").replace(/\./g, "-")}.${fmt}`;
     const path = await pickSave(name, fmt);
     if (!path) return;
     try {
-      await api("journal_export", { path, format: fmt, group: grp || null, cols, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
+      await api("journal_export", { path, format: fmt, group: grp || null, cols, marks, f_semester: S.jFilter.semester, f_subject: S.jFilter.subject });
       close();
       toast("Журнал сохранён", "ok", { label: "Открыть", run: () => api("open_path", { path }) });
     } catch (e) { toast(String(e), "err"); }

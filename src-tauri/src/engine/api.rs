@@ -918,7 +918,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             if let Some(tz) = p.get("tz").as_f64() {
                 report::TZ_MIN.store(tz as i64, Ordering::Relaxed);
             }
-            let (rows, stats) = report::rows(core, &p.get("group").str_or(""));
+            let (rows, stats) = report::rows(core, &p.get("group").str_or(""), &p.get("set").str_or(""));
             let list: Vec<Json> = rows
                 .iter()
                 .map(|r| {
@@ -946,9 +946,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 return Err("не указан путь".into());
             }
             let bytes = match fmt.as_str() {
-                "xlsx" => report::xlsx(core, &p.get("group").str_or("")),
-                "csv" => report::csv(core, &p.get("group").str_or("")),
-                _ => report::docx(core, &p.get("group").str_or("")),
+                "xlsx" => report::xlsx(core, &p.get("group").str_or(""), &p.get("set").str_or("")),
+                "csv" => report::csv(core, &p.get("group").str_or(""), &p.get("set").str_or("")),
+                _ => report::docx(core, &p.get("group").str_or(""), &p.get("set").str_or("")),
             };
             std::fs::write(&path, bytes).map_err(|e| format!("не удалось сохранить: {}", e))?;
             Ok(Json::obj().with("path", path))
@@ -1335,6 +1335,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let replace = p.get("replace").bool_or(false);
             let add_roster = p.get("roster").bool_or(true);
             let (mut added, mut updated, mut skipped, mut new_students, mut flagged) = (0, 0, 0, 0, 0);
+            let mut copy_flagged = 0;
             let (mut comments, mut no_variant) = (0, 0);
             // одинаковые ФИО в разных строках файла (например, обезличенный файл) — оценки таких строк сольются
             let mut seen_names: std::collections::BTreeMap<String, usize> = Default::default();
@@ -1392,6 +1393,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                                 if super::journal::mentions_no_variant(&im.comment) {
                                     no_variant += 1;
                                 }
+                                if super::journal::mentions_copy(&im.comment) {
+                                    copy_flagged += 1;
+                                }
                                 continue;
                             }
                         }
@@ -1422,6 +1426,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     if super::journal::mentions_ai(&im.comment) {
                         flagged += 1;
                     }
+                    if super::journal::mentions_copy(&im.comment) {
+                        copy_flagged += 1;
+                    }
                     if exists {
                         updated += 1;
                     } else {
@@ -1444,7 +1451,7 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 j.save();
             }
             let mut v = journal_view(core, &p);
-            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes).with("tests", tests).with("flagged", flagged).with("comments", comments).with("no_variant", no_variant).with("dup_names", seen_names.len()).with("dup_rows", dup_rows).with("group", group.as_str()));
+            v.set("imported", Json::obj().with("added", added).with("updated", updated).with("skipped", skipped).with("students", new_students).with("codes", codes).with("tests", tests).with("flagged", flagged).with("copied", copy_flagged).with("comments", comments).with("no_variant", no_variant).with("dup_names", seen_names.len()).with("dup_rows", dup_rows).with("group", group.as_str()));
             Ok(v)
         }
 
@@ -3028,6 +3035,11 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let only = p.get("group").as_str().map(|s| s.to_string());
             let cols = p.get("cols").clone();
             let on = |k: &str, d: bool| cols.get(k).bool_or(d);
+            // пометки у оценок: «*» — нарушение, «•» — в отзыве (что именно — выбирает преподаватель)
+            let marks = p.get("marks").clone();
+            let mark_on = |k: &str, d: bool| marks.get(k).bool_or(d);
+            let dot_flags: Vec<&str> = [("ai_text", true), ("copy_text", true), ("no_variant", false)].iter().filter(|(k, d)| mark_on(k, *d)).map(|(k, _)| *k).collect();
+            let star = mark_on("violation", true);
             let v = journal_view(core, &p);
             let groups: Vec<Json> = v.get("groups").as_arr().iter().filter(|g| only.as_ref().map(|o| o == &g.get("name").str_or("")).unwrap_or(true)).cloned().collect();
             // темы: из выбранной группы или объединение всех
@@ -3121,7 +3133,11 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                         let custom = kinds.get(c).map(|k| k == "custom").unwrap_or(false);
                         r.push(match cell.get("grade").as_f64() {
                             Some(x) if custom => if (x - x.round()).abs() < 1e-9 { format!("{}", x.round() as i64) } else { format!("{}", x).replace('.', ",") },
-                            Some(x) => format!("{}{}{}", super::core::fmt_grade(x), if cell.get("violation").str_or("").is_empty() { "" } else { "*" }, if cell.get("flag").str_or("").is_empty() { "" } else { "•" }),
+                            Some(x) => {
+                                let fl = cell.get("flag").str_or("");
+                                let dot = fl.split(',').any(|f| dot_flags.contains(&f));
+                                format!("{}{}{}", super::core::fmt_grade(x), if !star || cell.get("violation").str_or("").is_empty() { "" } else { "*" }, if dot { "•" } else { "" })
+                            }
                             None => String::new(),
                         });
                     }
@@ -3148,7 +3164,16 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 only.as_ref().map(|g| format!(" {}", g)).unwrap_or_default(),
                 if sub_title.is_empty() { String::new() } else { format!(" — {}", sub_title.join(", ")) }
             );
-            let legend = "* — «2» за нарушение (ИИ или списывание); • — в отзыве упоминается ИИ; пустая клетка — оценки нет";
+            let mut legend_parts: Vec<String> = Vec::new();
+            if star {
+                legend_parts.push("* — «2» за нарушение (ИИ или списывание)".into());
+            }
+            if !dot_flags.is_empty() {
+                let what: Vec<&str> = dot_flags.iter().map(|f| match *f { "ai_text" => "упоминается ИИ", "copy_text" => "говорится о списывании", _ => "не указан вариант" }).collect();
+                legend_parts.push(format!("• — в отзыве {}", what.join(" или ")));
+            }
+            legend_parts.push("пустая клетка — оценки нет".into());
+            let legend = legend_parts.join("; ");
             // цвет — только у оценок; дробные («3,5») — по ближайшей целой
             let fill_of = |i: usize, x: &str| -> &'static str {
                 if i < first_grade || i >= last_grade || kinds.get(&heads[i]).map(|k| k == "custom").unwrap_or(false) {
@@ -3534,7 +3559,8 @@ pub fn journal_view(core: &Arc<Core>, p: &Json) -> Json {
                             .with("grade", val)
                             .with("raw", raw)
                             .with("violation", e.violation.as_str())
-                            .with("flag", e.flag.as_str())
+                            // пометки по отзыву — и для оценок, загруженных старой версией
+                            .with("flag", { let mut f: Vec<String> = e.flag.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(); for x in super::journal::comment_flags(&e.comment).split(',').filter(|x| !x.is_empty()) { if !f.iter().any(|y| y == x) { f.push(x.to_string()); } } f.join(",") })
                             .with("date", e.date)
                             .with("file", e.file.as_str())
                             .with("comment", e.comment.as_str())

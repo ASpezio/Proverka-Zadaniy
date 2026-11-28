@@ -139,11 +139,29 @@ pub fn mentions_no_variant(text: &str) -> bool {
         .any(|w| compact.contains(w))
 }
 
-/// Пометки оценки по отзыву: «ai_text» (упоминается ИИ), «no_variant» (не указан вариант), через запятую.
+/// Отзыв говорит о списывании: «списано», «чужая работа», «работа как у …», «плагиат».
+pub fn mentions_copy(text: &str) -> bool {
+    let low = format!(" {} ", text.to_lowercase().replace('ё', "е"));
+    let low: String = low.split_whitespace().collect::<Vec<_>>().join(" ");
+    let low = format!(" {} ", low);
+    [
+        "списан", "списал", "списыва", "списала", "чужая работа", "чужую работу", "чужой работ", "не своя работа", "не свою работу", "не ваша работа", "не твоя работа",
+        "плагиат", "антиплагиат", "одинаковые работы", "одинаковая работа", "такая же работа", "та же работа", "копия работы", "копия чужой", "скопирован", "скопировал",
+        "копипаст", "работа другого", "работа другой", "работу другого", "работу другой", "совпадает с работой", "совпадение с работой", "сдал чужую", "сдала чужую",
+    ]
+    .iter()
+    .any(|w| low.contains(w))
+}
+
+/// Пометки оценки по отзыву: «ai_text» (упоминается ИИ), «copy_text» (говорится о списывании),
+/// «no_variant» (не указан вариант), через запятую.
 pub fn comment_flags(text: &str) -> String {
     let mut f: Vec<&str> = Vec::new();
     if mentions_ai(text) {
         f.push("ai_text");
+    }
+    if mentions_copy(text) {
+        f.push("copy_text");
     }
     if mentions_no_variant(text) {
         f.push("no_variant");
@@ -761,4 +779,16 @@ mod tests {
 pub fn ru_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     let key = |s: &str| s.to_lowercase().replace('ё', "е\u{1}");
     key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+}
+
+#[cfg(test)]
+mod copy_flag_tests {
+    #[test]
+    fn copy_words() {
+        assert!(super::mentions_copy("Работа списана у соседа"));
+        assert!(super::mentions_copy("Это чужая работа!"));
+        assert!(super::mentions_copy("Скопировано из интернета"));
+        assert!(!super::mentions_copy("Работа выполнена хорошо, вариант указан"));
+        assert_eq!(super::comment_flags("Списал, и вариант?"), "copy_text,no_variant");
+    }
 }
