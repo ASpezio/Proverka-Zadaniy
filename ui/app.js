@@ -226,9 +226,14 @@ function showNotice(n) {
   const el = document.createElement("div");
   el.className = "notice " + (n.kind === "errors" ? "err" : "");
   el.innerHTML = `<div class="n-body"><b>${esc(n.title || "Проверка заданий")}</b>${n.body ? `<span>${esc(n.body)}</span>` : ""}</div>
-    <div class="n-act">${go_ ? `<button class="btn sm" data-n="go">${esc(go_[0])}</button>` : ""}<button class="btn sm ghost" data-n="x" title="Закрыть">×</button></div>`;
+    <div class="n-act">${go_ ? `<button class="btn sm" data-n="go">${esc(go_[0])}</button>` : ""}${n.kind === "speed" ? `<button class="btn sm ghost" data-n="off" title="Больше не показывать такие предупреждения (включить снова — в «Нейросеть и MCP»)">Не предупреждать</button>` : ""}<button class="btn sm ghost" data-n="x" title="Закрыть">×</button></div>`;
   const close = () => { el.classList.add("out"); setTimeout(() => el.remove(), 300); };
   el.querySelector('[data-n="x"]').onclick = close;
+  el.querySelector('[data-n="off"]')?.addEventListener("click", async () => {
+    close();
+    try { await saveSettings({ perf: { ...(settings().perf || {}), warn: false } }); toast("Предупреждения о скорости выключены. Включить снова — в «Нейросеть и MCP»"); }
+    catch (e) { toast(String(e), "err"); }
+  });
   el.querySelector('[data-n="go"]')?.addEventListener("click", () => { close(); go_[1](); });
   box.appendChild(el);
   SND.play("notify");
@@ -2161,6 +2166,7 @@ VIEWS.model = async (v) => {
       </div>
       <p class="small muted" style="margin:8px 0 0">Короткий ответ: до 5 главных ошибок, по каждому заданию — статус и одна фраза, итог в 1–2 предложения. Основное время модель тратит на то, что пишет, поэтому проверка идёт примерно вдвое быстрее. Строгость оценки та же.</p>
       <label class="switch" style="margin-top:14px"><input type="checkbox" id="learnOn" ${st.learn?.enabled !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Учиться на моих исправлениях</b><small>Когда вы ставите свою оценку вместо оценки проверки, приложение запоминает это. В следующих проверках того же задания нейросеть видит 2–3 похожих случая: что поставила она, что вы и почему. Так она привыкает к вашей строгости. Текст работ не хранится — только отпечаток для поиска похожих, итог модели и ваш комментарий. <span id="learnInfo"></span></small></span></label>
+      <label class="switch" style="margin-top:14px"><input type="checkbox" id="perfWarn" ${st.perf?.warn !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Предупреждать о падении скорости</b><small>Если модель вдруг стала отвечать в 3 раза медленнее обычного или перед проверкой почти заполнена видеопамять, приложение подскажет, в чём может быть дело. Скорость и видеопамять по-прежнему видны на шаге «Проверка».</small></span></label>
     </div>`)}
     ${fold("trial", "Пробный прогон", "Можно ли доверять модели — до проверки всей группы", `<div class="card pad">
       <p class="small" style="margin:0 0 12px;max-width:80ch">Сменили модель или движок LM Studio? Пробный прогон заново проверит несколько уже оценённых работ текущей моделью и покажет, где она ставит иначе. Сначала берутся работы, которым вы сами поставили оценку, и работы с разными оценками. Сохранённые результаты не меняются.</p>
@@ -2181,6 +2187,7 @@ VIEWS.model = async (v) => {
   $("#reuseCopies").onchange = (e) => saveSettings({ reuse_copies: e.target.checked });
   $("#ansStyle").onchange = (e) => saveSettings({ answer_style: e.target.value });
   $("#learnOn").onchange = (e) => saveSettings({ learn: { ...(settings().learn || {}), enabled: e.target.checked } });
+  $("#perfWarn").onchange = (e) => saveSettings({ perf: { ...(settings().perf || {}), warn: e.target.checked } });
   renderLearnInfo();
   $("#trialBtn").onclick = () => startTrial(+$("#trialN").value);
   if (S.trial?.rows || S.trial?.running) renderTrial();

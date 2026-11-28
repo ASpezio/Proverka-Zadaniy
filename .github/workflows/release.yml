@@ -18,7 +18,7 @@ jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -34,7 +34,7 @@ jobs:
         working-directory: tools/devserver
         run: cargo build --release
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
 
@@ -50,7 +50,7 @@ jobs:
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8790/ > /dev/null && break; sleep 1; done
           node tools/ui_smoke.js http://127.0.0.1:8790 ui-shots
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         if: always()
         with:
           name: ui-screenshots
@@ -66,7 +66,7 @@ jobs:
       SIGN_PFX_BASE64: ${{ secrets.SIGN_PFX_BASE64 }}
       SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -145,7 +145,7 @@ jobs:
           if (Test-Path $exe) { throw "Программа удаления не удалила файлы" }
           "Установщик: установка и удаление прошли"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: proverka-${{ env.VERSION }}
           path: dist/*.exe
@@ -160,7 +160,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
           exit 0
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         if: steps.rel.outputs.exists == 'false'
         with:
           tag_name: v${{ env.VERSION }}

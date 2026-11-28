@@ -65,6 +65,11 @@ fn key(model: &str, conc: usize) -> String {
     format!("{}|{}", model, conc)
 }
 
+/// Предупреждать о скорости и видеопамяти (преподаватель может выключить).
+fn warn_on(core: &Core) -> bool {
+    core.settings().get("perf").get("warn").bool_or(true)
+}
+
 /// Начало проверки: сбросить замеры и посмотреть видеопамять (для локальной модели).
 pub fn run_started(core: &Core) {
     let conc = core.settings().get("concurrency").i64_or(1).clamp(1, 8) as usize;
@@ -75,7 +80,7 @@ pub fn run_started(core: &Core) {
     }
     if let Some(g) = gpu() {
         core.log(&format!("Видеопамять {}: занято {:.1} из {:.1} ГБ", g.name, g.used_mb as f64 / 1024.0, g.total_mb as f64 / 1024.0));
-        if g.total_mb > 0 && g.used_mb as f64 / g.total_mb as f64 >= 0.95 && !VRAM_WARNED.swap(true, Ordering::SeqCst) {
+        if g.total_mb > 0 && g.used_mb as f64 / g.total_mb as f64 >= 0.95 && warn_on(core) && !VRAM_WARNED.swap(true, Ordering::SeqCst) {
             super::notify::send(
                 core,
                 "speed",
@@ -104,7 +109,7 @@ pub fn sample(core: &Core, model: &str, local: bool, tokens_out: i64, secs: f64)
         r.local.insert(k.clone(), local);
         let list = r.samples.entry(k.clone()).or_default();
         list.push(tps);
-        if !local || list.len() < 2 || r.warned.contains(&k) {
+        if !local || list.len() < 2 || r.warned.contains(&k) || !warn_on(core) {
             None
         } else {
             let now = median(list);

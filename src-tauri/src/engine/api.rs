@@ -68,7 +68,7 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         let settings_lock = method == "set_settings" && {
             // во время проверки можно менять только то, что не влияет на неё: оформление, звук, трей
             let s = p.get("settings");
-            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_styles" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects" | "reminders" | "backup"))
+            s.as_obj().iter().any(|(k, _)| !matches!(k.as_str(), "theme" | "look_style" | "font_ui" | "font_head" | "font_size" | "sound" | "sound_volume" | "sound_pack" | "animations" | "tray" | "notify" | "updates" | "ui" | "custom_themes" | "custom_styles" | "custom_fonts" | "llama" | "teacher" | "programs" | "journal_auto" | "sound_events" | "journal_opts" | "csv_encoding" | "csv_sep" | "subjects" | "reminders" | "backup" | "perf"))
         };
         if LOCKED_WHILE_RUNNING.contains(&method) || settings_lock {
             return Err(LOCK_MESSAGE.into());
