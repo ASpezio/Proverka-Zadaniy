@@ -140,7 +140,7 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 
 ### Версия 1.4.1
 * `settings.perf.warn` (по умолчанию true; разрешено менять во время проверки) — `perf::warn_on` выключает предупреждения о скорости и видеопамяти (запись в журнал остаётся). В уведомлении `speed` — кнопка «Не предупреждать».
-* CI: actions/checkout@v5, setup-node@v5, upload-artifact@v5, softprops/action-gh-release@v3 (Node 24).
+* CI: actions/checkout@v5, setup-node@v5, upload-artifact@v6, softprops/action-gh-release@v3 (Node 24).
 
 ### Версия 1.4.0
 * `lessons.rs`: уроки (`lessons.json`: key = хэш работы, code, variant, model/teacher, why, model_said, sketch — до 300 основ слов) и банк замечаний (`remarks.json`). `Core::learn_from_override` вызывается из `set_override` (оценка ≠ `o.grade` → урок, иначе забыть); замечания — из `set_override` (комментарий), `feedback` save, `journal_set` (комментарий); «до правки» не считается, ФИО и обращения («Иван, …») отбрасываются. API: `lessons` (сводка, `action: clear`), `remarks` (`list`/`add`/`delete`, `id` или `code`, `all`).
