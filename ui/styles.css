@@ -1430,3 +1430,10 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .trial-t th, .trial-t td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line, rgba(127,127,127,.2)); }
 .trial-t td.num { text-align: center; font-variant-numeric: tabular-nums; }
 .trial-t tr.diff td { background: color-mix(in srgb, #e5484d 9%, transparent); }
+
+/* столбец «Вар.» в журнале */
+.jt th.jvar, .jt td.jvar { width: 48px; text-align: center; font-variant-numeric: tabular-nums; }
+.jt td.jvar { cursor: pointer; font-weight: 600; }
+.jt td.jvar:hover { background: color-mix(in srgb, currentColor 7%, transparent); }
+.jt td.jvar.off { cursor: default; opacity: .5; }
+.rg-table tr.va-ch td { background: color-mix(in srgb, var(--uv, #7a3cf0) 8%, transparent); }

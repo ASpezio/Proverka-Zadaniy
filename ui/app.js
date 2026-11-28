@@ -4394,6 +4394,7 @@ function renderJournal() {
     ${(() => { const r = (S.reminders || []).filter((x) => x.group === g.name); return r.length ? `<div class="j-remind">${r.map((x) => `<div class="ev"><span class="w medium"></span><div><b>Скоро срок ${esc(x.code)}</b> — ${x.hours_left < 24 ? `через ${Math.max(1, x.hours_left)} ч` : `через ${Math.round(x.hours_left / 24)} дн.`} (${esc(x.deadline.replace("T", " "))}): не сдали ${x.missing} из ${x.of}.</div></div>`).join("")}</div>` : ""; })()}
     <div class="section-actions j-actions">
       <button class="btn sm" id="jRoster">Список и варианты${g.roster.length ? ` (${g.roster.length})` : ""}</button>
+      ${g.roster.length ? `<button class="btn sm" id="jVariants" title="Раздать варианты всей группе (по алфавиту, по порядку, случайно…) и выгрузить список с вариантами">Варианты…</button>` : ""}
       <button class="btn sm" id="jTopics" title="Вид тем (работа, тест, свой столбец), предмет, семестр, свои средние">Темы и средние</button>
       <button class="btn sm" id="jNewCol" title="Столбец не для оценок: пропуски, посещения… В средний балл и долги не входит">${ICON.plus}Свой столбец</button>
       <button class="btn sm" id="jFill" title="Поставить «2» всем, у кого нет оценки по выданным работам и тестам">«2» несдавшим</button>
@@ -4403,12 +4404,13 @@ function renderJournal() {
       <button class="btn ghost sm danger" id="jDelGroup">${ICON.trash}Удалить группу</button>
     </div>
     ${g.students.length ? `<div class="journal-wrap"><table class="jt">
-      <thead><tr><th class="num">№</th><th class="name">Студент</th>${topics.map(head).join("")}
+      <thead><tr><th class="num">№</th><th class="name">Студент</th>${g.roster.length ? `<th class="jvar" title="Вариант студента. Щёлкните по клетке, чтобы поставить одному, или «Варианты…» — раздать всем">Вар.</th>` : ""}${topics.map(head).join("")}
         <th class="sum">Средний</th>${showW ? `<th class="sum">По работам</th>` : ""}${g.has_tests ? `<th class="sum">По тестам</th>` : ""}${own.map((a) => `<th class="sum own" title="${esc(a.codes.join(", "))}">${esc(a.name)}</th>`).join("")}
         <th class="sum">Нарушения</th><th class="sum">Долги</th></tr></thead>
       <tbody>${sortStudents(g.students, g).map((s, i) => `<tr style="animation:fadeIn .4s ${Math.min(i, 30) * 18}ms both">
         <td class="num">${i + 1}</td>
-        <td class="name ${s.in_roster || !g.roster.length ? "" : "notroster"}" data-stud="${esc(s.name)}" title="${s.in_roster || !g.roster.length ? "Щёлкните: история студента, переименовать, удалить" : "Нет в списке группы — щёлкните: история, переименовать, объединить или удалить"}">${esc(s.name)}${g.teams?.[s.name] ? ` <span class="j-var" title="Работает в паре">пара ${esc(g.teams[s.name])}</span>` : ""}${g.variants?.[s.name] ? ` <span class="j-var" title="Вариант по списку группы">в. ${esc(g.variants[s.name])}</span>` : ""}</td>
+        <td class="name ${s.in_roster || !g.roster.length ? "" : "notroster"}" data-stud="${esc(s.name)}" title="${s.in_roster || !g.roster.length ? "Щёлкните: история студента, переименовать, удалить" : "Нет в списке группы — щёлкните: история, переименовать, объединить или удалить"}">${esc(s.name)}${g.teams?.[s.name] ? ` <span class="j-var" title="Работает в паре">пара ${esc(g.teams[s.name])}</span>` : ""}${!g.roster.length && g.variants?.[s.name] ? ` <span class="j-var" title="Вариант по списку группы">в. ${esc(g.variants[s.name])}</span>` : ""}</td>
+        ${g.roster.length ? `<td class="jvar ${s.in_roster ? "" : "off"}" ${s.in_roster ? `data-var="${esc(s.name)}" title="Щёлкните, чтобы поставить или сменить вариант"` : `title="Студента нет в списке группы — вариант не ставится"`}>${g.variants?.[s.name] ? esc(g.variants[s.name]) : `<span class="miss">·</span>`}</td>` : ""}
         ${topics.map((t) => cell(s, t)).join("")}
         <td class="avg">${fmtNum(s.avg)}</td>${showW ? `<td class="avg sub">${fmtNum(s.avg_works)}</td>` : ""}${g.has_tests ? `<td class="avg sub">${fmtNum(s.avg_tests)}</td>` : ""}${own.map((a) => `<td class="avg sub">${fmtNum(s.avg_own?.[a.name])}</td>`).join("")}
         <td>${s.violations ? `<span class="chip solid-bad">${s.violations}</span>` : `<span class="muted">0</span>`}</td>
@@ -4427,6 +4429,8 @@ function renderJournal() {
   $("#jfReset")?.addEventListener("click", () => { $("#jfSem").value = ""; $("#jfSub").value = ""; refilter(); });
   $$(".group-tabs [data-g]").forEach((b) => (b.onclick = () => { if (b.dataset.g === "__new") editRoster(""); else { S.jGroup = b.dataset.g; renderJournal(); } }));
   $("#jRoster").onclick = () => editRoster(S.jGroup);
+  $("#jVariants")?.addEventListener("click", () => openVariants(S.jGroup));
+  $$(".jt td[data-var]").forEach((td) => (td.onclick = () => openVariantOne(S.jGroup, td.dataset.var)));
   $("#jTopics").onclick = () => editTopics(S.jGroup);
   $("#jNewCol").onclick = () => editTopic(S.jGroup, "", "custom");
   $("#jDebt").onclick = () => exportDebtors(S.jGroup);
@@ -4723,11 +4727,167 @@ function openJournalAnalytics() {
 /** Пометка оценки журнала из отзыва: "ai_text" — упоминается ИИ, "no_variant" — не указан вариант. */
 function hasFlag(x, f) { return !!x?.flag && String(x.flag).split(",").includes(f); }
 
+/** Сколько вариантов в задании группы — по умолчанию для раздачи. */
+function variantsOfGroup(group) {
+  const fit = sets().filter((x) => !x.scope || x.scope === group);
+  return Math.max(0, ...fit.map((x) => x.variant_count || 0)) || 10;
+}
+
+/** Порядок, в котором студенты получают варианты: как в списке, по алфавиту, случайно. */
+function orderNames(names, how) {
+  const a = [...names];
+  if (how === "az") a.sort(ruCmp);
+  else if (how === "za") a.sort((x, y) => ruCmp(y, x));
+  else if (how === "shuffle") for (let k = a.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [a[k], a[j]] = [a[j], a[k]]; }
+  return a;
+}
+
+/** Раздать варианты группе прямо из журнала: способ, порядок, предпросмотр, выгрузка. */
+function openVariants(group) {
+  const g = S.journal.groups.find((x) => x.name === group);
+  if (!g?.roster.length) { toast("Сначала загрузите список группы — «Список и варианты»", "err"); return; }
+  const cur = { ...(g.variants || {}) };
+  const teams = g.teams || {};
+  const hasPairs = Object.keys(teams).length > 0;
+  let plan = null;
+  const md = simpleModal(`Варианты — ${group}`, `
+    <div class="grid3" style="gap:12px">
+      <label class="field"><span>Как раздать</span><select class="select input" id="vaMode">
+        <option value="cycle">по кругу</option>
+        <option value="order">по порядку, без повторов</option>
+        <option value="random">случайно, поровну</option>
+        <option value="random_rep">случайно, с повторами</option>
+        <option value="same">всем один вариант</option>
+        <option value="clear">убрать варианты</option></select></label>
+      <label class="field"><span>Кому первый вариант</span><select class="select input" id="vaOrder">
+        <option value="list">по списку группы</option>
+        <option value="az">по алфавиту А–Я</option>
+        <option value="za">по алфавиту Я–А</option>
+        <option value="shuffle">в случайном порядке</option></select></label>
+      <div class="field"><span>Варианты</span><div style="display:flex;gap:8px;align-items:center"><label class="rg-n">с <input class="input sm" id="vaFrom" type="number" min="1" max="999" value="1"></label><label class="rg-n">по <input class="input sm" id="vaTo" type="number" min="1" max="999" value="${variantsOfGroup(group)}"></label></div></div>
+    </div>
+    <p class="small muted" id="vaHelp" style="margin:8px 0 0"></p>
+    <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:10px">
+      <label class="rg-chk" title="Остальным варианты не меняются"><input type="checkbox" id="vaOnlyNew"> только тем, у кого варианта нет</label>
+      ${hasPairs ? `<label class="rg-chk" title="Напарники получают один вариант на двоих"><input type="checkbox" id="vaPair" checked> одинаковый у пары</label>` : ""}
+      <button class="btn sm ghost" id="vaAgain" title="Случайная раздача — ещё раз">Перемешать ещё раз</button>
+    </div>
+    <div class="rg-wrap" style="margin-top:12px;max-height:46vh"><table class="rg-table"><thead><tr><th>№</th><th>ФИО</th>${hasPairs ? "<th>Пара</th>" : ""}<th>Было</th><th>Станет</th></tr></thead><tbody id="vaBody"></tbody></table></div>
+    <p class="small muted" id="vaSum" style="margin:8px 0 0"></p>
+    <h3 class="sec">Выгрузить список с вариантами</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <select class="select input sm" id="vaExpOrder" style="width:auto"><option value="list">как в списке группы</option><option value="az">по алфавиту</option><option value="variant">по номеру варианта</option></select>
+      <button class="btn sm" data-exp="docx">${ICON.down}Word</button><button class="btn sm" data-exp="xlsx">${ICON.down}Excel</button><button class="btn sm" data-exp="csv">${ICON.down}CSV</button>
+      <span class="small muted">Выгружаются сохранённые варианты — сначала нажмите «Сохранить», если раздавали.</span>
+    </div>`, { width: 820, foot: `<span style="flex:1"></span><button class="btn ghost" id="vaCancel">Закрыть</button><button class="btn primary" id="vaSave">Сохранить варианты</button>` });
+  const el = md.el;
+  const q = (sel) => $(sel, el);
+  const compute = () => {
+    const mode = q("#vaMode").value;
+    const onlyNew = q("#vaOnlyNew").checked;
+    const pair = hasPairs && q("#vaPair")?.checked;
+    const names = orderNames(g.roster, q("#vaOrder").value).filter((n) => !onlyNew || !cur[n]);
+    const units = [];
+    names.forEach((n) => { const t = pair && String(teams[n] || "").trim(); const u = t ? units.find((x) => x.team === t) : null; if (u) u.names.push(n); else units.push({ team: t || null, names: [n] }); });
+    const vals = dealVariants(units.length, mode, +q("#vaFrom").value || 1, +q("#vaTo").value || 1);
+    const next = { ...cur };
+    if (!onlyNew && mode === "clear") for (const n of g.roster) next[n] = "";
+    units.forEach((u, i) => u.names.forEach((n) => { next[n] = vals[i] || ""; }));
+    plan = next;
+    const changed = g.roster.filter((n) => (cur[n] || "") !== (next[n] || "")).length;
+    q("#vaBody").innerHTML = g.roster.map((n, i) => `<tr class="${(cur[n] || "") !== (next[n] || "") ? "va-ch" : ""}"><td class="rg-i">${i + 1}</td><td>${esc(n)}</td>${hasPairs ? `<td>${esc(teams[n] || "")}</td>` : ""}<td>${esc(cur[n] || "—")}</td><td><b>${esc(next[n] || "—")}</b></td></tr>`).join("");
+    q("#vaSum").textContent = `Изменится у ${changed} из ${g.roster.length}.` + (onlyNew ? ` Без варианта было: ${g.roster.filter((n) => !cur[n]).length}.` : "");
+    q("#vaAgain").style.display = mode.startsWith("random") || q("#vaOrder").value === "shuffle" ? "" : "none";
+    const [a, b] = [+q("#vaFrom").value || 1, +q("#vaTo").value || 1];
+    q("#vaHelp").textContent = {
+      cycle: `Первый получает ${a}, следующий ${a + 1}… после ${b} — снова ${a}.`,
+      order: `Первый получает ${a}, дальше +1 каждому, без повторов (номера могут выйти за ${b}).`,
+      random: `Случайные номера с ${a} по ${b}, каждый номер встречается почти поровну.`,
+      random_rep: `Каждому — случайный номер с ${a} по ${b}, номера могут повторяться сколько угодно.`,
+      same: `Всем — вариант ${a}.`,
+      clear: "Варианты будут убраны.",
+    }[mode] || "";
+  };
+  ["#vaMode", "#vaOrder", "#vaFrom", "#vaTo", "#vaOnlyNew", "#vaPair"].forEach((sel) => { const x = q(sel); if (x) x.onchange = x.oninput = compute; });
+  q("#vaAgain").onclick = compute;
+  q("#vaCancel").onclick = md.close;
+  q("#vaSave").onclick = async () => {
+    try {
+      const r = await loadJournal("journal_variants", { group, variants: plan, merge: false });
+      md.close(); renderJournal();
+      toast(`Варианты сохранены (изменено ${g.roster.filter((n) => (cur[n] || "") !== (plan[n] || "")).length})`, "ok", { label: "Отменить", run: undoLast });
+      return r;
+    } catch (e) { toast(String(e), "err"); }
+  };
+  $$("[data-exp]", el).forEach((b) => (b.onclick = () => exportVariants(group, b.dataset.exp, q("#vaExpOrder").value)));
+  compute();
+}
+
+async function exportVariants(group, ext, order) {
+  const path = await pickSave(`Варианты_${group.replace(/[\\/:*?"<>|]/g, "")}.${ext}`, ext);
+  if (!path) return;
+  try {
+    const r = await api("journal_variants_export", { path, group, order });
+    toast(`Список сохранён: ${r.students} чел., с вариантом ${r.given}`, "ok", { label: "Открыть", run: () => api("open_path", { path: r.path }) });
+  } catch (e) { toast(String(e), "err"); }
+}
+
+/** Вариант одному студенту: вписать, случайный, наименее занятый, убрать. */
+function openVariantOne(group, name) {
+  const g = S.journal.groups.find((x) => x.name === group);
+  if (!g) return;
+  const cur = g.variants?.[name] || "";
+  const mate = g.teams?.[name] ? g.roster.filter((n) => n !== name && g.teams[n] === g.teams[name]) : [];
+  const md = simpleModal(name, `
+    <p class="small muted" style="margin-top:0">${esc(group)}${cur ? ` • сейчас вариант ${esc(cur)}` : " • варианта нет"}</p>
+    <label class="field"><span>Вариант</span><input class="input" id="v1Val" value="${esc(cur)}" placeholder="например, 7" inputmode="numeric"></label>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+      <button class="btn sm" id="v1Rand" title="Случайный номер из диапазона">Случайный</button>
+      <button class="btn sm" id="v1Free" title="Вариант, который в группе есть у меньшего числа студентов">Наименее занятый</button>
+      <button class="btn sm" id="v1Next" title="Следующий после самого большого розданного">Следующий по порядку</button>
+      <button class="btn sm ghost" id="v1Clear">Убрать</button>
+      <span class="small muted">из</span><label class="rg-n">с <input class="input sm" id="v1From" type="number" min="1" value="1"></label><label class="rg-n">по <input class="input sm" id="v1To" type="number" min="1" value="${variantsOfGroup(group)}"></label>
+    </div>
+    ${mate.length ? `<label class="rg-chk" style="margin-top:10px"><input type="checkbox" id="v1Pair" checked> и напарнику: ${esc(mate.join(", "))}</label>` : ""}`,
+    { width: 560, foot: `<span style="flex:1"></span><button class="btn ghost" id="v1Cancel">Отмена</button><button class="btn primary" id="v1Save">Сохранить</button>` });
+  const el = md.el, q = (sel) => $(sel, el);
+  const range = () => { const a = Math.max(1, +q("#v1From").value || 1); return [a, Math.max(a, +q("#v1To").value || a)]; };
+  q("#v1Rand").onclick = () => { const [a, b] = range(); q("#v1Val").value = String(a + Math.floor(Math.random() * (b - a + 1))); };
+  q("#v1Free").onclick = () => {
+    const [a, b] = range();
+    const cnt = {};
+    for (const n of g.roster) if (n !== name && !mate.includes(n)) { const v = +g.variants?.[n]; if (v >= a && v <= b) cnt[v] = (cnt[v] || 0) + 1; }
+    let best = a;
+    for (let v = a; v <= b; v++) if ((cnt[v] || 0) < (cnt[best] || 0)) best = v;
+    q("#v1Val").value = String(best);
+  };
+  q("#v1Next").onclick = () => {
+    const [a, b] = range();
+    const used = g.roster.filter((n) => n !== name).map((n) => +g.variants?.[n]).filter((v) => v >= a && v <= b);
+    const mx = used.length ? Math.max(...used) : a - 1;
+    q("#v1Val").value = String(mx >= b ? a : mx + 1);
+  };
+  q("#v1Clear").onclick = () => { q("#v1Val").value = ""; };
+  q("#v1Cancel").onclick = md.close;
+  const save = async () => {
+    const v = q("#v1Val").value.trim();
+    const variants = { [name]: v };
+    if (q("#v1Pair")?.checked) for (const n of mate) variants[n] = v;
+    try { await loadJournal("journal_variants", { group, variants, merge: true }); md.close(); renderJournal(); toast(v ? `${name}: вариант ${v}` : `${name}: вариант убран`); }
+    catch (e) { toast(String(e), "err"); }
+  };
+  q("#v1Save").onclick = save;
+  q("#v1Val").onkeydown = (e) => { if (e.key === "Enter") save(); };
+  setTimeout(() => q("#v1Val").focus(), 50);
+}
+
 function dealVariants(n, mode, from, to) {
   from = Math.max(1, Math.round(from)); to = Math.max(from, Math.round(to));
   const span = to - from + 1;
   if (mode === "clear") return Array(n).fill("");
+  if (mode === "same") return Array(n).fill(String(from));
   if (mode === "order") return Array.from({ length: n }, (_, i) => String(from + i));
+  if (mode === "random_rep") return Array.from({ length: n }, () => String(from + Math.floor(Math.random() * span)));
   if (mode === "random") {
     const pool = [];
     while (pool.length < n) { const part = Array.from({ length: span }, (_, k) => from + k); for (let k = part.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [part[k], part[j]] = [part[j], part[k]]; } pool.push(...part); }

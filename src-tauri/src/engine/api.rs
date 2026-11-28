@@ -50,6 +50,7 @@ const LOCKED_WHILE_RUNNING: &[&str] = &[
     "ai_decide",
     "group_delete",
     "journal_roster",
+    "journal_variants",
     "lmstudio_reload",
     "add_photo_work",
     "journal_student",
@@ -85,6 +86,7 @@ fn handle(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String> {
         "journal_roster" if p.get("names").as_arr().is_empty() => Some("удаление списка группы"),
         "journal_topic" if p.get("action").str_or("") == "delete" => Some("удаление темы"),
         "journal_fill" => Some("«2» несдавшим"),
+        "journal_variants" if !p.get("merge").bool_or(true) || p.get("variants").as_obj().len() > 1 => Some("раздача вариантов"),
         _ => None,
     };
     if let Some(what) = undoable {
@@ -1901,6 +1903,121 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             }
             core.refinalize_all();
             Ok(journal_view(core, &p))
+        }
+
+        // варианты студентов группы, не трогая сам список: {ФИО: вариант} (пусто — убрать).
+        // merge = false — заменить все варианты группы этим набором
+        "journal_variants" => {
+            let group = p.get("group").str_or("").trim().to_string();
+            if group.is_empty() {
+                return Err("Укажите группу".into());
+            }
+            let merge = p.get("merge").bool_or(true);
+            let n = {
+                let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                let roster = j.rosters.get(&group).cloned().unwrap_or_default();
+                if roster.is_empty() {
+                    return Err("Сначала загрузите список группы — «Список и варианты»".into());
+                }
+                let mut cur = if merge { j.assigned.get(&group).cloned().unwrap_or_default() } else { Default::default() };
+                let mut n = 0;
+                for (k, v) in p.get("variants").as_obj() {
+                    let name = k.trim().to_string();
+                    if !roster.contains(&name) {
+                        continue;
+                    }
+                    let val = v.as_str().map(|x| x.trim().to_string()).or_else(|| v.as_f64().map(|x| format!("{}", x as i64))).unwrap_or_default();
+                    if val.is_empty() {
+                        cur.remove(&name);
+                    } else {
+                        cur.insert(name, val);
+                    }
+                    n += 1;
+                }
+                if cur.is_empty() {
+                    j.assigned.remove(&group);
+                } else {
+                    j.assigned.insert(group.clone(), cur);
+                }
+                j.save();
+                n
+            };
+            core.refinalize_all();
+            let mut v = journal_view(core, &p);
+            v.set("changed", n);
+            Ok(v)
+        }
+
+        // список группы с вариантами: Word, Excel или CSV
+        "journal_variants_export" => {
+            let path = p.get("path").str_or("");
+            let group = p.get("group").str_or("");
+            let order = p.get("order").str_or("list");
+            let (roster, vars, teams) = {
+                let j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                (j.rosters.get(&group).cloned().unwrap_or_default(), j.assigned.get(&group).cloned().unwrap_or_default(), j.teams.get(&group).cloned().unwrap_or_default())
+            };
+            if roster.is_empty() {
+                return Err("В группе нет списка студентов".into());
+            }
+            let mut list: Vec<(String, String, String)> = roster.iter().map(|n| (n.clone(), vars.get(n).cloned().unwrap_or_default(), teams.get(n).cloned().unwrap_or_default())).collect();
+            let vkey = |v: &str| -> (u8, i64, String) {
+                match v.trim().parse::<i64>() {
+                    Ok(x) => (0, x, String::new()),
+                    Err(_) if v.trim().is_empty() => (2, 0, String::new()),
+                    Err(_) => (1, 0, v.to_lowercase()),
+                }
+            };
+            match order.as_str() {
+                "az" => list.sort_by(|a, b| super::journal::ru_cmp(&a.0, &b.0)),
+                "variant" => list.sort_by(|a, b| vkey(&a.1).cmp(&vkey(&b.1)).then_with(|| super::journal::ru_cmp(&a.0, &b.0))),
+                _ => {}
+            }
+            let with_pairs = list.iter().any(|x| !x.2.is_empty());
+            let mut heads: Vec<String> = vec!["№".into(), "ФИО".into(), "Вариант".into()];
+            if with_pairs {
+                heads.push("Пара".into());
+            }
+            let rows: Vec<Vec<String>> = list
+                .iter()
+                .enumerate()
+                .map(|(i, (n, v, t))| {
+                    let mut r = vec![(i + 1).to_string(), n.clone(), v.clone()];
+                    if with_pairs {
+                        r.push(t.clone());
+                    }
+                    r
+                })
+                .collect();
+            let given = list.iter().filter(|x| !x.1.is_empty()).count();
+            let title = format!("Варианты — группа {}", group);
+            let what = p.get("title").str_or("");
+            let sub = format!("{}Сформировано {}. Вариант указан у {} из {}.", if what.trim().is_empty() { String::new() } else { format!("{}. ", what.trim()) }, super::report::today_str(), given, list.len());
+            let low = path.to_lowercase();
+            let bytes = if low.ends_with(".xlsx") {
+                let widths: Vec<u32> = heads.iter().map(|h| match h.as_str() { "№" => 5, "ФИО" => 36, _ => 11 }).collect();
+                let fills: Vec<Vec<String>> = rows.iter().map(|r| r.iter().map(|_| String::new()).collect()).collect();
+                super::report::xlsx_table_ex("Варианты", &format!("{}  ({})", title, sub), &heads, &rows, &widths, &fills, 2)
+            } else if low.ends_with(".csv") {
+                let st = core.settings();
+                let sep = st.get("csv_sep").str_or(";");
+                let enc = st.get("csv_encoding").str_or("utf8bom");
+                let q = |x: &str| if x.contains(sep.as_str()) || x.contains('"') { format!("\"{}\"", x.replace('"', "\"\"")) } else { x.to_string() };
+                let mut t = heads.iter().map(|h| q(h)).collect::<Vec<_>>().join(&sep);
+                t.push_str("\r\n");
+                for r in &rows {
+                    t.push_str(&r.iter().map(|x| q(x)).collect::<Vec<_>>().join(&sep));
+                    t.push_str("\r\n");
+                }
+                super::moodle::encode_csv(&t, &enc)
+            } else {
+                let widths: Vec<u32> = heads.iter().map(|h| match h.as_str() { "№" => 600, "ФИО" => 5200, _ => 1500 }).collect();
+                let trows: Vec<Vec<(String, String)>> = rows.iter().map(|r| r.iter().map(|x| (x.clone(), String::new())).collect()).collect();
+                let blocks = vec![Block::Title(title.clone()), Block::Sub(sub), Block::Table { heads: heads.clone(), widths, rows: trows }];
+                super::report::docx_blocks(&title, &blocks, false)
+            };
+            std::fs::write(&path, bytes).map_err(|e| format!("Не удалось сохранить: {}", e))?;
+            Ok(Json::obj().with("path", path.as_str()).with("students", list.len()).with("given", given))
         }
 
         "analytics" => {

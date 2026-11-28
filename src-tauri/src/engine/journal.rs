@@ -756,3 +756,9 @@ mod tests {
         assert!(j.groups.is_empty() && j.topics.is_empty() && j.entries.is_empty());
     }
 }
+
+/// Сравнение ФИО по алфавиту (русский порядок: «ё» рядом с «е», без учёта регистра).
+pub fn ru_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let key = |s: &str| s.to_lowercase().replace('ё', "е\u{1}");
+    key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+}

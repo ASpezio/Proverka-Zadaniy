@@ -138,6 +138,10 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.4.2 (варианты в журнале)
+* API `journal_variants {group, variants: {ФИО: вариант|""}, merge}` — варианты без изменения списка (только студенты из списка; `merge: false` заменяет все; массовая раздача отменяется через «Отменить»). `journal_variants_export {path (.docx/.xlsx/.csv), group, order: list|az|variant, title?}`. `journal::ru_cmp` — алфавит с «ё».
+* UI: столбец `td.jvar[data-var]` → `openVariantOne`; кнопка `#jVariants` → `openVariants` (предпросмотр, `dealVariants` + режимы `random_rep`, `same`; `orderNames`: list/az/za/shuffle); `exportVariants`.
+
 ### Версия 1.4.1
 * `settings.perf.warn` (по умолчанию true; разрешено менять во время проверки) — `perf::warn_on` выключает предупреждения о скорости и видеопамяти (запись в журнал остаётся). В уведомлении `speed` — кнопка «Не предупреждать».
 * CI: actions/checkout@v5, setup-node@v5, upload-artifact@v6, softprops/action-gh-release@v3 (Node 24).
