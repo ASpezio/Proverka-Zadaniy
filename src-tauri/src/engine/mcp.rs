@@ -433,6 +433,9 @@ impl McpServer {
         for k in ["grade", "completeness", "variant", "tasks", "ai_detected", "ai_confidence", "ai_evidence", "errors", "summary", "rubric"] {
             llm.set(k, args.get(k).clone());
         }
+        llm.set("errors", as_text_items(args.get("errors")));
+        llm.set("ai_evidence", as_text_items(args.get("ai_evidence")));
+        llm.set("tasks", norm_tasks(args.get("tasks")));
         let half = core.settings().get("half_grades").bool_or(true);
         llm.set("grade", super::core::norm_grade(args.get("grade").f64_or(2.0), half));
         llm.set("completeness", args.get("completeness").i64_or(100).clamp(0, 100));
@@ -490,6 +493,55 @@ impl McpServer {
     }
 }
 
+/// Модель иногда присылает ошибки и признаки ИИ объектами ({"error": "…", "quote": "…"})
+/// вместо строк — приводим к строкам: «текст — «цитата»».
+pub fn as_text_items(j: &Json) -> Json {
+    let one = |x: &Json| -> String {
+        match x {
+            Json::Str(s) => s.clone(),
+            Json::Num(n) => format!("{}", n),
+            Json::Obj(items) => {
+                let pick = |keys: &[&str]| keys.iter().find_map(|k| items.iter().find(|(kk, v)| kk.eq_ignore_ascii_case(k) && !v.str_or("").trim().is_empty()).map(|(_, v)| v.str_or("")));
+                let main = pick(&["text", "error", "what", "description", "issue", "problem", "message", "ошибка", "описание", "comment", "reason", "evidence"]);
+                let quote = pick(&["quote", "citation", "fragment", "snippet", "цитата", "фрагмент"]);
+                let task = pick(&["task", "n", "задание"]);
+                match (main, quote) {
+                    (Some(m), Some(q)) => format!("{}{} — «{}»", task.map(|t| format!("Задание {}: ", t)).unwrap_or_default(), m, q.trim_matches(|c| c == '«' || c == '»' || c == '"')),
+                    (Some(m), None) => format!("{}{}", task.map(|t| format!("Задание {}: ", t)).unwrap_or_default(), m),
+                    (None, Some(q)) => format!("«{}»", q),
+                    // неизвестные поля — все значения через «; »
+                    (None, None) => items.iter().map(|(_, v)| v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())).filter(|s| !s.trim().is_empty()).collect::<Vec<_>>().join("; "),
+                }
+            }
+            Json::Null => String::new(),
+            other => other.to_string(),
+        }
+    };
+    match j {
+        Json::Arr(a) => Json::Arr(a.iter().map(one).filter(|s| !s.trim().is_empty()).map(Json::Str).collect()),
+        Json::Str(s) if !s.trim().is_empty() => Json::Arr(vec![Json::Str(s.clone())]),
+        _ => Json::Arr(vec![]),
+    }
+}
+
+/// Пункты разбора: номер и статус — строками, пояснение — строкой.
+pub fn norm_tasks(j: &Json) -> Json {
+    Json::Arr(
+        j.as_arr()
+            .iter()
+            .map(|t| {
+                let s = |k: &str| match t.get(k) {
+                    Json::Str(x) => x.clone(),
+                    Json::Num(n) => format!("{}", n),
+                    Json::Null => String::new(),
+                    o => as_text_items(&Json::Arr(vec![o.clone()])).as_arr().first().map(|x| x.str_or("")).unwrap_or_default(),
+                };
+                Json::obj().with("n", s("n")).with("status", s("status")).with("comment", s("comment"))
+            })
+            .collect(),
+    )
+}
+
 /// Оценка по ответу модели без сохранения (пробный прогон): те же правила, что при
 /// submit_grade — рубрика, срок, ИИ, списывание.
 pub fn preview_grade(core: &Core, wid: &str, args: &Json) -> Result<f64, String> {
@@ -504,6 +556,9 @@ pub fn preview_grade(core: &Core, wid: &str, args: &Json) -> Result<f64, String>
     for k in ["grade", "completeness", "variant", "tasks", "ai_detected", "ai_confidence", "ai_evidence", "errors", "summary", "rubric"] {
         llm.set(k, args.get(k).clone());
     }
+    llm.set("errors", as_text_items(args.get("errors")));
+    llm.set("ai_evidence", as_text_items(args.get("ai_evidence")));
+    llm.set("tasks", norm_tasks(args.get("tasks")));
     let half = core.settings().get("half_grades").bool_or(true);
     llm.set("grade", super::core::norm_grade(args.get("grade").f64_or(2.0), half));
     llm.set("completeness", args.get("completeness").i64_or(100).clamp(0, 100));
@@ -624,4 +679,21 @@ pub fn client_config(exe: &str) -> String {
 #[allow(dead_code)]
 pub fn hidden_preview(marked: &str) -> Vec<String> {
     docx::hidden_of(marked)
+}
+
+#[cfg(test)]
+mod norm_tests {
+    use super::*;
+    #[test]
+    fn objects_become_text() {
+        let j = super::super::json::parse(r#"[{"error":"нет вывода","quote":"«в итоге»","task":3},"просто строка",{"foo":"bar","n":2}]"#).unwrap();
+        let t = as_text_items(&j);
+        let v: Vec<String> = t.as_arr().iter().map(|x| x.str_or("")).collect();
+        assert_eq!(v[0], "Задание 3: нет вывода — «в итоге»");
+        assert_eq!(v[1], "просто строка");
+        assert!(!v[2].contains("[object") && v[2].contains("bar"));
+        let tk = norm_tasks(&super::super::json::parse(r#"[{"n":1,"status":"верно","comment":{"text":"ок"}}]"#).unwrap());
+        assert_eq!(tk.as_arr()[0].get("n").str_or(""), "1");
+        assert_eq!(tk.as_arr()[0].get("comment").str_or(""), "ок");
+    }
 }

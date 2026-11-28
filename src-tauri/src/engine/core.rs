@@ -2750,6 +2750,11 @@ impl Core {
     /// `second_opinion`). При расхождении работа помечается «нужен ваш взгляд»,
     /// по настройке итоговая оценка считается по всем моделям.
     pub fn attach_second_opinion(&self, wid: &str, j: &Json, model: &str) {
+        let mut j2 = j.clone();
+        j2.set("errors", super::mcp::as_text_items(j.get("errors")));
+        j2.set("ai_evidence", super::mcp::as_text_items(j.get("ai_evidence")));
+        j2.set("tasks", super::mcp::norm_tasks(j.get("tasks")));
+        let j = &j2;
         let st = self.settings();
         let dc = st.get("double_check").clone();
         let max_diff = dc.get("max_diff").f64_or(2.0).max(0.5);

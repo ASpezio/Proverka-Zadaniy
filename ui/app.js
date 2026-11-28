@@ -1912,11 +1912,28 @@ async function openCompare(a, b) {
   tb.addEventListener("scroll", sync(tb, ta));
 }
 
+/** Пункт ответа модели как текст: старые результаты могли сохранить объект вместо строки. */
+function itemText(x) {
+  if (x == null) return "";
+  if (typeof x !== "object") return String(x);
+  const pick = (...ks) => { for (const k of ks) if (x[k] != null && String(x[k]).trim()) return String(x[k]); return ""; };
+  const main = pick("text", "error", "what", "description", "issue", "message", "ошибка", "описание", "comment", "reason", "evidence");
+  const q = pick("quote", "citation", "fragment", "snippet", "цитата");
+  const t = pick("task", "n", "задание");
+  if (main || q) return `${t ? `Задание ${t}: ` : ""}${main}${main && q ? " — " : ""}${q ? `«${q.replace(/^[«"]|[»"]$/g, "")}»` : ""}`;
+  return Object.values(x).filter((v) => v != null && String(v).trim()).map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v))).join("; ");
+}
+const textItems = (a) => (Array.isArray(a) ? a : a ? [a] : []).map(itemText).filter(Boolean);
+
 async function openWork(id) {
   const w = await api("work", { id });
   const o = w.outcome;
+  o.ai_evidence = textItems(o.ai_evidence);
   const ev = w.scan.evidence || [];
-  const llm = o.llm || {};
+  const llm = { ...(o.llm || {}) };
+  llm.errors = textItems(llm.errors);
+  llm.ai_evidence = textItems(llm.ai_evidence);
+  if (Array.isArray(llm.tasks)) llm.tasks = llm.tasks.map((t) => ({ n: itemText(t.n), status: itemText(t.status), comment: itemText(t.comment) }));
   const hl = highlightWork(w.text || "", ev, llm, o);
   const text = hl.html;
   openDrawer(`
@@ -2021,10 +2038,12 @@ async function openWork(id) {
   $$("[data-url]").forEach((a) => (a.onclick = (e) => { e.preventDefault(); api("open_url", { url: a.dataset.url }).catch((x) => toast(String(x), "err")); }));
   // миниатюры фото и страниц скана
   (async () => {
+    const thumbs = settings().perf?.thumbs !== false;
     for (const p of w.page_list || []) {
       const el = document.querySelector(`[data-thumb="${p.i}"]`);
       if (!el) return;
       el.onclick = () => api("open_path", { path: p.src });
+      if (!thumbs) { el.innerHTML = `<span>${p.i + 1}</span>`; continue; }
       try {
         const { b64 } = await api("read_file_b64", { id, page: p.i });
         const mime = { png: "image/png", webp: "image/webp", gif: "image/gif", bmp: "image/bmp" }[p.ext] || "image/jpeg";
@@ -3234,8 +3253,9 @@ async function loadPerf() {
 }
 // видеопамять меняется, когда LM Studio загружает или выгружает модель: обновляем, пока виден шаг
 setInterval(() => {
-  if (document.hidden || !["check", "mcplog"].includes(S.view)) return;
-  if (Date.now() - (S.perfAt || 0) > 10000) loadPerf();
+  const every = settings()?.perf?.poll ?? 10;
+  if (!every || document.hidden || !["check", "mcplog"].includes(S.view)) return;
+  if (Date.now() - (S.perfAt || 0) > every * 1000) loadPerf();
 }, 5000);
 
 // ---------------------------------------------------------------- 7. Журнал MCP
@@ -3611,7 +3631,7 @@ onEvent("run_state", (r) => {
 });
 onEvent("mcp", (m) => {
   S.mcpLog.push({ ...m, kind: "mcp" });
-  if (S.mcpLog.length > 1500) S.mcpLog.splice(0, 300);
+  { const lim = +(settings().perf?.log_limit) || 1500; if (S.mcpLog.length > lim) S.mcpLog.splice(0, Math.max(1, Math.round(lim / 5))); }
   mlLater();
   mlBadge();
 });
@@ -5645,6 +5665,42 @@ async function exportLook(onlyTheme = null) {
   if (!path) return;
   try { await api("save_text", { path, text: JSON.stringify(out, null, 1) }); toast("Оформление сохранено в файл"); } catch (e) { toast(String(e), "err"); }
 }
+/** Пример файла оформления: все поля, какие понимает импорт, с пояснениями. */
+const LOOK_SAMPLE = {
+  type: "proverka-look",
+  version: 1,
+  name: "Моё оформление",
+  theme: { name: "Морская волна", dark: false, c: { paper: "#f2f8fb", ink: "#12324a", cover: "#0f3550", accent: "#0ea5a4", pen: "#e5484d" } },
+  style: "notebook",
+  custom_style: { name: "Тетрадь без полей", base: "notebook", opts: { radius: 10, btn: "pill", shadow: "soft", border: 1, pattern: "dots", margin: "off", density: "normal", blur: 0, caps: false } },
+  font_ui: "Inter",
+  font_head: "Lora",
+  font_size: 14.5,
+};
+function showLookSample() {
+  const text = JSON.stringify(LOOK_SAMPLE, null, 2);
+  const row = (k, t) => `<tr><td><code>${k}</code></td><td>${t}</td></tr>`;
+  const md = simpleModal("Пример файла оформления", `
+    <p class="small" style="margin-top:0">Файл оформления — обычный текстовый файл <b>.json</b>. Проще всего получить его кнопкой «Экспорт оформления» и поправить. Обязательны только <code>"type": "proverka-look"</code> и хотя бы одно из полей <code>theme</code>, <code>style</code>, <code>custom_style</code>. Остальное можно не писать.</p>
+    <pre class="json-sample">${esc(text)}</pre>
+    <table class="tp-table small"><tbody>
+      ${row("type", "всегда <code>proverka-look</code> — по нему приложение узнаёт свой файл")}
+      ${row("name", "название — покажется после загрузки")}
+      ${row("theme", `цветовая схема: <code>name</code>, <code>dark</code> (тёмная — <code>true</code>) и пять цветов в виде <code>#rrggbb</code>: <code>paper</code> — фон, <code>ink</code> — текст, <code>cover</code> — боковая панель, <code>accent</code> — акцент (кнопки, ссылки), <code>pen</code> — «красная ручка» (ошибки, «2»). Можно указать и готовую схему строкой: ${THEMES.slice(0, 6).map((t) => `<code>"${esc(t.id)}"</code>`).join(", ")}…`)}
+      ${row("style", `готовый стиль: ${STYLES.map((x) => `<code>${x.id}</code> — ${esc(x.name)}`).join(", ")}`)}
+      ${row("custom_style", "свой стиль поверх готового: <code>base</code> — стиль-основа (из списка выше), <code>opts</code> — настройки: <code>radius</code> 0–30 (скругление, px), <code>btn</code> base | pill | square, <code>shadow</code> base | none | soft | strong | hard, <code>border</code> 0–4 (рамки, px), <code>pattern</code> base | grid | lines | dots | none (фон листа), <code>margin</code> base | on | off (красные поля), <code>density</code> compact | normal | roomy, <code>blur</code> 0–24 (матовое стекло, px), <code>caps</code> true | false (заголовки прописными)")}
+      ${row("font_ui, font_head", "шрифт текста и заголовков — имя шрифта из раздела «Шрифты» (например, Inter, Lora) или своего шрифта")}
+      ${row("font_size", "размер текста, 12,5–18")}
+      ${row("fonts", "необязательно: свои шрифты вместе с файлами — экспорт кладёт их сам, вручную писать не нужно")}
+    </tbody></table>`, { width: 760, foot: `<span style="flex:1"></span><button class="btn" id="lsCopy">${ICON.copy}Копировать</button><button class="btn primary" id="lsSave">${ICON.down}Сохранить пример…</button>` });
+  $("#lsCopy", md.el).onclick = async () => { if (await copyText(text)) toast("Пример скопирован"); };
+  $("#lsSave", md.el).onclick = async () => {
+    const path = await pickSave("Пример_оформления.json", "json");
+    if (!path) return;
+    try { await api("save_text", { path, text }); toast("Пример сохранён — откройте его в Блокноте, поправьте и загрузите кнопкой «Импорт оформления»"); } catch (e) { toast(String(e), "err"); }
+  };
+}
+
 async function importLook() {
   const picked = await pickFiles({ multiple: false, title: "Файл оформления", only: [{ name: "Оформление (.json)", extensions: ["json"] }] });
   if (!picked.length) return false;
@@ -5746,7 +5802,7 @@ function openLook() {
         <div class="section-actions"><button class="btn sm" id="lkAddFont">${ICON.plus}Добавить шрифт…</button></div>
       </div>
       <div class="lk-sec"><h3>Обмен оформлением</h3><p class="small muted">Сохраните всё оформление (стиль, цвета, шрифты вместе с файлами своих шрифтов) в один файл — и откройте его на другом компьютере или отправьте коллегам.</p>
-        <div class="section-actions"><button class="btn sm" id="lkExport">${ICON.down}Экспорт оформления…</button><button class="btn sm" id="lkImport">Импорт оформления или схемы…</button></div>
+        <div class="section-actions"><button class="btn sm" id="lkExport">${ICON.down}Экспорт оформления…</button><button class="btn sm" id="lkImport">Импорт оформления или схемы…</button><button class="btn sm ghost" id="lkSample" title="Как устроен файл оформления: пример с пояснениями">Пример файла…</button></div>
       </div>
       <div class="section-actions"><button class="btn ghost sm" id="lkReset">Вернуть как было по умолчанию</button></div>
     </div></div>`;
@@ -5858,6 +5914,7 @@ function openLook() {
   }));
   $("#lkExport", m).onclick = () => exportLook();
   $("#lkImport", m).onclick = async () => { if (await importLook()) reopen(); };
+  $("#lkSample", m).onclick = () => showLookSample();
   $("#lkReset", m).onclick = async () => {
     await saveSettings({ theme: "paper", look_style: "notebook", font_ui: "Inter", font_head: "Lora", font_size: 14.5 });
     applyTheme("paper", "notebook"); applyFonts();
@@ -5963,6 +6020,105 @@ async function openImport() {
   } catch (e) { toast(String(e), "err"); }
 }
 
+// ---------------------------------------------------------------- производительность
+/** Наборы настроек под компьютер: что включено и сколько всего делается сразу. */
+const PERF_PRESETS = {
+  low: { name: "Экономный", hint: "для слабого компьютера или ноутбука: без анимаций и эффектов, меньше картинок, короткий ответ модели",
+    animations: false, effects: false, thumbs: false, log_limit: 300, poll: 0,
+    concurrency: 1, images: true, max_images: 5, max_side: 1024, links: false, answer: "short", dc_when: "disputed", archive: false, examples: 2 },
+  normal: { name: "Обычный", hint: "как задумано по умолчанию",
+    animations: true, effects: true, thumbs: true, log_limit: 1500, poll: 10,
+    concurrency: 1, images: true, max_images: 20, max_side: 1600, links: false, answer: "full", dc_when: "all", archive: true, examples: 3 },
+  high: { name: "Максимум", hint: "для мощного компьютера: всё включено, две работы сразу, больше картинок и деталей",
+    animations: true, effects: true, thumbs: true, log_limit: 5000, poll: 10,
+    concurrency: 2, images: true, max_images: 40, max_side: 2048, links: true, answer: "full", dc_when: "all", archive: true, examples: 5 },
+};
+/** Текущие значения «крутилок» из настроек. */
+function perfNow(st = settings()) {
+  const pf = st.perf || {};
+  return {
+    animations: st.animations !== false, effects: pf.effects !== false, thumbs: pf.thumbs !== false, log_limit: +pf.log_limit || 1500, poll: pf.poll ?? 10,
+    concurrency: +st.concurrency || 1, images: st.media?.images !== false, max_images: +(st.media?.max_images ?? 20), max_side: +(st.media?.max_side ?? 1600),
+    links: !!st.links?.enabled, answer: st.answer_style || "full", dc_when: st.double_check?.when || "all", archive: st.archive?.enabled !== false, examples: +(st.learn?.examples ?? 3),
+  };
+}
+/** Какой набор совпадает с текущими настройками (или «custom»). */
+function perfProfile(st = settings()) {
+  const now = perfNow(st);
+  for (const [k, p] of Object.entries(PERF_PRESETS)) if (Object.keys(now).every((x) => now[x] === p[x])) return k;
+  return "custom";
+}
+/** Записать «крутилки» в настройки (одним сохранением). */
+function perfPatch(v, st = settings()) {
+  return {
+    animations: v.animations,
+    perf: { ...(st.perf || {}), effects: v.effects, thumbs: v.thumbs, log_limit: v.log_limit, poll: v.poll },
+    concurrency: v.concurrency,
+    media: { ...(st.media || {}), images: v.images, max_images: v.max_images, max_side: v.max_side },
+    links: { ...(st.links || {}), enabled: v.links },
+    answer_style: v.answer,
+    double_check: { ...(st.double_check || {}), when: v.dc_when },
+    archive: { ...(st.archive || {}), enabled: v.archive },
+    learn: { ...(st.learn || {}), examples: v.examples },
+  };
+}
+/** Применить к окну то, что видно сразу: анимации и эффекты. */
+function applyPerfUi(st = settings()) {
+  document.body.classList.toggle("no-anim", st.animations === false);
+  document.body.classList.toggle("no-fx", st.perf?.effects === false);
+}
+function perfHtml2() {
+  const v = perfNow();
+  const prof = perfProfile();
+  const sel = (id, opts, cur) => `<select class="select input sm" id="${id}" style="width:auto">${opts.map(([val, t]) => `<option value="${val}" ${String(val) === String(cur) ? "selected" : ""}>${t}</option>`).join("")}</select>`;
+  const chk = (id, on, t, small) => `<label class="switch"><input type="checkbox" id="${id}" ${on ? "checked" : ""}><span class="track"></span><span class="lbl"><b>${t}</b>${small ? `<small>${small}</small>` : ""}</span></label>`;
+  const row = (t, ctl, small) => `<div class="pf-row"><div><b>${t}</b>${small ? `<small class="muted">${small}</small>` : ""}</div>${ctl}</div>`;
+  return `<h3>Производительность</h3>
+    <div class="seg pf-seg" id="pfSeg" role="radiogroup">${[...Object.entries(PERF_PRESETS).map(([k, p]) => [k, p.name]), ["custom", "Свой"]].map(([k, t]) => `<button type="button" data-pf="${k}" class="${prof === k ? "on" : ""}" role="radio" aria-checked="${prof === k}">${t}</button>`).join("")}</div>
+    <p class="small muted" id="pfHint" style="margin:6px 0 0">${prof === "custom" ? "Свои настройки — ниже можно поменять любую." : esc(PERF_PRESETS[prof].hint)}</p>
+    <details class="adv" id="pfMore" ${prof === "custom" ? "open" : ""}><summary>Все настройки производительности</summary><div class="adv-body pf-body">
+      <div class="pf-grp">Окно приложения</div>
+      ${chk("pfAnim", v.animations, "Анимации", "Плавные переходы, появление строк, штамп «Проверено»")}
+      ${chk("pfFx", v.effects, "Эффекты стекла и размытия", "Размытие под окнами и в теме «Стекло» — на слабой видеокарте заметно тормозит")}
+      ${chk("pfThumbs", v.thumbs, "Миниатюры фото в карточке работы", "Без них — только номера страниц, открыть можно щелчком")}
+      ${row("Журнал MCP хранит", sel("pfLog", [[300, "300 сообщений"], [1500, "1500 сообщений"], [5000, "5000 сообщений"]], v.log_limit), "чем больше, тем больше памяти занимает окно")}
+      ${row("Скорость и видеопамять обновлять", sel("pfPoll", [[0, "только при запуске и окончании проверки"], [10, "каждые 10 секунд"], [30, "каждые 30 секунд"]], v.poll))}
+      <div class="pf-grp">Проверка</div>
+      ${row("Работ одновременно", sel("pfConc", [[1, "1"], [2, "2"], [3, "3"], [4, "4"]], v.concurrency), "для локальной модели больше 1 — только если в LM Studio Parallel не меньше и модель с контекстом влезает в видеопамять")}
+      ${chk("pfImg", v.images, "Смотреть картинки внутри документов", "Скриншоты и схемы в Word/PowerPoint описывает модель с поддержкой изображений")}
+      ${row("Картинок на работу — не больше", sel("pfImgN", [[5, "5"], [10, "10"], [20, "20"], [40, "40"]], v.max_images))}
+      ${row("Фото уменьшать до", sel("pfSide", [[1024, "1024 px — быстрее"], [1600, "1600 px"], [2048, "2048 px — мелкий почерк"], [0, "не уменьшать"]], v.max_side))}
+      ${chk("pfLinks", v.links, "Открывать ссылки из работ", "Нейросеть читает сайты и документы по ссылкам — это время и трафик")}
+      ${row("Ответ модели", sel("pfAns", [["full", "подробный разбор"], ["short", "короткий — примерно вдвое быстрее"]], v.answer))}
+      ${row("Вторая модель проверяет", sel("pfDc", [["all", "каждую работу"], ["disputed", "только спорные"]], v.dc_when), "если включена проверка несколькими моделями")}
+      ${chk("pfArc", v.archive, "Сравнивать с архивом прошлых лет", "Поиск списывания у прошлогодних студентов")}
+      ${row("Примеров ваших исправлений в запросе", sel("pfEx", [[0, "не давать"], [2, "2"], [3, "3"], [5, "5"]], v.examples), "больше примеров — точнее манера оценивания, но длиннее запрос")}
+    </div></details>`;
+}
+function bindPerf(box) {
+  const read = () => ({
+    animations: $("#pfAnim").checked, effects: $("#pfFx").checked, thumbs: $("#pfThumbs").checked, log_limit: +$("#pfLog").value, poll: +$("#pfPoll").value,
+    concurrency: +$("#pfConc").value, images: $("#pfImg").checked, max_images: +$("#pfImgN").value, max_side: +$("#pfSide").value,
+    links: $("#pfLinks").checked, answer: $("#pfAns").value, dc_when: $("#pfDc").value, archive: $("#pfArc").checked, examples: +$("#pfEx").value,
+  });
+  const save = async (v, toastText) => {
+    await saveSettings(perfPatch(v));
+    applyPerfUi();
+    const open = $("#pfMore")?.open;
+    box.innerHTML = perfHtml2();
+    if (open) $("#pfMore").open = true;
+    bindPerf(box);
+    if (toastText) toast(toastText);
+  };
+  $$("[data-pf]", box).forEach((b) => (b.onclick = () => {
+    const k = b.dataset.pf;
+    if (k === "custom") { $("#pfMore").open = true; return; }
+    if (S.run.running && PERF_PRESETS[k].concurrency !== perfNow().concurrency) { toast("Во время проверки число работ одновременно не меняется — выберите набор после проверки", "err"); return; }
+    save({ ...PERF_PRESETS[k] }, `Включён набор «${PERF_PRESETS[k].name}»`);
+  }));
+  $$("#pfMore input, #pfMore select", box).forEach((x) => (x.onchange = () => save(read())));
+}
+
 // ---------------------------------------------------------------- настройки приложения
 async function openSettings() {
   const st = settings();
@@ -5974,6 +6130,7 @@ async function openSettings() {
   const sw = (id, on, title, small, dis = false) => `<label class="switch ${dis ? "dis" : ""}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${dis ? "disabled" : ""}><span class="track"></span><span class="lbl"><b>${title}</b>${small ? `<small>${small}</small>` : ""}</span></label>`;
   openDrawer(`
     <h2>Настройки</h2>
+    <div class="set-sec" id="sPerf">${perfHtml2()}</div>
     <div class="set-sec"><h3>Внешний вид</h3>
       <button class="btn sm" id="sLook" style="justify-self:start">Темы и шрифты…</button>
       ${sw("sAnim", st.animations !== false, "Анимации", "Плавные переходы, оценки красной ручкой, штамп «Проверено».")}
@@ -6034,6 +6191,7 @@ async function openSettings() {
       </div>
     </div>`);
   $("#sLook").onclick = () => { closeDrawer(); openLook(); };
+  bindPerf($("#sPerf"));
   $("#sAnim").onchange = async (e) => { document.body.classList.toggle("no-anim", !e.target.checked); await saveSettings({ animations: e.target.checked }); };
   $("#sSnd").onchange = async (e) => { await saveSettings({ sound: e.target.checked }); $("#sVol").disabled = !e.target.checked; renderSetState(); SND.play("toggle"); };
   $("#sVol").oninput = (e) => { S.volPreview = +e.target.value; };
@@ -6150,7 +6308,7 @@ window.addEventListener("resize", moveRibbon);
   setInterval(checkReminders, 60 * 60 * 1000);
   // встроенные шрифты могли ещё не загрузиться — проверим наличие системных после загрузки
   document.fonts?.ready?.then(() => applyFonts());
-  if (settings().animations === false) document.body.classList.add("no-anim");
+  applyPerfUi();
   setupDragDrop();
   const st = S.state;
   S.run.running = st.running;

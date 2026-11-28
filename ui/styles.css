@@ -1440,3 +1440,15 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 .jt td.jvar:hover { background: color-mix(in srgb, currentColor 7%, transparent); }
 .jt td.jvar.off { cursor: default; opacity: .5; }
 .rg-table tr.va-ch td { background: color-mix(in srgb, var(--uv, #7a3cf0) 8%, transparent); }
+
+/* производительность */
+.no-fx *, .no-fx *::before, .no-fx *::after { backdrop-filter: none !important; -webkit-backdrop-filter: none !important; }
+.pf-seg { margin-top: 4px; }
+.pf-body { display: grid; gap: 10px; }
+.pf-grp { font-weight: 700; margin-top: 6px; }
+.pf-row { display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.pf-row > div { display: grid; gap: 2px; min-width: 0; flex: 1 1 260px; }
+.pf-row small { font-size: 12px; }
+
+/* пример файла оформления */
+.json-sample { flex-shrink: 0; min-height: 240px; max-height: 340px; overflow: auto; padding: 12px 14px; border-radius: 10px; background: color-mix(in srgb, currentColor 6%, transparent); font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; white-space: pre; }
