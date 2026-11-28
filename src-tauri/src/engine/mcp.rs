@@ -45,7 +45,8 @@ pub fn tool_defs() -> Vec<(String, String, Json)> {
         t("get_ai_traps", "Скрытые ловушки против нейросетей, внедрённые в условие варианта (белый текст 1 пт), и слова-маркеры.", schema(wid(), &["work_id"])),
         t("scan_work", "Автоматическая проверка работы без нейросети: найденные ловушки, утечки скрытого текста, признаки ответа чат-бота, вариант по содержанию.", schema(wid(), &["work_id"])),
         t("check_plagiarism", "Совпадения текста этой работы с работами других студентов (возможное списывание).", schema(wid(), &["work_id"])),
-        t("get_grading_criteria", "Критерии оценивания преподавателя и дополнительные указания. С work_id — ещё и рубрика задания (баллы по критериям), если преподаватель её задал.", schema(wid(), &[])),
+        t("get_grading_criteria", "Критерии оценивания преподавателя и дополнительные указания. С work_id — ещё и рубрика задания (баллы по критериям), если преподаватель её задал, и примеры, где преподаватель исправлял оценку нейросети за это задание.", schema(wid(), &[])),
+        t("get_teacher_examples", "Примеры похожих работ за это задание, где преподаватель не согласился с оценкой нейросети: что поставила модель, что преподаватель и почему. Оценивай в его манере.", schema(wid(), &["work_id"])),
         t("get_work_links", "Содержимое ссылок из работы (Google Документы/Таблицы/Презентации, Google и Яндекс Диск, GitHub, сайты), если преподаватель разрешил их открывать.", schema(wid(), &["work_id"])),
         t(
             "submit_grade",
@@ -229,6 +230,10 @@ impl McpServer {
             s.push_str("\n\nДополнительные указания преподавателя:\n");
             s.push_str(&extra);
         }
+        // короткий ответ: модель пишет вдвое меньше — проверка примерно вдвое быстрее
+        if st.get("answer_style").str_or("full") == "short" {
+            s.push_str("\n\nФОРМАТ ОТВЕТА — КРАТКО. В errors — не больше 5 самых важных ошибок, каждая одной короткой фразой с короткой цитатой. summary — 1–2 предложения. В tasks у каждого пункта — статус и не больше одной короткой фразы пояснения. Не пересказывай работу и условие. На оценку краткость не влияет: оценивай так же строго и по тем же критериям.");
+        }
         s
     }
 
@@ -359,9 +364,19 @@ impl McpServer {
                             t.push_str(&r.prompt());
                         }
                     }
+                    drop(ws);
+                    // прямой режим берёт примеры отдельно (они разные для каждой работы)
+                    if args.get("examples").bool_or(true) {
+                        let ex = core.teacher_examples(&wid);
+                        if !ex.is_empty() {
+                            t.push_str("\n\n");
+                            t.push_str(ex.trim_end());
+                        }
+                    }
                 }
                 Ok(Json::Str(t))
             }
+            "get_teacher_examples" => Ok(Json::Str(core.teacher_examples(&wid))),
             "get_work_links" => {
                 let enabled = core.settings().get("links").get("enabled").bool_or(false);
                 let (urls, mut docs) = {
@@ -473,6 +488,30 @@ impl McpServer {
         }
         Ok(Json::obj().with("accepted", true).with("final_grade", grade).with("violation", violation).with("applied_rules", reasons))
     }
+}
+
+/// Оценка по ответу модели без сохранения (пробный прогон): те же правила, что при
+/// submit_grade — рубрика, срок, ИИ, списывание.
+pub fn preview_grade(core: &Core, wid: &str, args: &Json) -> Result<f64, String> {
+    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+    let w = ws.works.iter().find(|w| w.id == wid).cloned().ok_or("Работа не найдена")?;
+    if args.get("grade").as_f64().is_none() {
+        return Err("Модель не поставила оценку".into());
+    }
+    let scan = core.scan(&ws, &w);
+    let pinfo = core.plag_info(&ws, wid);
+    let mut llm = Json::obj();
+    for k in ["grade", "completeness", "variant", "tasks", "ai_detected", "ai_confidence", "ai_evidence", "errors", "summary", "rubric"] {
+        llm.set(k, args.get(k).clone());
+    }
+    let half = core.settings().get("half_grades").bool_or(true);
+    llm.set("grade", super::core::norm_grade(args.get("grade").f64_or(2.0), half));
+    llm.set("completeness", args.get("completeness").i64_or(100).clamp(0, 100));
+    let mut wd = w.clone();
+    wd.deadline = core.deadline_of(&ws, &w);
+    let rub = core.rubric_for(&ws, &w);
+    rub.apply(&mut llm, half);
+    Ok(core.finalize(&wd, &scan, &llm, &pinfo, "").grade)
 }
 
 // ------------------------------------------------------------------ клиент

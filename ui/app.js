@@ -103,11 +103,125 @@ function askConfirm(text, { ok = "Да", cancel = "Отмена", title = "По�
   });
 }
 
+/** Сколько исправлений преподавателя запомнено (в настройках модели). */
+async function renderLearnInfo() {
+  const el = $("#learnInfo");
+  if (!el) return;
+  let r;
+  try { r = await api("lessons"); } catch (e) { return; }
+  if (!$("#learnInfo")) return;
+  el.innerHTML = r.total ? `Запомнено исправлений: ${r.total} (${r.codes.slice(0, 6).map((c) => `${esc(c.code)} — ${c.count}`).join(", ")}${r.codes.length > 6 ? "…" : ""}). <a href="#" id="learnClear">Забыть все</a>` : "Пока исправлений нет.";
+  $("#learnClear")?.addEventListener("click", async (e) => {
+    e.preventDefault();
+    if (!(await askConfirm("Забыть все запомненные исправления? Нейросеть перестанет видеть примеры ваших оценок."))) return;
+    await api("lessons", { action: "clear" });
+    renderLearnInfo();
+  });
+}
+
+/** Пробный прогон: события trial_progress / trial_done. */
+async function startTrial(n) {
+  try { const r = await api("trial_start", { n }); S.trial = { running: true, i: 0, n: r.count, rows: null }; renderTrial(); }
+  catch (e) { toast(String(e), "err"); }
+}
+onEvent("trial_progress", (e) => { S.trial = { ...(S.trial || {}), running: true, i: e.i, n: e.n, name: e.name }; renderTrial(); });
+onEvent("trial_done", (e) => {
+  S.trial = { running: false, rows: e.rows, model: e.model, error: e.error };
+  renderTrial();
+  if (e.error) toast(e.error, "err");
+  else if (S.view !== "model") toast("Пробный прогон готов", "ok", { label: "Открыть", run: () => go("model") });
+});
+function renderTrial() {
+  const box = $("#trialOut");
+  const btn = $("#trialBtn");
+  if (!box) return;
+  const t = S.trial;
+  if (btn) btn.disabled = !!t?.running;
+  if (!t) { box.innerHTML = ""; return; }
+  if (t.running) {
+    box.innerHTML = `<div class="thinking"><div class="spinner"></div><span>Проверяю ${t.i || 1} из ${t.n}${t.name ? `: ${esc(t.name)}` : ""}…</span><button class="btn ghost sm" id="trialStop">Остановить</button></div>`;
+    $("#trialStop").onclick = () => api("trial_stop");
+    return;
+  }
+  const rows = t.rows || [];
+  if (!rows.length) { box.innerHTML = t.error ? `<span class="chip bad">${esc(t.error)}</span>` : `<p class="muted small">Прогон остановлен.</p>`; return; }
+  const ok = rows.filter((r) => r.new != null);
+  const ref = (r) => (r.teacher != null ? r.teacher : r.old);
+  const diffs = ok.map((r) => Math.abs(r.new - ref(r)));
+  const same = diffs.filter((d) => d < 0.5).length;
+  const mean = diffs.length ? diffs.reduce((a, b) => a + b, 0) / diffs.length : 0;
+  const verdict = !ok.length ? "Модель не смогла проверить ни одной работы — посмотрите ошибки ниже."
+    : same === ok.length ? "Оценки совпали со всеми прежними — модели можно доверять."
+    : mean <= 0.5 ? `Совпало ${same} из ${ok.length}, расхождения небольшие — модели в целом можно доверять, спорные работы проверьте сами.`
+    : `Совпало ${same} из ${ok.length}, в среднем расхождение ${fmtG(Math.round(mean * 10) / 10)} балла — стоит посмотреть, в чём модель ставит иначе, или вернуть прежнюю модель/движок.`;
+  box.innerHTML = `<p style="margin:0 0 10px"><b>${esc(verdict)}</b> <span class="small muted">Модель: ${esc(t.model || "")}</span></p>
+    <table class="trial-t"><thead><tr><th>Работа</th><th>Было</th><th>Ваша оценка</th><th>Сейчас</th><th></th></tr></thead><tbody>
+    ${rows.map((r) => { const d = r.new != null && Math.abs(r.new - ref(r)) >= 0.5; return `<tr class="${d ? "diff" : ""}"><td><a href="#" data-open-work="${esc(r.id)}">${esc(r.name)}</a>${r.old_model ? `<br><small class="muted">была: ${esc(r.old_model)}</small>` : ""}</td><td class="num">${r.old != null ? fmtG(r.old) : "—"}</td><td class="num">${r.teacher != null ? fmtG(r.teacher) : "—"}</td><td class="num"><b>${r.new != null ? fmtG(r.new) : "—"}</b></td><td class="small">${r.error ? `<span class="bad-t">${esc(r.error)}</span>` : `${String(r.secs).replace(".", ",")} с`}</td></tr>`; }).join("")}
+    </tbody></table>`;
+  $$("[data-open-work]", box).forEach((a) => (a.onclick = (e) => { e.preventDefault(); openWork(a.dataset.openWork); }));
+}
+
+/** Простое окно поверх всего: возвращает { el, close }. */
+function simpleModal(title, body, { width = 640, foot = "" } = {}) {
+  const m = document.createElement("div");
+  m.className = "modal-veil";
+  m.innerHTML = `<div class="modal" role="dialog" aria-modal="true" style="width:min(${width}px,100%)">
+    <div class="modal-head"><h2>${esc(title)}</h2><button class="btn ghost sm" data-close aria-label="Закрыть">${ICON.x}</button></div>
+    <div class="modal-body">${body}</div>${foot ? `<div class="modal-foot">${foot}</div>` : ""}</div>`;
+  document.body.appendChild(m);
+  requestAnimationFrame(() => m.classList.add("on"));
+  const key = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
+  const close = () => { m.classList.remove("on"); document.removeEventListener("keydown", key, true); setTimeout(() => m.remove(), 250); };
+  document.addEventListener("keydown", key, true);
+  m.querySelector("[data-close]").onclick = close;
+  m.onclick = (e) => { if (e.target === m) close(); };
+  return { el: m, close };
+}
+
+/** Банк замечаний под полем ввода: частые фразы преподавателя — вставить одним щелчком. */
+async function remarkChips(box, target, q) {
+  if (!box || !target) return;
+  let r;
+  try { r = await api("remarks", q || {}); } catch (e) { return; }
+  const list = r.remarks || [];
+  box.innerHTML = `<span class="small muted">Частые замечания:</span>${list.map((x, i) => `<button type="button" class="rm ${x.pinned ? "pin" : ""}" data-rm="${i}" title="${esc(x.text)}${x.count ? ` — встречалось ${x.count} раз` : ""}">${esc(x.text.length > 60 ? x.text.slice(0, 57) + "…" : x.text)}</button>`).join("") || `<span class="small muted">появятся, когда вы будете писать отзывы и комментарии</span>`}
+    <a href="#" class="rm-manage">все замечания…</a>`;
+  $$("[data-rm]", box).forEach((b) => (b.onclick = () => {
+    const t = list[+b.dataset.rm].text;
+    const v = target.value;
+    const sep = !v.trim() ? "" : target.tagName === "TEXTAREA" ? (v.endsWith("\n") ? "" : "\n") : /[.;!?]\s*$/.test(v) ? " " : "; ";
+    target.value = v + sep + t;
+    target.focus();
+    target.dispatchEvent(new Event("input"));
+  }));
+  box.querySelector(".rm-manage").onclick = (e) => { e.preventDefault(); openRemarks(() => remarkChips(box, target, q)); };
+}
+
+/** Все замечания: добавить своё (закрепится наверху), убрать лишнее. */
+async function openRemarks(after) {
+  const md = simpleModal("Банк замечаний", `<p class="small muted" style="margin-top:0">Приложение само собирает фразы, которые вы пишете в отзывах, в комментариях к оценкам и в журнале. В подсказку попадают повторявшиеся хотя бы дважды и добавленные вами. ФИО студентов в банк не попадают.</p>
+    <div style="display:flex;gap:8px"><input class="input" id="rmNew" placeholder="Например: не подписаны оси графика" style="flex:1"><button class="btn primary" id="rmAdd">Добавить</button></div>
+    <div class="rm-list" id="rmList" style="margin-top:12px"><div class="spinner"></div></div>`, { width: 620 });
+  const render = async () => {
+    const r = await api("remarks", { all: true });
+    const list = r.remarks || [];
+    $("#rmList", md.el).innerHTML = list.length ? list.map((x, i) => `<div class="rm-row"><span>${x.pinned ? "★ " : ""}${esc(x.text)}</span><span class="small muted">${x.pinned ? "ваше" : `${x.count}×`}</span><button class="btn ghost sm" data-rmdel="${i}" title="Убрать">${ICON.x}</button></div>`).join("") : `<p class="muted small">Пока пусто.</p>`;
+    $$("[data-rmdel]", md.el).forEach((b) => (b.onclick = async () => { await api("remarks", { action: "delete", text: list[+b.dataset.rmdel].text }); render(); after?.(); }));
+  };
+  $("#rmAdd", md.el).onclick = async () => {
+    const t = $("#rmNew", md.el).value.trim();
+    if (!t) return;
+    try { await api("remarks", { action: "add", text: t }); $("#rmNew", md.el).value = ""; render(); after?.(); } catch (e) { toast(String(e), "err"); }
+  };
+  $("#rmNew", md.el).onkeydown = (e) => { if (e.key === "Enter") $("#rmAdd", md.el).click(); };
+  render();
+}
+
 /** Сообщения ядра (проверка завершилась с ошибками, ждут решения по ИИ, скоро срок…) — в окне приложения.
  *  Уведомление Windows приходит, только когда окно свёрнуто или в фоне. */
 function showNotice(n) {
   if (!n || n.kind === "done" || n.kind === "update") return; // об этом приложение уже говорит само
-  const go_ = { ai: ["Открыть проверку", () => go("check")], errors: ["Открыть проверку", () => go("check")], deadline: ["Открыть журнал", () => go("journal")] }[n.kind];
+  const go_ = { ai: ["Открыть проверку", () => go("check")], errors: ["Открыть проверку", () => go("check")], deadline: ["Открыть журнал", () => go("journal")], speed: ["Открыть «Модель»", () => go("model")] }[n.kind];
   const box = $("#notices") || (() => { const d = document.createElement("div"); d.id = "notices"; d.setAttribute("aria-live", "polite"); document.body.appendChild(d); return d; })();
   const el = document.createElement("div");
   el.className = "notice " + (n.kind === "errors" ? "err" : "");
@@ -1857,7 +1971,8 @@ async function openWork(id) {
     <div class="field" style="margin-top:10px"><span>Нарушение</span>
       <div class="seg" id="ovrViol" role="radiogroup" aria-label="Нарушение">${[["", `как решила проверка${o.auto_violation ? ` (${o.auto_violation === "ai" ? "ИИ" : "списывание"})` : " (нет)"}`], ["ai", "Использование ИИ"], ["plagiarism", "Списывание"], ["none", "Нарушения нет"]].map(([k, t]) => `<button type="button" data-v="${k}" class="${(o.override_violation || "") === k ? "on" : ""}" role="radio" aria-checked="${(o.override_violation || "") === k}">${esc(t)}</button>`).join("")}</div>
       <small class="muted">Если отметить ИИ или списывание и не выбрать оценку выше, в ведомость пойдёт «2» и пометка «Да — ИИ» / «Да — списывание».</small></div>
-    <div class="field" style="margin-top:10px"><span>Комментарий в ведомость</span><input class="input" id="ovrComment" value="${esc(o.override_comment || "")}" placeholder="Например: устно объяснил ответы — оценка подтверждена"></div>
+    <div class="field" style="margin-top:10px"><span>Комментарий в ведомость</span><input class="input" id="ovrComment" value="${esc(o.override_comment || "")}" placeholder="Например: устно объяснил ответы — оценка подтверждена"><div class="remarks" id="ovrRemarks"></div></div>
+    <p class="small muted" style="margin:6px 0 0">Если ваша оценка отличается от оценки проверки, приложение запомнит это как пример и в следующих проверках этого задания покажет нейросети похожие случаи — она начнёт оценивать в вашей манере. Комментарий («почему») делает пример понятнее.</p>
     <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap">
       <button class="btn primary" id="ovrSave">Сохранить</button>
       <button class="btn" id="recheck">${ICON.refresh}Проверить заново</button>
@@ -1878,6 +1993,7 @@ async function openWork(id) {
     m.classList.remove("flash"); void m.offsetWidth; m.classList.add("flash");
   }));
   bindOral(id, w);
+  remarkChips($("#ovrRemarks"), $("#ovrComment"), { id });
   $("#fbOpen").onclick = () => showFeedback(id, w);
   $("#aiOpen")?.addEventListener("click", () => { closeDrawer(); openAiDecide([id]); });
   $("#aiUndo")?.addEventListener("click", async (e) => { e.preventDefault(); try { S.state = await api("ai_decide", { id, decision: "" }); closeDrawer(); openAiDecide([id]); } catch (er) { toast(String(er), "err"); } });
@@ -1966,6 +2082,7 @@ async function showFeedback(id, w) {
   let r;
   try { r = await api("feedback", { id }); } catch (e) { box.innerHTML = `<span class="chip bad">${esc(e)}</span>`; return; }
   box.innerHTML = `<textarea class="input" id="fbText" rows="12" style="min-height:220px">${esc(r.text)}</textarea>
+    <div class="remarks" id="fbRemarks"></div>
     <div class="section-actions" style="margin-top:8px">
       <button class="btn primary" id="fbSave">Сохранить</button>
       <button class="btn" id="fbAi">Написать нейросетью</button>
@@ -1974,6 +2091,7 @@ async function showFeedback(id, w) {
       <button class="btn" id="fbWord">${ICON.down}Word</button>
     </div>
     <p class="small muted" style="margin:0">Текст можно править. «Из результатов проверки» собирает отзыв мгновенно, без нейросети.</p>`;
+  remarkChips($("#fbRemarks"), $("#fbText"), { id });
   const save = async (quiet) => { await api("feedback", { id, mode: "save", text: $("#fbText").value }); if (!quiet) toast("Отзыв сохранён"); };
   $("#fbSave").onclick = () => save(false);
   $("#fbTpl").onclick = async () => { const t = await api("feedback", { id, mode: "template" }); $("#fbText").value = t.text; };
@@ -2036,7 +2154,20 @@ VIEWS.model = async (v) => {
       </div>
       <p class="small muted" style="margin:8px 0 0">Локальная модель обычно обрабатывает работы по одной; для облака можно 3–4. Если работа не помещается в контекст модели, приложение само сократит запрос — как именно, выбирается в разделе «Длинные работы и приватность».</p>
       <label class="switch" style="margin-top:14px"><input type="checkbox" id="reuseCopies" ${st.reuse_copies !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Копии не проверять заново</b><small>Если работа почти целиком совпадает с уже проверенной (то же задание и вариант, те же картинки, текст совпадает на 90 % и больше), она получает её разбор без запроса к нейросети. Оценку приложение пересчитывает для каждой работы: списывание, срок сдачи, признаки ИИ — как обычно.</small></span></label>
+      <div class="grid3" style="margin-top:16px;max-width:760px">
+        <label class="field"><span>Ответ модели</span><select class="select input" id="ansStyle">
+          <option value="full" ${(st.answer_style || "full") === "full" ? "selected" : ""}>Подробный разбор</option>
+          <option value="short" ${st.answer_style === "short" ? "selected" : ""}>Короткий — примерно вдвое быстрее</option></select></label>
+      </div>
+      <p class="small muted" style="margin:8px 0 0">Короткий ответ: до 5 главных ошибок, по каждому заданию — статус и одна фраза, итог в 1–2 предложения. Основное время модель тратит на то, что пишет, поэтому проверка идёт примерно вдвое быстрее. Строгость оценки та же.</p>
+      <label class="switch" style="margin-top:14px"><input type="checkbox" id="learnOn" ${st.learn?.enabled !== false ? "checked" : ""}><span class="track"></span><span class="lbl"><b>Учиться на моих исправлениях</b><small>Когда вы ставите свою оценку вместо оценки проверки, приложение запоминает это. В следующих проверках того же задания нейросеть видит 2–3 похожих случая: что поставила она, что вы и почему. Так она привыкает к вашей строгости. Текст работ не хранится — только отпечаток для поиска похожих, итог модели и ваш комментарий. <span id="learnInfo"></span></small></span></label>
     </div>`)}
+    ${fold("trial", "Пробный прогон", "Можно ли доверять модели — до проверки всей группы", `<div class="card pad">
+      <p class="small" style="margin:0 0 12px;max-width:80ch">Сменили модель или движок LM Studio? Пробный прогон заново проверит несколько уже оценённых работ текущей моделью и покажет, где она ставит иначе. Сначала берутся работы, которым вы сами поставили оценку, и работы с разными оценками. Сохранённые результаты не меняются.</p>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <select class="select input" id="trialN" style="width:auto">${[3, 5, 8].map((n) => `<option value="${n}" ${n === 5 ? "selected" : ""}>${n} работ</option>`).join("")}</select>
+        <button class="btn primary" id="trialBtn">Запустить пробный прогон</button></div>
+      <div id="trialOut" style="margin-top:12px"></div></div>`)}
     ${fold("mcp", "MCP-сервер приложения", "Подключить инструменты проверки к LM Studio, Claude Desktop, Cursor", `<div class="card pad" id="mcpBox"><div class="spinner"></div></div>`)}`;
   setupFolds(v);
   renderProviders();
@@ -2048,6 +2179,11 @@ VIEWS.model = async (v) => {
   $("#conc").onchange = (e) => saveSettings({ concurrency: Math.max(1, Math.min(8, +e.target.value || 1)) });
   $("#maxChars").onchange = (e) => saveSettings({ max_work_chars: Math.max(2000, +e.target.value || 16000) });
   $("#reuseCopies").onchange = (e) => saveSettings({ reuse_copies: e.target.checked });
+  $("#ansStyle").onchange = (e) => saveSettings({ answer_style: e.target.value });
+  $("#learnOn").onchange = (e) => saveSettings({ learn: { ...(settings().learn || {}), enabled: e.target.checked } });
+  renderLearnInfo();
+  $("#trialBtn").onclick = () => startTrial(+$("#trialN").value);
+  if (S.trial?.rows || S.trial?.running) renderTrial();
   if (act) editProvider(act.id);
   loadMcp();
   if (!S.detect) detectLocal(false);
@@ -2056,7 +2192,7 @@ VIEWS.model = async (v) => {
 const isLocal = (p) => ["lmstudio", "ollama", "llamacpp"].includes(p?.kind);
 
 // ---- сворачиваемые разделы (что открыто — запоминается)
-const FOLD_DEFAULT = { dc: true, mode: false, mcp: false, ctxz: false };
+const FOLD_DEFAULT = { trial: false, dc: true, mode: false, mcp: false, ctxz: false };
 function foldOpen(id) { try { const v = localStorage.getItem("fold:" + id); return v == null ? FOLD_DEFAULT[id] ?? true : v === "1"; } catch (e) { return FOLD_DEFAULT[id] ?? true; } }
 function fold(id, title, sub, body) {
   return `<details class="fold" data-fold="${id}" ${foldOpen(id) ? "open" : ""}><summary><span class="fold-t">${esc(title)}</span><span class="fold-sub">${esc(sub)}</span><span class="fold-chev" aria-hidden="true"></span></summary><div class="fold-body">${body}</div></details>`;
@@ -2470,7 +2606,7 @@ function renderDoubleCheck() {
   };
   box.innerHTML = `
     <label class="switch"><input type="checkbox" id="dcOn" ${dc.enabled ? "checked" : ""}><span class="track"></span>
-      <span class="lbl"><b>Проверять каждую работу несколькими моделями</b><small>После основной модели работу по очереди проверяют все модели из списка. Если они расходятся в оценке или спорят об ИИ, работа помечается «нужен ваш взгляд». Каждая модель добавляет время проверки.</small></span></label>
+      <span class="lbl"><b>Проверять работы несколькими моделями</b><small>После основной модели работу по очереди проверяют все модели из списка — каждую работу или только спорные (см. ниже). Если они расходятся в оценке или спорят об ИИ, работа помечается «нужен ваш взгляд». Каждая модель добавляет время проверки.</small></span></label>
     <div style="${dc.enabled ? "" : "opacity:.5"}">
       <div class="checkers">
         <div class="checker main"><span class="checker-n">1</span><div class="small"><b>Основная:</b> ${act ? `${esc(act.name)}: ${esc(act.model || "модель не выбрана")} • контекст ${fmtN(act.num_ctx || 0)}` : "не выбрана"}</div></div>
@@ -2478,6 +2614,9 @@ function renderDoubleCheck() {
       </div>
       <button class="btn sm" id="ckAdd" style="margin-top:10px">${ICON.plus}Добавить модель</button>
       <div class="grid3" style="margin-top:14px;max-width:860px">
+        <label class="field"><span>Какие работы проверять ещё раз</span><select class="select input" id="dcWhen" title="«Только спорные»: остальные модели смотрят работу, если оценка основной на границе (3,5; 4,5) или модель сомневается насчёт ИИ">
+          <option value="all" ${(dc.when || "all") === "all" ? "selected" : ""}>каждую работу</option>
+          <option value="disputed" ${dc.when === "disputed" ? "selected" : ""}>только спорные — быстрее</option></select></label>
         <label class="field"><span>Итоговая оценка</span><select class="select input" id="dcPolicy">
           ${[["primary", "как у основной модели"], ["avg", "среднее по всем"], ["median", "медиана (большинство)"], ["min", "самая низкая"], ["max", "самая высокая"]].map(([k, l]) => `<option value="${k}" ${(dc.policy || "primary") === k ? "selected" : ""}>${l}</option>`).join("")}
         </select></label>
@@ -2487,8 +2626,9 @@ function renderDoubleCheck() {
       </div>
     </div>
     <p class="small muted" style="margin:10px 0 0" id="dcHint">${opts.length ? "Можно брать модели одного сервера (несколько моделей LM Studio) или разных: LM Studio, Ollama, llama.cpp, облако. В 16 ГБ видеопамяти две большие модели одновременно не поместятся — LM Studio будет загружать их по очереди." : "Ищу модели на серверах…"}</p>`;
-  const save = (list2, extra = {}) => saveSettings({ double_check: { ...dc, enabled: $("#dcOn").checked, checkers: list2, provider: list2[0]?.provider || "", model: list2[0]?.model || "", policy: $("#dcPolicy").value, max_diff: +$("#dcDiff").value, ...extra } }).then(renderDoubleCheck);
+  const save = (list2, extra = {}) => saveSettings({ double_check: { ...dc, enabled: $("#dcOn").checked, checkers: list2, provider: list2[0]?.provider || "", model: list2[0]?.model || "", policy: $("#dcPolicy").value, max_diff: +$("#dcDiff").value, when: $("#dcWhen").value, ...extra } }).then(renderDoubleCheck);
   $("#dcOn").onchange = () => save(list);
+  $("#dcWhen").onchange = () => save(list);
   $("#dcPolicy").onchange = () => save(list);
   $("#dcDiff").onchange = () => save(list);
   $("#ckAdd").onclick = () => { SND.play("add"); save([...list, { provider: "", model: "", num_ctx: 0 }], { enabled: true }); };
@@ -2874,6 +3014,7 @@ VIEWS.check = (v) => {
   renderQueue();
   renderTokens();
   renderSpeed();
+  if (!S.perf) loadPerf();
   $("#toModel")?.addEventListener("click", (e) => { e.preventDefault(); go("model"); });
   $("#aiOpenAll")?.addEventListener("click", () => openAiDecide());
   const penPatch = () => ({
@@ -2965,9 +3106,21 @@ function renderRunBtn() {
       w.innerHTML = `<button class="run-btn stop stopping" id="runBtn" disabled><span class="pen"><span class="spinner"></span></span>Останавливаю…</button>`;
       return;
     }
+    if (S.run.pausing || S.state?.pausing) {
+      w.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="run-btn stop stopping" disabled><span class="pen"><span class="spinner"></span></span>Пауза: доделываю начатые работы…</button>
+        <span class="small muted">Остальные подождут кнопки «Продолжить» — можно и после перезапуска приложения.</span></div>`;
+      return;
+    }
     w.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="run-btn stop" id="runBtn"><span class="pen">${ICON.stop}</span>Остановить</button>
+      <button class="btn lock-ok" id="runPause" title="Доделать начатые работы и остановиться. Остальные продолжатся по кнопке «Продолжить» — в том числе после перезапуска приложения">Пауза</button>
       <button class="btn lock-ok" id="runPick" title="Добавить работы в идущую проверку">Добавить работы…</button></div>`;
     $("#runPick").onclick = () => openPickWorks();
+    $("#runPause").onclick = async () => {
+      S.run.pausing = true;
+      renderRunBtn();
+      try { const r = await api("pause_check"); toast(`Пауза: доделываю начатые, ещё ${r.left} подождут «Продолжить»`); }
+      catch (e) { S.run.pausing = false; renderRunBtn(); toast(String(e), "err"); }
+    };
     $("#runBtn").onclick = async () => {
       if (S.run.stopping) return;
       S.run.stopping = true;
@@ -2983,6 +3136,19 @@ function renderRunBtn() {
     const leftIds = ws.filter((x) => x.outcome.status !== "done").map((x) => x.id);
     const left = leftIds.length;
     const what = g ? `группу «${esc(g)}»` : "все работы";
+    // проверка на паузе — сначала предлагаем продолжить
+    const paused = (S.state?.paused || []).filter((id) => works().some((x) => x.id === id));
+    if (paused.length) {
+      w.innerHTML = `<div class="paused-box"><div><b>Проверка на паузе.</b> Осталось работ: ${paused.length}.</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"><button class="run-btn" id="runResume"><span class="pen">${ICON.pen}</span>Продолжить проверку</button>
+        <button class="btn ghost" id="runDiscard" title="Забыть очередь на паузе — проверить потом как обычно">Не продолжать</button></div></div>`;
+      $("#runResume").onclick = async () => {
+        try { await api("resume_check"); S.run.running = true; S.run.done = 0; S.run.total = paused.length; applyLock(); renderRunBtn(); }
+        catch (e) { toast(String(e), "err"); }
+      };
+      $("#runDiscard").onclick = async () => { S.state = await api("pause_discard"); renderRunBtn(); if (VIEWS[S.view]) VIEWS[S.view]($("#view")); };
+      return;
+    }
     w.innerHTML = `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
       ${groups.length > 1 ? `<label class="run-group"><span class="small muted">Группа</span><select class="select input" id="runGroup"><option value="">все группы (${works().length})</option>${groups.map((x) => `<option value="${esc(x)}" ${x === g ? "selected" : ""}>${esc(x)} (${works().filter((y) => y.group === x).length})</option>`).join("")}</select></label>` : ""}
       <button class="run-btn" id="runBtn" ${ws.length ? "" : "disabled"}><span class="pen">${ICON.pen}</span>${left && left < ws.length ? `Проверить оставшиеся (${left})` : `Проверить ${what}`}</button>
@@ -3041,8 +3207,23 @@ function renderSpeed() {
     else el.innerHTML = `<div class="speed-head"><b>Скорость модели</b>${el.id === "speedCard" ? `<button class="btn sm ghost" data-go-mcp>Журнал MCP</button>` : ""}</div>
       ${st.map((m) => `<div class="speed-row"><span class="sp-model" title="${esc(m.model)}">${esc(m.model)}</span><span class="sp-now"><b>${fmtTps(m.last)}</b> ток/с</span><span class="small muted">в среднем ${fmtTps(m.avg)} • ответов ${m.n}</span></div>`).join("")}
       <div class="sp-chart">${speedSpark(S.speed.list)}</div>`;
+    if (S.perf) el.insertAdjacentHTML("beforeend", perfHtml(S.perf));
     $("[data-go-mcp]", el)?.addEventListener("click", () => go("mcplog"));
   }
+}
+/** Видеопамять и обычная скорость модели — под карточкой скорости. */
+function perfHtml(p) {
+  const parts = [];
+  if (p.usual_tps) parts.push(`обычно ${fmtTps(p.usual_tps)} ток/с`);
+  if (p.gpu?.total_mb) {
+    const used = p.gpu.used_mb / 1024, tot = p.gpu.total_mb / 1024;
+    const full = p.gpu.used_mb / p.gpu.total_mb >= 0.95;
+    parts.push(`<span class="${full ? "bad-t" : ""}" title="${full ? "Видеопамять почти заполнена: если модель не поместится, часть уйдёт в оперативную память и скорость упадёт в разы" : ""}">видеопамять ${used.toFixed(1).replace(".", ",")} из ${tot.toFixed(1).replace(".", ",")} ГБ</span>`);
+  }
+  return parts.length ? `<div class="small muted" style="margin-top:6px">${parts.join(" • ")}</div>` : "";
+}
+async function loadPerf() {
+  try { S.perf = await api("perf_info"); renderSpeed(); } catch (e) { /* нет данных */ }
 }
 
 // ---------------------------------------------------------------- 7. Журнал MCP
@@ -3387,7 +3568,7 @@ onEvent("run_state", (r) => {
   if (was !== r.running) applyLock();
   if (r.total != null) S.run.total = r.total;
   if (r.done != null) S.run.done = r.done;
-  if (r.running && !S.run.started) S.run.started = Date.now();
+  if (r.running && !S.run.started) { S.run.started = Date.now(); loadPerf(); }
   updateRail();
   updateProgress();
   if (!r.running) {
@@ -3395,7 +3576,13 @@ onEvent("run_state", (r) => {
     renderTokens();
     S.run.started = 0;
     S.run.stopping = false;
+    S.run.pausing = false;
+    loadPerf();
     if (r.cancelled) toast("Проверка остановлена");
+    if (r.paused) {
+      toast(`Проверка на паузе: осталось ${r.left}. Продолжить можно в любой момент — кнопка на шаге «Проверка»`, "ok", { label: "Продолжить", run: async () => { try { await api("resume_check"); } catch (e) { toast(String(e), "err"); } } });
+      api("state").then((st) => { S.state = st; renderRunBtn(); updateRail(); }).catch(() => {});
+    }
     renderRunBtn();
     scheduleRefresh();
     if (r.error) toast(r.error, "err");
@@ -4763,9 +4950,10 @@ function editCell(group, student, code) {
   if (t.kind === "custom") {
     openDrawer(`<h2>${esc(student)}</h2><p class="muted">${esc(code)} • ${esc(group)}</p>
       <label class="field"><span>Значение${t.unit ? `, ${esc(t.unit)}` : ""}</span><input class="input" type="number" step="any" id="jcNum" value="${x?.grade ?? ""}" placeholder="например, 4"></label>
-      <label class="field" style="margin-top:12px"><span>Комментарий</span><input class="input" id="jcCom" value="${esc(x?.comment || "")}"></label>
+      <label class="field" style="margin-top:12px"><span>Комментарий</span><input class="input" id="jcCom" value="${esc(x?.comment || "")}"></label><div class="remarks" id="jcRemarks"></div>
       <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="jcSave">Сохранить</button>${x ? `<button class="btn ghost danger" id="jcDel">Очистить</button>` : ""}</div>`);
     $("#jcNum").focus();
+    remarkChips($("#jcRemarks"), $("#jcCom"), { code });
     $("#jcSave").onclick = async () => {
       const v = $("#jcNum").value.trim();
       await loadJournal("journal_set", { group, student, code, grade: v === "" ? null : +v.replace(",", "."), comment: $("#jcCom").value });
@@ -4781,9 +4969,10 @@ function editCell(group, student, code) {
     ${hasFlag(x, "no_variant") ? `<div class="ev"><span class="w medium"></span><div>По отзыву — в работе не указан вариант.</div></div>` : ""}
     <div class="override" id="jc">${gradeScale().map((gr) => `<button class="g${Math.floor(gr)} ${x?.grade === gr ? "on" : ""}" data-g="${gr}">${fmtG(gr)}</button>`).join("")}</div>
     <label class="field jc-any"><span>или точная оценка (например, 2,6 за тест)</span><input class="input" id="jcAny" inputmode="decimal" placeholder="от 0 до 5" value="${x?.grade != null && !gradeScale().includes(x.grade) ? fmtG(x.grade) : ""}"></label>
-    <label class="field" style="margin-top:12px"><span>Комментарий / отзыв</span><textarea class="input" id="jcCom" rows="3" placeholder="например: защитил устно">${esc(x?.comment || "")}</textarea></label>
+    <label class="field" style="margin-top:12px"><span>Комментарий / отзыв</span><textarea class="input" id="jcCom" rows="3" placeholder="например: защитил устно">${esc(x?.comment || "")}</textarea></label><div class="remarks" id="jcRemarks"></div>
     <div class="section-actions" style="margin-top:12px"><button class="btn primary" id="jcSave">Сохранить</button>${x ? `<button class="btn ghost danger" id="jcDel">Убрать оценку</button>` : ""}</div>`);
   let sel = x?.grade ?? null;
+  remarkChips($("#jcRemarks"), $("#jcCom"), { code });
   $$("#jc [data-g]").forEach((b) => (b.onclick = () => { sel = +b.dataset.g; $("#jcAny").value = ""; $$("#jc button").forEach((y) => y.classList.toggle("on", +y.dataset.g === sel)); }));
   $("#jcAny").oninput = (e) => {
     const v = parseFloat(e.target.value.replace(",", "."));

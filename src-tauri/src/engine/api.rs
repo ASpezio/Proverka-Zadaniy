@@ -625,6 +625,9 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             if core.running.load(Ordering::SeqCst) {
                 return Err("Проверка уже идёт".into());
             }
+            if grader::TRIAL.load(Ordering::SeqCst) {
+                return Err("Идёт пробный прогон — дождитесь его или остановите".into());
+            }
             let mut ids = p.get("ids").str_list();
             let only_new = p.get("only_unchecked").bool_or(false);
             {
@@ -721,11 +724,119 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             Ok(Json::obj().with("ok", true))
         }
 
-        "set_override" => {
-            let id = p.get("id").str_or("");
+        // пробный прогон: 3–5 уже оценённых работ заново текущей моделью, без сохранения
+        "trial_start" => {
+            if core.running.load(Ordering::SeqCst) {
+                return Err("Сейчас идёт проверка — пробный прогон можно запустить после неё".into());
+            }
+            if grader::TRIAL.swap(true, Ordering::SeqCst) {
+                return Err("Пробный прогон уже идёт".into());
+            }
+            let mut ids = p.get("ids").str_list();
+            if ids.is_empty() {
+                ids = grader::trial_pick(core, p.get("n").i64_or(5).clamp(1, 10) as usize);
+            }
+            if ids.is_empty() {
+                grader::TRIAL.store(false, Ordering::SeqCst);
+                return Err("Нет проверенных работ: сначала проверьте хотя бы несколько — прогон сравнивает с прежними оценками".into());
+            }
+            if grader::active_provider(core).map(|p| p.model.is_empty()).unwrap_or(true) {
+                grader::TRIAL.store(false, Ordering::SeqCst);
+                return Err("Не выбрана модель — откройте раздел «Модель» и выберите её".into());
+            }
+            let c = core.clone();
+            let n = ids.len();
+            std::thread::spawn(move || grader::trial(c, ids));
+            Ok(Json::obj().with("started", true).with("count", n))
+        }
+
+        "trial_stop" => {
+            if grader::TRIAL.load(Ordering::SeqCst) {
+                core.cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(Json::obj().with("ok", true))
+        }
+
+        // пауза: начатые работы доделываются, остальные ждут «Продолжить» (и после перезапуска)
+        "pause_check" => {
+            if !core.running.load(Ordering::SeqCst) {
+                return Err("Проверка сейчас не идёт".into());
+            }
+            core.pause.store(true, Ordering::SeqCst);
+            {
+                let q = core.queue.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                // сразу в сессию: если закрыть приложение, не дожидаясь, очередь не потеряется
+                let mut list: Vec<String> = ws.outcomes.iter().filter(|(_, o)| o.status == "running").map(|(k, _)| k.clone()).collect();
+                list.sort_by_key(|k| ws.works.iter().position(|w| &w.id == k).unwrap_or(usize::MAX));
+                list.extend(q);
+                ws.paused = list;
+                ws.paused_fresh = core.no_cache.load(Ordering::SeqCst);
+            }
+            core.save_session();
+            let n = core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.len();
+            Ok(Json::obj().with("ok", true).with("left", n))
+        }
+
+        // видеопамять и обычная скорость модели (для карточки скорости)
+        "perf_info" => {
+            let mut o = Json::obj();
+            if let Some(g) = super::perf::gpu() {
+                o.set("gpu", Json::obj().with("name", g.name.as_str()).with("used_mb", g.used_mb).with("total_mb", g.total_mb));
+            }
+            if let Some(p) = grader::active_provider(core) {
+                if let Some(u) = super::perf::usual_speed(core, &p.model) {
+                    o.set("usual_tps", (u * 10.0).round() / 10.0);
+                }
+                o.set("model", p.model.as_str());
+            }
+            Ok(o)
+        }
+
+        "resume_check" => {
+            if core.running.load(Ordering::SeqCst) {
+                return Err("Проверка уже идёт".into());
+            }
+            let ids: Vec<String> = {
+                let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                ws.paused.iter().filter(|id| ws.works.iter().any(|w| &w.id == *id)).cloned().collect()
+            };
+            if ids.is_empty() {
+                core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.clear();
+                return Err("Нет работ на паузе".into());
+            }
+            if grader::active_provider(core).map(|p| p.model.is_empty()).unwrap_or(true) {
+                return Err("Не выбрана модель — откройте раздел «Модель» и выберите её".into());
+            }
+            let fresh = core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused_fresh;
+            core.no_cache.store(fresh, Ordering::SeqCst);
+            let c = core.clone();
+            let n = ids.len();
+            std::thread::spawn(move || grader::run(c, ids));
+            Ok(Json::obj().with("started", true).with("count", n))
+        }
+
+        "pause_discard" => {
             {
                 let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
-                let o = ws.outcomes.entry(id).or_default();
+                ws.paused.clear();
+                for o in ws.outcomes.values_mut() {
+                    if o.phase == "paused" {
+                        o.phase.clear();
+                        o.message.clear();
+                    }
+                }
+            }
+            core.save_session();
+            Ok(core.state_json())
+        }
+
+        "set_override" => {
+            let id = p.get("id").str_or("");
+            let before_comment = core.ws.lock().unwrap_or_else(|e| e.into_inner()).outcomes.get(&id).map(|o| o.override_comment.clone()).unwrap_or_default();
+            {
+                let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                let o = ws.outcomes.entry(id.clone()).or_default();
                 // оценка преподавателя — как он её поставил, до сотых (2,7; 2,9…)
                 o.override_grade = p.get("grade").as_f64().map(|g| (g.clamp(2.0, 5.0) * 100.0).round() / 100.0);
                 o.override_comment = p.get("comment").str_or("");
@@ -741,8 +852,38 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                     }
                 }
             }
+            core.learn_from_override(&id, &before_comment);
             core.save_session();
             Ok(core.state_json())
+        }
+
+        // чему проверка научилась у преподавателя: сводка, очистка
+        "lessons" => {
+            if p.get("action").str_or("") == "clear" {
+                let n = super::lessons::lessons_clear(&core.data_dir, &p.get("code").str_or(""));
+                return Ok(Json::obj().with("removed", n).with("summary", super::lessons::lessons_summary(&core.data_dir)));
+            }
+            Ok(super::lessons::lessons_summary(&core.data_dir))
+        }
+
+        // банк замечаний: list (code, all), add, delete
+        "remarks" => {
+            let dir = &core.data_dir;
+            match p.get("action").str_or("list").as_str() {
+                "add" => super::lessons::remark_add(dir, &p.get("text").str_or(""))?,
+                "delete" => super::lessons::remark_delete(dir, &p.get("text").str_or("")),
+                _ => {}
+            }
+            let code = match p.get("id").as_str() {
+                Some(id) => {
+                    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                    ws.works.iter().find(|w| w.id == id).and_then(|w| core.set_for_work(&ws, w)).map(|s| s.code.clone()).unwrap_or_default()
+                }
+                None => p.get("code").str_or(""),
+            };
+            let all = p.get("all").bool_or(false);
+            let list = super::lessons::remarks_list(dir, &code, if all { 400 } else { 14 }, all);
+            Ok(Json::obj().with("remarks", Json::Arr(list.iter().map(super::lessons::remark_json).collect())))
         }
 
         "ai_decide" => {
@@ -860,11 +1001,16 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
                 "template" => core.feedback_template(&id).ok_or("работа не найдена")?,
                 "save" => {
                     let t = p.get("text").str_or("");
+                    let prev = core.ws.lock().unwrap_or_else(|e| e.into_inner()).outcomes.get(&id).map(|o| o.feedback.clone()).unwrap_or_default();
+                    // «до правки» — прежний отзыв или собранный из результатов проверки
+                    let before = if prev.trim().is_empty() { core.feedback_template(&id).unwrap_or_default() } else { prev };
                     let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(o) = ws.outcomes.get_mut(&id) {
                         o.feedback = t.clone();
                     }
+                    let (code, student) = ws.works.iter().find(|w| w.id == id).map(|w| (core.set_for_work(&ws, w).map(|s| s.code.clone()).unwrap_or_default(), format!("{} {}", w.student, core.authors(&ws, w).0.join(" ")))).unwrap_or_default();
                     drop(ws);
+                    super::lessons::remarks_learn(&core.data_dir, &code, &t, &before, &student);
                     core.save_session();
                     t
                 }
@@ -2123,6 +2269,12 @@ fn handle_inner(core: &Arc<Core>, method: &str, p: &Json) -> Result<Json, String
             let (group, student, code) = (p.get("group").str_or(""), p.get("student").str_or(""), p.get("code").str_or(""));
             {
                 let mut j = core.journal.lock().unwrap_or_else(|e| e.into_inner());
+                // замечания из комментария к оценке — в банк (что было до правки — не считается)
+                let new_c = p.get("comment").str_or("");
+                if !new_c.trim().is_empty() {
+                    let old_c = j.entries.iter().find(|e| e.group == group && e.student == student && e.code == code).map(|e| e.comment.clone()).unwrap_or_default();
+                    super::lessons::remarks_learn(&core.data_dir, &code, &new_c, &old_c, &student);
+                }
                 let custom = j.kind_of(&group, &code) == "custom";
                 match p.get("grade").as_f64() {
                     Some(g) => j.upsert(Entry {

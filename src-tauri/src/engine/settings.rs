@@ -41,6 +41,10 @@ pub fn defaults() -> Json {
         .with("concurrency", 1)
         // почти одинаковые работы получают разбор уже проверенной (без нейросети)
         .with("reuse_copies", true)
+        // full — подробный разбор, short — до 5 ошибок и итог в 1–2 предложения (быстрее)
+        .with("answer_style", "full")
+        // учиться на правках преподавателя: примеры похожих исправленных работ в запросе
+        .with("learn", Json::obj().with("enabled", true).with("examples", 3))
         .with("max_work_chars", 16000)
         // открывать ссылки из работ студентов (Google Документы, Диски, GitHub, сайты)
         .with("links", Json::obj().with("enabled", false).with("max", 15))

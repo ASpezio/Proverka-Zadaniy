@@ -45,6 +45,7 @@ async function api(method, payload = {}) {
     await page.waitForTimeout(700);
     const empty = await page.$eval("#view", (el) => el.innerText.trim().length === 0);
     if (empty) errors.push(`пустой экран: ${v}`);
+    if (v === "model") for (const id of ["#ansStyle", "#learnOn", "#trialBtn", "#reuseCopies"]) if (!(await page.$(id))) errors.push(`в «Нейросеть и MCP» нет ${id}`);
     await shot(`view-${v}`);
   }
   // журнал: группа, клетки, шапка, значок «в?»

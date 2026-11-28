@@ -331,6 +331,10 @@ pub struct Workspace {
     pub team_dups: Vec<(String, String)>,
     /// совпадения с архивом работ прошлых лет: id работы → [(чья работа, доля)]
     pub archive_hits: HashMap<String, Vec<(String, f64)>>,
+    /// очередь, поставленная на паузу: продолжится по «Продолжить» (в том числе после перезапуска)
+    pub paused: Vec<String>,
+    /// очередь на паузе была «без кэша» (Проверить заново без кэша)
+    pub paused_fresh: bool,
 }
 
 pub struct Core {
@@ -341,6 +345,8 @@ pub struct Core {
     pub settings: Mutex<Json>,
     pub running: AtomicBool,
     pub cancel: AtomicBool,
+    /// «Пауза»: новые работы из очереди не берутся, начатые доделываются
+    pub pause: AtomicBool,
     /// текущая проверка идёт без кэша результатов («проверить заново»)
     pub no_cache: AtomicBool,
     /// очередь идущей проверки: в неё можно добавлять и убирать работы на ходу
@@ -760,6 +766,7 @@ impl Core {
             run_tokens_in: std::sync::atomic::AtomicI64::new(0),
             run_tokens_out: std::sync::atomic::AtomicI64::new(0),
             cancel: AtomicBool::new(false),
+            pause: AtomicBool::new(false),
             no_cache: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             restoring: AtomicBool::new(true),
@@ -2178,6 +2185,71 @@ impl Core {
 
     /// Отпечаток всего, от чего зависит ответ нейросети: файлы работы, условие и ключ
     /// варианта, критерии, режим, модели. Совпал — работу можно не проверять заново.
+    /// Раздел запроса «как преподаватель исправлял оценки за это задание» (пусто — нет примеров
+    /// или учёт выключен).
+    pub fn teacher_examples(&self, id: &str) -> String {
+        let st = self.settings();
+        if !st.get("learn").get("enabled").bool_or(true) {
+            return String::new();
+        }
+        let _ = st;
+        let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
+        match ws.works.iter().find(|w| w.id == id) {
+            Some(w) => self.teacher_examples_ws(&ws, w),
+            None => String::new(),
+        }
+    }
+
+    pub fn teacher_examples_ws(&self, ws: &Workspace, w: &Work) -> String {
+        let st = self.settings();
+        if !st.get("learn").get("enabled").bool_or(true) {
+            return String::new();
+        }
+        let n = st.get("learn").get("examples").i64_or(3).clamp(0, 6) as usize;
+        let Some(set) = self.set_for_work(ws, w) else { return String::new() };
+        let sc = self.scan(ws, w);
+        let variant = sc.variant_used.or(sc.variant_in_name).or(sc.variant_in_text).unwrap_or_default();
+        let list = super::lessons::lessons_for(&self.data_dir, &set.code, &variant, &format!("{:x}", w.hash), &w.visible, n);
+        super::lessons::lessons_prompt(&list, fmt_grade)
+    }
+
+    /// Правка оценки преподавателем → урок для следующих проверок этого задания
+    /// (оценка отличается от поставленной проверкой) и замечания из комментария — в банк.
+    pub fn learn_from_override(&self, id: &str, before_comment: &str) {
+        let ws = self.ws.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = ws.works.iter().find(|w| w.id == id) else { return };
+        let Some(o) = ws.outcomes.get(id) else { return };
+        let key = format!("{:x}", w.hash);
+        let code = self.set_for_work(&ws, w).map(|s| s.code.clone()).unwrap_or_default();
+        let names = format!("{} {}", w.student, self.authors(&ws, w).0.join(" "));
+        super::lessons::remarks_learn(&self.data_dir, &code, &o.override_comment, before_comment, &names);
+        let model = o.grade;
+        match (o.override_grade, model) {
+            (Some(t), Some(m)) if (t - m).abs() > 0.01 && !code.is_empty() && !o.llm.is_null() => {
+                let sc = self.scan(&ws, w);
+                let variant = sc.variant_used.or(sc.variant_in_name).or(sc.variant_in_text).unwrap_or_default();
+                let mut said = o.llm.get("summary").str_or("");
+                let errs: Vec<String> = o.llm.get("errors").as_arr().iter().take(3).map(|e| e.as_str().map(|s| s.to_string()).unwrap_or_else(|| e.get("what").str_or(&e.get("text").str_or("")))).filter(|s| !s.trim().is_empty()).collect();
+                if !errs.is_empty() {
+                    said.push_str(&format!(" Ошибки: {}", errs.join("; ")));
+                }
+                // ФИО студента в пример не попадает
+                for part in names.split_whitespace().filter(|x| x.chars().count() >= 3) {
+                    said = said.replace(part, "…");
+                }
+                let mut why = o.override_comment.clone();
+                for part in names.split_whitespace().filter(|x| x.chars().count() >= 3) {
+                    why = why.replace(part, "…");
+                }
+                super::lessons::lesson_put(
+                    &self.data_dir,
+                    super::lessons::Lesson { key, code, variant, model_grade: m, teacher_grade: t, why, model_said: super::text::clip(said.trim(), 600), sketch: super::lessons::sketch(&w.visible), date: now_s() },
+                );
+            }
+            _ => super::lessons::lesson_forget(&self.data_dir, &key),
+        }
+    }
+
     pub fn fingerprint(&self, ws: &Workspace, w: &Work) -> String {
         let mut parts: Vec<String> = vec!["cache-v1".into(), format!("{:x}", w.hash)];
         for src in &w.sources {
@@ -2204,6 +2276,15 @@ impl Core {
         parts.push(st.get("mode").str_or("direct"));
         parts.push(st.get("double_check").to_string());
         parts.push(st.get("links").get("enabled").to_string());
+        // новые параметры — только если отличаются от прежнего поведения (старый кэш остаётся годным)
+        let style = st.get("answer_style").str_or("full");
+        if style != "full" {
+            parts.push(format!("answer:{}", style));
+        }
+        let ex = self.teacher_examples_ws(ws, w);
+        if !ex.is_empty() {
+            parts.push(format!("examples:{:x}", fnv(ex.as_bytes())));
+        }
         if let Some(p) = super::grader::active_provider(self) {
             parts.push(format!("{}|{}|{}", p.kind, p.base_url, p.model));
         }
@@ -2357,6 +2438,9 @@ impl Core {
             if w.submitted > 0 {
                 o.set("submitted", w.submitted);
             }
+            if ws.paused.contains(&w.id) {
+                o.set("paused", true);
+            }
             if let Some(oc) = ws.outcomes.get(&w.id) {
                 if oc.status == "done" || oc.override_grade.is_some() {
                     o.set("outcome", oc.to_json(&w.id, &w.path));
@@ -2364,7 +2448,10 @@ impl Core {
             }
             works.push(o);
         }
-        let doc = Json::obj().with("version", 1).with("tasks", tasks).with("works", works);
+        let mut doc = Json::obj().with("version", 1).with("tasks", tasks).with("works", works);
+        if !ws.paused.is_empty() && ws.paused_fresh {
+            doc.set("paused_fresh", true);
+        }
         drop(ws);
         let tmp = self.data_dir.join("session.json.tmp");
         if std::fs::write(&tmp, doc.to_string()).is_ok() {
@@ -2393,8 +2480,12 @@ impl Core {
         let mut sources: HashMap<String, Vec<String>> = HashMap::new();
         let mut deadlines: HashMap<String, u64> = HashMap::new();
         let mut submitted: HashMap<String, u64> = HashMap::new();
+        let mut paused: Vec<String> = Vec::new();
         for w in doc.get("works").as_arr() {
             let p = w.get("path").str_or("");
+            if w.get("paused").bool_or(false) {
+                paused.push(p.clone());
+            }
             if let Some(d) = w.get("deadline").as_f64().filter(|d| *d > 0.0) {
                 deadlines.insert(p.clone(), d as u64);
             }
@@ -2439,6 +2530,8 @@ impl Core {
                 repaired.push(w.path.clone());
             }
         }
+        ws.paused = ws.works.iter().filter(|w| paused.contains(&w.path)).map(|w| w.id.clone()).collect();
+        ws.paused_fresh = doc.get("paused_fresh").bool_or(false);
         let ids: Vec<(String, String)> = ws.works.iter().map(|w| (w.id.clone(), w.path.clone())).collect();
         for (id, path) in ids {
             if let Some(o) = saved_out.get(&path) {
@@ -2571,6 +2664,8 @@ impl Core {
             .with("works", works)
             .with("plag", plag)
             .with("running", self.running.load(Ordering::SeqCst))
+            .with("pausing", self.pause.load(Ordering::SeqCst) && self.running.load(Ordering::SeqCst))
+            .with("paused", ws.paused.clone())
             .with("settings", self.settings())
             .with("groups", self.groups_json(&ws))
             .with("data_dir", self.data_dir.to_string_lossy().to_string())

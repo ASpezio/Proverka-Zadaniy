@@ -16,7 +16,7 @@ use super::llm::{self, ChatResult, LlmError, Msg, Provider, ToolDef};
 use super::mcp::{McpClient, AGENT_TOOLS};
 use super::text;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -289,6 +289,7 @@ pub fn chat_cancellable(core: &Arc<Core>, p: &Provider, msgs: &[Msg], tools: &[T
                     // скорость модели: токенов ответа в секунду
                     let secs = t0.elapsed().as_secs_f64();
                     if res.tokens_out > 0 && secs > 0.05 {
+                        super::perf::sample(core, &p.model, p.is_local(), res.tokens_out, secs);
                         (core.emit)(
                             "speed",
                             Json::obj()
@@ -465,6 +466,10 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
         return;
     }
     core.cancel.store(false, Ordering::SeqCst);
+    core.pause.store(false, Ordering::SeqCst);
+    // новая проверка заменяет очередь на паузе
+    core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.clear();
+    super::perf::run_started(&core);
     let started = Instant::now();
     let Some(mut provider) = active_provider(&core) else {
         core.log("Не выбрана нейросеть — откройте раздел «Нейросеть и MCP»");
@@ -541,7 +546,7 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
         let anon = anon.clone();
         handles.push(std::thread::spawn(move || loop {
             set_anon(anon.clone());
-            if core.cancel.load(Ordering::SeqCst) {
+            if core.cancel.load(Ordering::SeqCst) || core.pause.load(Ordering::SeqCst) {
                 break;
             }
             let next = {
@@ -609,6 +614,21 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                 // копия: вторые модели смотрели образец
                 if copied.is_some() {
                     return Ok(r);
+                }
+                // «только спорные»: оценка однозначная — остальные модели не нужны
+                if !second.is_empty() && core.settings().get("double_check").get("when").str_or("all") == "disputed" {
+                    match disputed(&core, &wid) {
+                        None => {
+                            let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(o) = ws.outcomes.get_mut(&wid) {
+                                o.log.push("Оценка однозначная — другие модели эту работу не проверяли (режим «только спорные»)".to_string());
+                            }
+                            return Ok(r);
+                        }
+                        Some(why) => {
+                            emit_progress(&core, &wid, "running", "second", &format!("Спорная работа ({}) — проверяют другие модели", why));
+                        }
+                    }
                 }
                 for (k, sp) in second.iter().enumerate() {
                     if should_stop(&core) {
@@ -689,6 +709,8 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                 *d += 1;
                 *d
             };
+            // на паузе: доделанная работа больше не ждёт продолжения
+            core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.retain(|x| x != &wid);
             core.save_session();
             (core.emit)("run_state", Json::obj().with("running", true).with("done", d).with("total", core.run_total.load(Ordering::SeqCst)).to_string());
         }));
@@ -697,7 +719,22 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
         let _ = h.join();
     }
     // работы, оставшиеся в очереди после отмены (в том числе добавленные на ходу)
-    core.queue.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let left: Vec<String> = std::mem::take(&mut *core.queue.lock().unwrap_or_else(|e| e.into_inner()));
+    let paused = core.pause.swap(false, Ordering::SeqCst) && !core.cancel.load(Ordering::SeqCst);
+    {
+        let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+        if paused {
+            // недоделанные (на случай ошибки) + ещё не начатые — по порядку очереди
+            let mut keep: Vec<String> = ws.paused.iter().filter(|x| !left.contains(x)).cloned().collect();
+            keep.retain(|x| ws.outcomes.get(x).map(|o| o.status != "done").unwrap_or(true));
+            keep.extend(left.iter().cloned());
+            ws.paused = keep;
+        } else {
+            ws.paused.clear();
+        }
+    }
+    // пауза, а ждать нечего (всё успело доделаться) — обычное завершение
+    let paused = paused && !core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.is_empty();
     core.dropped.lock().unwrap_or_else(|e| e.into_inner()).clear();
     {
         let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
@@ -706,14 +743,14 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
                 if o.status == "queued" || o.status == "running" {
                     // прежний результат не теряем: работа просто не перепроверялась
                     o.status = if o.grade.is_some() { "done".into() } else { "pending".into() };
-                    o.phase = String::new();
-                    o.message = String::new();
+                    o.phase = if paused { "paused".into() } else { String::new() };
+                    o.message = if paused { "На паузе — продолжится по кнопке «Продолжить»".into() } else { String::new() };
                 }
             }
         }
     }
     core.running.store(false, Ordering::SeqCst);
-    let cancelled = core.cancel.load(Ordering::SeqCst);
+    let cancelled = core.cancel.load(Ordering::SeqCst) || paused;
     if !cancelled && core.settings().get("journal_auto").bool_or(false) {
         let n = core.journal_add_current();
         if n > 0 {
@@ -741,12 +778,17 @@ pub fn run(core: Arc<Core>, ids: Vec<String>) {
             super::notify::send(&core, "ai", "Нужно ваше решение", &format!("Работ с признаками ИИ: {} — решите, ставить «2» или оценку по содержанию.", ai));
         }
     }
-    core.log(&format!("{} за {:.0} с", if cancelled { "Проверка остановлена" } else { "Проверка завершена" }, started.elapsed().as_secs_f64()));
+    let n_left = core.ws.lock().unwrap_or_else(|e| e.into_inner()).paused.len();
+    if paused {
+        super::notify::send(&core, "done", "Проверка на паузе", &format!("Осталось работ: {}. Продолжить можно в любой момент — и после перезапуска приложения.", n_left));
+    }
+    core.log(&format!("{} за {:.0} с", if paused { "Проверка поставлена на паузу" } else if cancelled { "Проверка остановлена" } else { "Проверка завершена" }, started.elapsed().as_secs_f64()));
     let (ti, to) = (core.run_tokens_in.load(Ordering::SeqCst), core.run_tokens_out.load(Ordering::SeqCst));
     if ti + to > 0 {
         core.log(&format!("Токенов за проверку: отправлено {}, получено {}", ti, to));
     }
-    (core.emit)("run_state", Json::obj().with("running", false).with("finished", !cancelled).with("cancelled", cancelled).with("total", core.run_total.load(Ordering::SeqCst)).with("tokens_in", ti).with("tokens_out", to).to_string());
+    super::perf::run_finished(&core);
+    (core.emit)("run_state", Json::obj().with("running", false).with("finished", !cancelled).with("cancelled", cancelled && !paused).with("paused", paused).with("left", n_left).with("total", core.run_total.load(Ordering::SeqCst)).with("tokens_in", ti).with("tokens_out", to).to_string());
 }
 
 /// Возвращает уточнённый размер контекста, если его пришлось подбирать.
@@ -1035,7 +1077,8 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
     let traps = client.call("get_ai_traps", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
     let scan = client.call("scan_work", Json::obj().with("work_id", wid))?;
     let plag = client.call("check_plagiarism", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
-    let crit = client.call("get_grading_criteria", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
+    let crit = client.call("get_grading_criteria", Json::obj().with("work_id", wid).with("examples", false)).unwrap_or(Json::Null);
+    let examples = client.call("get_teacher_examples", Json::obj().with("work_id", wid)).ok().and_then(|x| x.as_str().map(|s| s.to_string())).unwrap_or_default();
     let links = client.call("get_work_links", Json::obj().with("work_id", wid)).unwrap_or(Json::Null);
 
     // --- неизменяемые части (с умеренными пределами)
@@ -1120,6 +1163,11 @@ pub fn build_direct_prompt_with(client: &McpClient, wid: &str, max_chars: usize,
         variant_extra.push('\n');
     }
     let mut tail = String::new();
+    // примеры правок преподавателя — свои для каждой работы (похожие), поэтому после работы
+    if !examples.trim().is_empty() {
+        tail.push_str(&text::clip(&examples, lim([3000, 1500, 600])));
+        tail.push_str("\n\n");
+    }
     tail.push_str("# АВТОМАТИЧЕСКАЯ ПРОВЕРКА (без нейросети)\n");
     // Excel: формулы и диаграммы проверены по самому файлу — это факты, а не догадки
     for x in scan.get("excel_findings").str_list() {
@@ -1598,6 +1646,139 @@ fn remember_checker_ctx(core: &Core, idx: usize, n_ctx: i64) {
     }
     drop(st);
     core.save_settings();
+}
+
+// ------------------------------------------------------------------ пробный прогон
+
+pub static TRIAL: AtomicBool = AtomicBool::new(false);
+
+/// Работы для пробного прогона: уже оценённые, сначала с оценкой преподавателя, с разными
+/// оценками (от «2» до «5»), разных вариантов.
+pub fn trial_pick(core: &Core, n: usize) -> Vec<String> {
+    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+    let mut cands: Vec<(bool, f64, String, String)> = ws
+        .works
+        .iter()
+        .filter_map(|w| {
+            let o = ws.outcomes.get(&w.id)?;
+            if o.status != "done" || o.llm.is_null() || w.visible.trim().is_empty() {
+                return None;
+            }
+            let g = o.final_grade()?;
+            Some((o.override_grade.is_some(), g, w.assignment.clone().unwrap_or_default(), w.id.clone()))
+        })
+        .collect();
+    // преподаватель проверил сам — такие работы лучше всего показывают, можно ли модели доверять
+    cands.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut out: Vec<String> = Vec::new();
+    let mut grades: Vec<i64> = Vec::new();
+    // сначала по одной работе на каждую оценку, потом остальные
+    for pass in 0..2 {
+        for c in &cands {
+            if out.len() >= n {
+                break;
+            }
+            let g = c.1.round() as i64;
+            if out.contains(&c.3) || (pass == 0 && grades.contains(&g)) {
+                continue;
+            }
+            grades.push(g);
+            out.push(c.3.clone());
+        }
+    }
+    out
+}
+
+/// Пробный прогон: те же работы проверяются текущей моделью заново, но результат не
+/// сохраняется — только сравнивается с прежней оценкой (и оценкой преподавателя).
+/// События: trial_progress {i, n, name}, trial_done {rows, model, error?}.
+pub fn trial(core: Arc<Core>, ids: Vec<String>) {
+    let done = |rows: Vec<Json>, model: &str, err: &str| {
+        (core.emit)("trial_done", Json::obj().with("rows", Json::Arr(rows)).with("model", model).with("error", err).to_string());
+    };
+    let Some(mut p) = active_provider(&core) else {
+        TRIAL.store(false, Ordering::SeqCst);
+        return done(vec![], "", "Не выбрана нейросеть");
+    };
+    if let Some(n) = detect_context(&core, &p) {
+        p.num_ctx = n;
+    }
+    core.cancel.store(false, Ordering::SeqCst);
+    let mut rows = Vec::new();
+    let n = ids.len();
+    for (i, wid) in ids.iter().enumerate() {
+        if core.cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        let (name, before, old_grade, teacher, old_model) = {
+            let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(w) = ws.works.iter().find(|w| &w.id == wid) else { continue };
+            let o = ws.outcomes.get(wid).cloned().unwrap_or_default();
+            let name = if w.student.is_empty() { w.name.clone() } else { w.student.clone() };
+            (name, o.clone(), o.grade, o.override_grade, o.model.clone())
+        };
+        (core.emit)("trial_progress", Json::obj().with("i", i + 1).with("n", n).with("name", name.as_str()).to_string());
+        let t0 = Instant::now();
+        CURRENT.with(|c| *c.borrow_mut() = wid.clone());
+        let r = (|| -> Result<f64, String> {
+            let client = McpClient::new(core.clone(), "пробный прогон");
+            client.initialize()?;
+            let (j, _) = direct_verdict(&core, &client, &p, wid, true)?;
+            super::mcp::preview_grade(&core, wid, &j)
+        })();
+        CURRENT.with(|c| c.borrow_mut().clear());
+        // прогон ничего не меняет: состояние работы — как было (правки преподавателя за это время — сохраняются)
+        {
+            let mut ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(o) = ws.outcomes.get_mut(wid) {
+                o.status = before.status.clone();
+                o.phase = before.phase.clone();
+                o.message = before.message.clone();
+                o.log = before.log.clone();
+                o.tokens_in = before.tokens_in;
+                o.tokens_out = before.tokens_out;
+            }
+        }
+        emit_progress(&core, wid, &before.status, &before.phase, "");
+        let mut row = Json::obj().with("id", wid.as_str()).with("name", name.as_str()).with("secs", (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0).with("old_model", old_model.as_str());
+        if let Some(g) = old_grade {
+            row.set("old", g);
+        }
+        if let Some(t) = teacher {
+            row.set("teacher", t);
+        }
+        match r {
+            Ok(g) => row.set("new", g),
+            Err(e) if e == STOPPED => break,
+            Err(e) => row.set("error", e.as_str()),
+        }
+        rows.push(row);
+    }
+    core.save_session();
+    TRIAL.store(false, Ordering::SeqCst);
+    done(rows, &p.model, "");
+}
+
+/// Спорная ли работа после основной модели (тогда её смотрят остальные модели):
+/// оценка на границе (3,5; 4,4…), модель не уверена насчёт ИИ или есть подозрение на ИИ.
+/// None — оценка однозначная.
+pub fn disputed(core: &Core, wid: &str) -> Option<String> {
+    let ws = core.ws.lock().unwrap_or_else(|e| e.into_inner());
+    let o = ws.outcomes.get(wid)?;
+    let g = o.llm.get("grade").as_f64()?;
+    let frac = g - g.floor();
+    if (0.25..=0.75).contains(&frac) {
+        return Some(format!("оценка на границе: {}", super::core::fmt_grade(g)));
+    }
+    let conf = o.llm.get("ai_confidence").as_f64().unwrap_or(0.0);
+    let conf = if conf > 1.0 { conf / 100.0 } else { conf };
+    if o.llm.get("ai_detected").bool_or(false) || (0.35..0.8).contains(&conf) {
+        return Some("модель сомневается насчёт ИИ".into());
+    }
+    if !o.ai_suspect.is_null() && !o.ai_suspect.get("content_grade").is_null() {
+        return Some("есть признаки ИИ".into());
+    }
+    None
 }
 
 fn second_opinion(core: &Arc<Core>, p: &Provider, wid: &str, tag: &str, no: usize, of: usize) -> Result<(), String> {

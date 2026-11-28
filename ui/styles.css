@@ -1414,3 +1414,19 @@ details.adv[open] > summary { border-bottom: 1px solid var(--line); }
 @media (prefers-reduced-motion: reduce) { .notice { animation: none; } }
 .ask-veil { z-index: 140; }
 .jt th.name { cursor: pointer; }
+
+/* проверка на паузе */
+.paused-box { padding: 14px 16px; border-radius: 14px; background: color-mix(in srgb, var(--uv, #7a3cf0) 9%, transparent); border: 1px solid color-mix(in srgb, var(--uv, #7a3cf0) 30%, transparent); }
+/* банк замечаний */
+.remarks { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; align-items: center; }
+.remarks .rm { border: 1px solid var(--line, rgba(127,127,127,.3)); background: transparent; color: inherit; border-radius: 999px; padding: 3px 10px; font: inherit; font-size: 12.5px; cursor: pointer; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.remarks .rm:hover { background: color-mix(in srgb, currentColor 8%, transparent); }
+.remarks .rm.pin { border-style: solid; font-weight: 600; }
+.remarks .rm-manage { font-size: 12.5px; }
+.rm-list { display: grid; gap: 6px; }
+.rm-list .rm-row { display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--line, rgba(127,127,127,.2)); }
+/* пробный прогон */
+.trial-t { width: 100%; border-collapse: collapse; }
+.trial-t th, .trial-t td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line, rgba(127,127,127,.2)); }
+.trial-t td.num { text-align: center; font-variant-numeric: tabular-nums; }
+.trial-t tr.diff td { background: color-mix(in srgb, #e5484d 9%, transparent); }
