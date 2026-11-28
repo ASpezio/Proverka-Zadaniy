@@ -138,6 +138,10 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.5.1
+* `customStyleCss`: правила окна — `:root[data-cstyle] X:not(.pv X)`, превью своего стиля — `.pv[data-cstyle] X`. В `styles.css` у `.pv` свои `--r-s/--r-m/--r-l` и `--card-shadow: var(--theme-shadow)` (тема задаёт `--theme-shadow`, в том числе своя схема) — превью не наследуют переменные стиля окна.
+* `.st-card .th-tools` видны всегда (кнопки своего стиля).
+
 ### Версия 1.5.0
 * «Производительность» (настройки): `PERF_PRESETS` (low/normal/high), `perfNow`/`perfProfile`/`perfPatch`, `applyPerfUi` (классы `no-anim`, `no-fx`). Новые ключи `settings.perf`: `effects`, `thumbs`, `log_limit`, `poll` (секунды, 0 — выкл.). Остальные «крутилки» — существующие настройки (`concurrency`, `media.*`, `links.enabled`, `answer_style`, `double_check.when`, `archive.enabled`, `learn.examples`).
 * `mcp::as_text_items` / `norm_tasks` — ошибки, признаки ИИ и пункты разбора приводятся к строкам (в `submit`, `preview_grade`, `attach_second_opinion`); в UI — `itemText`/`textItems` для старых результатов.

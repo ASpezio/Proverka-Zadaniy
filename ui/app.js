@@ -5266,7 +5266,8 @@ const CS_DEF = { radius: 14, shadow: "base", border: 1, pattern: "base", margin:
 function customStyleCss(c) {
   const o = { ...CS_DEF, ...(c.opts || {}) };
   const R = `:root[data-cstyle="${c.id}"]`, P = `.pv[data-cstyle="${c.id}"]`;
-  const sel = (x) => `${R} ${x}, ${P} ${x}`;
+  // правила стиля окна не должны задевать превью других стилей в «Оформлении»
+  const sel = (x) => `${R} ${x}:not(.pv ${x}), ${P} ${x}`;
   const out = [];
   const r = Math.max(0, Math.min(30, +o.radius));
   out.push(`${R}, ${P} { --r-s: ${Math.round(r * 0.57)}px; --r-m: ${r}px; --r-l: ${Math.round(r * 1.57)}px; }`);
@@ -5403,6 +5404,7 @@ function themeVars(t) {
     "--uv-glow": mix(accent, "#ffffff", 0.35),
     "--card": d ? mix(paper, "#ffffff", 0.05) : "#ffffff",
     "--card-shadow": d ? "0 1px 0 rgba(0,0,0,.3), 0 12px 32px -16px rgba(0,0,0,.6)" : `0 1px 0 ${rgba(ink, 0.06)}, 0 8px 24px -12px ${rgba(ink, 0.25)}`,
+    "--theme-shadow": d ? "0 1px 0 rgba(0,0,0,.3), 0 12px 32px -16px rgba(0,0,0,.6)" : `0 1px 0 ${rgba(ink, 0.06)}, 0 8px 24px -12px ${rgba(ink, 0.25)}`,
     "--focus": `0 0 0 3px ${rgba(accent, 0.35)}`,
     ...(d ? { "--g5": "#34d58a", "--g4": "#6b9bff", "--g3": "#f2b63c", "--g2": pen } : { "--g2": pen }),
   };
