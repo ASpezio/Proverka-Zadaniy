@@ -138,6 +138,9 @@ API: `roster_import {path | image(base64)+mime}` (Excel/Word/текст чере
 * Провайдер: `top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`, `reasoning_effort`, `system_extra`, `keep_alive`, `num_gpu`, `num_thread`, `retries`; у проверяющей модели — `checker.opts` поверх провайдера.
 * Во время проверки разрешено менять только «безопасные» ключи настроек (см. `handle()` в `api.rs`).
 
+### Версия 1.4.4
+* `office::formula_ru` — формула как в русском Excel (функции по `FUNCS_RU`, «,» → «;», десятичная запятая; строки в кавычках и 'листы' не трогаются, `_xlfn.` убирается); используется в `from_xlsx`. `XlsxFacts.funcs` — русские имена (`func_ru`). `excel_checks` вызывается и без набора заданий.
+
 ### Версия 1.4.3
 * `perf::run_started` больше не предупреждает о видеопамяти (только журнал); `sample` добавляет к предупреждению о скорости строку о видеопамяти, если она ≥ 95 %. UI: `perfHtml` без красного; `loadPerf` каждые 10 с на шагах «Проверка» и «Журнал MCP»; переключатель `#sPerfWarn` в настройках («Уведомления»).
 * Агентный режим: `grader::verdict_from_text` (JSON, `{"name":"submit_grade","arguments":…}`, `<tool_call>…`), два напоминания; ошибка с префиксом `NO_SUBMIT` → `check_one` переходит в прямой режим. Мок: `MOCK_MODE=agent_text|agent_texttool`.

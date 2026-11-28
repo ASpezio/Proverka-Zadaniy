@@ -1670,6 +1670,10 @@ impl Core {
             .filter(|(_, n)| !n.ends_with("в документе") && n != "вставлен в документ")
             .map(|(k, n)| format!("{} — {}", n, if k == "drawio" { "схема draw.io" } else { detect::kind_label(k) }))
             .collect();
+        // где формулы в Excel — и без загруженного задания
+        if set.is_none() {
+            self.excel_checks(w, "", &mut sc);
+        }
         if let Some(set) = set {
             // текст условия варианта (или общий для всех вариантов)
             let task_text: String = match sc.variant_used.as_ref().and_then(|v| set.variant(v)) {

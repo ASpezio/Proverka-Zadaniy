@@ -394,6 +394,230 @@ fn comments_text(xml: &str) -> Vec<String> {
     out
 }
 
+
+// ------------------------------------------------------------------ формулы по-русски
+
+/// Английские имена функций Excel (так они хранятся в файле) → русские (как их видит
+/// студент в русском Excel и как пишут в заданиях: SUM → СУММ).
+const FUNCS_RU: &[(&str, &str)] = &[
+    ("SUM", "СУММ"),
+    ("AVERAGE", "СРЗНАЧ"),
+    ("MIN", "МИН"),
+    ("MAX", "МАКС"),
+    ("COUNT", "СЧЁТ"),
+    ("COUNTA", "СЧЁТЗ"),
+    ("COUNTIF", "СЧЁТЕСЛИ"),
+    ("COUNTIFS", "СЧЁТЕСЛИМН"),
+    ("COUNTBLANK", "СЧИТАТЬПУСТОТЫ"),
+    ("SUMIF", "СУММЕСЛИ"),
+    ("SUMIFS", "СУММЕСЛИМН"),
+    ("AVERAGEIF", "СРЗНАЧЕСЛИ"),
+    ("AVERAGEIFS", "СРЗНАЧЕСЛИМН"),
+    ("MAXIFS", "МАКСЕСЛИ"),
+    ("MINIFS", "МИНЕСЛИ"),
+    ("IF", "ЕСЛИ"),
+    ("IFS", "ЕСЛИМН"),
+    ("IFERROR", "ЕСЛИОШИБКА"),
+    ("IFNA", "ЕСНД"),
+    ("SWITCH", "ПЕРЕКЛЮЧ"),
+    ("AND", "И"),
+    ("OR", "ИЛИ"),
+    ("NOT", "НЕ"),
+    ("XOR", "ИСКЛИЛИ"),
+    ("TRUE", "ИСТИНА"),
+    ("FALSE", "ЛОЖЬ"),
+    ("ROUND", "ОКРУГЛ"),
+    ("ROUNDUP", "ОКРУГЛВВЕРХ"),
+    ("ROUNDDOWN", "ОКРУГЛВНИЗ"),
+    ("CEILING", "ОКРВВЕРХ"),
+    ("FLOOR", "ОКРВНИЗ"),
+    ("INT", "ЦЕЛОЕ"),
+    ("TRUNC", "ОТБР"),
+    ("SQRT", "КОРЕНЬ"),
+    ("POWER", "СТЕПЕНЬ"),
+    ("MOD", "ОСТАТ"),
+    ("PRODUCT", "ПРОИЗВЕД"),
+    ("SUMPRODUCT", "СУММПРОИЗВ"),
+    ("SUMSQ", "СУММКВ"),
+    ("PI", "ПИ"),
+    ("RAND", "СЛЧИС"),
+    ("RANDBETWEEN", "СЛУЧМЕЖДУ"),
+    ("FACT", "ФАКТР"),
+    ("GCD", "НОД"),
+    ("LCM", "НОК"),
+    ("SIGN", "ЗНАК"),
+    ("EVEN", "ЧЁТН"),
+    ("ODD", "НЕЧЁТ"),
+    ("ISEVEN", "ЕЧЁТН"),
+    ("ISODD", "ЕНЕЧЁТ"),
+    ("RADIANS", "РАДИАНЫ"),
+    ("DEGREES", "ГРАДУСЫ"),
+    ("MEDIAN", "МЕДИАНА"),
+    ("MODE", "МОДА"),
+    ("STDEV", "СТАНДОТКЛОН"),
+    ("STDEV.S", "СТАНДОТКЛОН.В"),
+    ("STDEV.P", "СТАНДОТКЛОН.Г"),
+    ("VAR", "ДИСП"),
+    ("VAR.S", "ДИСП.В"),
+    ("VAR.P", "ДИСП.Г"),
+    ("LARGE", "НАИБОЛЬШИЙ"),
+    ("SMALL", "НАИМЕНЬШИЙ"),
+    ("RANK", "РАНГ"),
+    ("RANK.EQ", "РАНГ.РВ"),
+    ("PERCENTILE", "ПЕРСЕНТИЛЬ"),
+    ("QUARTILE", "КВАРТИЛЬ"),
+    ("FREQUENCY", "ЧАСТОТА"),
+    ("CORREL", "КОРРЕЛ"),
+    ("FORECAST", "ПРЕДСКАЗ"),
+    ("TREND", "ТЕНДЕНЦИЯ"),
+    ("VLOOKUP", "ВПР"),
+    ("HLOOKUP", "ГПР"),
+    ("XLOOKUP", "ПРОСМОТРX"),
+    ("LOOKUP", "ПРОСМОТР"),
+    ("INDEX", "ИНДЕКС"),
+    ("MATCH", "ПОИСКПОЗ"),
+    ("XMATCH", "ПОИСКПОЗX"),
+    ("CHOOSE", "ВЫБОР"),
+    ("OFFSET", "СМЕЩ"),
+    ("INDIRECT", "ДВССЫЛ"),
+    ("ADDRESS", "АДРЕС"),
+    ("ROW", "СТРОКА"),
+    ("COLUMN", "СТОЛБЕЦ"),
+    ("ROWS", "ЧСТРОК"),
+    ("COLUMNS", "ЧИСЛСТОЛБ"),
+    ("TRANSPOSE", "ТРАНСП"),
+    ("FILTER", "ФИЛЬТР"),
+    ("SORT", "СОРТ"),
+    ("UNIQUE", "УНИК"),
+    ("SEQUENCE", "ПОСЛЕДОВ"),
+    ("SUBTOTAL", "ПРОМЕЖУТОЧНЫЕ.ИТОГИ"),
+    ("AGGREGATE", "АГРЕГАТ"),
+    ("TODAY", "СЕГОДНЯ"),
+    ("NOW", "ТДАТА"),
+    ("DATE", "ДАТА"),
+    ("YEAR", "ГОД"),
+    ("MONTH", "МЕСЯЦ"),
+    ("DAY", "ДЕНЬ"),
+    ("WEEKDAY", "ДЕНЬНЕД"),
+    ("HOUR", "ЧАС"),
+    ("MINUTE", "МИНУТЫ"),
+    ("SECOND", "СЕКУНДЫ"),
+    ("DATEDIF", "РАЗНДАТ"),
+    ("DAYS", "ДНИ"),
+    ("NETWORKDAYS", "ЧИСТРАБДНИ"),
+    ("WORKDAY", "РАБДЕНЬ"),
+    ("EOMONTH", "КОНМЕСЯЦА"),
+    ("EDATE", "ДАТАМЕС"),
+    ("TEXT", "ТЕКСТ"),
+    ("CONCATENATE", "СЦЕПИТЬ"),
+    ("CONCAT", "СЦЕП"),
+    ("TEXTJOIN", "ОБЪЕДИНИТЬ"),
+    ("LEFT", "ЛЕВСИМВ"),
+    ("RIGHT", "ПРАВСИМВ"),
+    ("MID", "ПСТР"),
+    ("LEN", "ДЛСТР"),
+    ("UPPER", "ПРОПИСН"),
+    ("LOWER", "СТРОЧН"),
+    ("PROPER", "ПРОПНАЧ"),
+    ("TRIM", "СЖПРОБЕЛЫ"),
+    ("FIND", "НАЙТИ"),
+    ("SEARCH", "ПОИСК"),
+    ("SUBSTITUTE", "ПОДСТАВИТЬ"),
+    ("REPLACE", "ЗАМЕНИТЬ"),
+    ("VALUE", "ЗНАЧЕН"),
+    ("NUMBERVALUE", "ЧЗНАЧ"),
+    ("REPT", "ПОВТОР"),
+    ("EXACT", "СОВПАД"),
+    ("CHAR", "СИМВОЛ"),
+    ("CODE", "КОДСИМВ"),
+    ("FIXED", "ФИКСИРОВАННЫЙ"),
+    ("DOLLAR", "РУБЛЬ"),
+    ("ISBLANK", "ЕПУСТО"),
+    ("ISNUMBER", "ЕЧИСЛО"),
+    ("ISTEXT", "ЕТЕКСТ"),
+    ("ISERROR", "ЕОШИБКА"),
+    ("NA", "НД"),
+    ("PMT", "ПЛТ"),
+    ("FV", "БС"),
+    ("PV", "ПС"),
+    ("NPV", "ЧПС"),
+    ("IRR", "ВСД"),
+    ("RATE", "СТАВКА"),
+    ("NPER", "КПЕР"),
+    ("HYPERLINK", "ГИПЕРССЫЛКА"),
+    ("MMULT", "МУМНОЖ"),
+    ("MDETERM", "МОПРЕД"),
+    ("MINVERSE", "МОБР")
+];
+
+/// Русское имя функции (или исходное, если перевода нет).
+pub fn func_ru(en: &str) -> String {
+    let u = en.to_uppercase();
+    FUNCS_RU.iter().find(|(e, _)| *e == u).map(|(_, r)| r.to_string()).unwrap_or(u)
+}
+
+/// Формула как в русском Excel: функции по-русски, разделитель аргументов «;»,
+/// десятичная запятая. Текст в кавычках и имена листов в апострофах не меняются.
+pub fn formula_ru(f: &str) -> String {
+    let ch: Vec<char> = f.chars().collect();
+    let mut out = String::with_capacity(f.len() + 8);
+    let mut i = 0;
+    while i < ch.len() {
+        let c = ch[i];
+        if c == '"' || c == '\'' {
+            // строка или 'Имя листа' — как есть (удвоенная кавычка внутри — часть строки)
+            out.push(c);
+            i += 1;
+            while i < ch.len() {
+                out.push(ch[i]);
+                if ch[i] == c {
+                    if i + 1 < ch.len() && ch[i + 1] == c {
+                        out.push(c);
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let st = i;
+            while i < ch.len() && (ch[i].is_alphanumeric() || ch[i] == '.' || ch[i] == '_') {
+                i += 1;
+            }
+            let word: String = ch[st..i].iter().collect();
+            let bare = word.trim_start_matches("_xlfn.").trim_start_matches("_xlws.").trim_start_matches("_xlfn._xlws.");
+            let is_call = i < ch.len() && ch[i] == '(';
+            let up = bare.to_uppercase();
+            // ссылка на ячейку («B2», «AB12»), за ней не скобка — не трогаем
+            if is_call || up == "TRUE" || up == "FALSE" {
+                if let Some((_, ru)) = FUNCS_RU.iter().find(|(e, _)| *e == up) {
+                    out.push_str(ru);
+                    continue;
+                }
+                if is_call {
+                    out.push_str(bare);
+                    continue;
+                }
+            }
+            out.push_str(&word);
+            continue;
+        }
+        if c == ',' {
+            out.push(';');
+        } else if c == '.' && i > 0 && ch[i - 1].is_ascii_digit() && ch.get(i + 1).map(|x| x.is_ascii_digit()).unwrap_or(false) {
+            out.push(',');
+        } else {
+            out.push(c);
+        }
+        i += 1;
+    }
+    out
+}
+
 // ------------------------------------------------------------------ Excel: проверка без нейросети
 
 /// Факты о книге Excel для правил «расчёты только формулами» и «нужна диаграмма».
@@ -518,7 +742,7 @@ pub fn xlsx_facts(bytes: &[u8]) -> Option<XlsxFacts> {
                     i += 1;
                 }
                 if i < chars.len() && chars[i] == '(' {
-                    let name: String = chars[st..i].iter().collect::<String>().to_uppercase().trim_start_matches("XLFN.").trim_start_matches("XLWS.").to_string();
+                    let name: String = func_ru(chars[st..i].iter().collect::<String>().to_uppercase().trim_start_matches("XLFN.").trim_start_matches("XLWS."));
                     if !name.is_empty() && !f.funcs.contains(&name) && f.funcs.len() < 20 {
                         f.funcs.push(name);
                     }
@@ -716,7 +940,7 @@ pub fn from_xlsx(bytes: &[u8]) -> Extracted {
                             line.push(format!("{}: [формула, скопированная из ячейки выше/левее]{}", col_of(&cref), if val.is_empty() { String::new() } else { format!(" → {}", val) }));
                         } else if !f.trim().is_empty() {
                             formulas += 1;
-                            line.push(format!("{}: ={}{}", col_of(&cref), f.trim(), if val.is_empty() { String::new() } else { format!(" → {}", val) }));
+                            line.push(format!("{}: ={}{}", col_of(&cref), formula_ru(f.trim()), if val.is_empty() { String::new() } else { format!(" → {}", val) }));
                         } else if !val.is_empty() {
                             line.push(format!("{}: {}", col_of(&cref), val));
                         }
@@ -1103,6 +1327,17 @@ mod facts_tests {
         let f = super::xlsx_facts(&z.finish()).unwrap();
         assert_eq!(f.formulas, 5);
         assert_eq!(f.places, vec!["Расчёт!F2:F4, H6:H7".to_string()]);
-        assert!(f.funcs.contains(&"IFS".to_string()) && f.funcs.contains(&"СУММ".to_string()), "{:?}", f.funcs);
+        assert!(f.funcs.contains(&"ЕСЛИМН".to_string()) && f.funcs.contains(&"СУММ".to_string()), "{:?}", f.funcs);
+    }
+
+    #[test]
+    fn formulas_in_russian() {
+        use super::formula_ru;
+        assert_eq!(formula_ru("SUM(H2:H3)"), "СУММ(H2:H3)");
+        assert_eq!(formula_ru("IF(B2>0.5,\"да, верно\",FALSE)"), "ЕСЛИ(B2>0,5;\"да, верно\";ЛОЖЬ)");
+        assert_eq!(formula_ru("_xlfn.IFS(A1>10,\"много\",TRUE,\"мало\")"), "ЕСЛИМН(A1>10;\"много\";ИСТИНА;\"мало\")");
+        assert_eq!(formula_ru("VLOOKUP(A2,'Лист 2'!A:B,2,0)"), "ВПР(A2;'Лист 2'!A:B;2;0)");
+        assert_eq!(formula_ru("ROUND(AVERAGE(B2:B9),2)*1.5"), "ОКРУГЛ(СРЗНАЧ(B2:B9);2)*1,5");
+        assert_eq!(formula_ru("STDEV.S(C1:C5)+MYFUNC(1)"), "СТАНДОТКЛОН.В(C1:C5)+MYFUNC(1)");
     }
 }

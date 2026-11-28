@@ -1,6 +1,6 @@
 [package]
 name = "proverka-zadaniy"
-version = "1.4.3"
+version = "1.4.4"
 description = "Проверка практических работ локальной нейросетью (MCP, защита от ИИ)"
 authors = ["Spezio"]
 edition = "2021"
